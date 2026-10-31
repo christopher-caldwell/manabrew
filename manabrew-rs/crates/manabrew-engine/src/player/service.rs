@@ -76,15 +76,19 @@ impl GameState {
             return Some(effect_id);
         }
 
-        let mut effect = new_player_effect_card(player, "Start Your Engines!", None);
+        let effect = new_player_effect_card(player, "Start Your Engines!", None);
+        let effect_id = self.create_card(effect);
+        self.move_card(effect_id, ZoneType::Command, player);
+        // Zone-change cleanup restores the freshly created card's prior traits;
+        // install the permanent command-zone ability after that cleanup.
         add_trigger_ability(
-            &mut effect,
+            self.card_mut(effect_id),
             "Mode$ LifeLostAll | ValidPlayer$ Opponent | TriggerZones$ Command | ActivationLimit$ 1 | PlayerTurn$ True | CheckSVar$ Count$YourSpeed | SVarCompare$ LT4 | Execute$ SpeedUp | TriggerDescription$ Whenever one or more opponents lose life during your turn, if your speed is less than 4, your speed increases by 1. This ability triggers only once each turn.",
             [("SpeedUp", "DB$ ChangeSpeed")],
         );
-
-        let effect_id = self.create_card(effect);
-        self.move_card(effect_id, ZoneType::Command, player);
+        let triggers = self.card(effect_id).triggers.clone();
+        self.card_mut(effect_id).set_triggers(triggers);
+        self.card_mut(effect_id).reset_changed_card_traits_baseline_to_current();
         self.player_mut(player).speed_effect_card = Some(effect_id);
         Some(effect_id)
     }
@@ -731,6 +735,9 @@ impl GameState {
         };
         self.move_card(card_id, ZoneType::Hand, player);
         self.player_mut(player).drawn_this_turn += 1;
+        if self.turn.phase == forge_foundation::PhaseType::Draw && self.active_player() == player {
+            self.player_mut(player).drawn_this_draw_step += 1;
+        }
         // Draw extra cards from replacement effects (each goes through its own
         // replacement pipeline — is_first_in_draw_step is false for extras).
         for _ in 0..extra {
@@ -764,7 +771,10 @@ impl GameState {
     }
 
     pub fn player_record_spell_cast(&mut self, player: PlayerId, card_id: CardId) {
+        let mut cast_lki = self.card(card_id).clone();
+        cast_lki.controller = player;
         let p = self.player_mut(player);
+        p.cast_lki_this_turn.push(cast_lki);
         p.spells_cast_this_turn += 1;
         p.spells_cast_this_game += 1;
         p.cards_cast_this_turn.push(card_id);

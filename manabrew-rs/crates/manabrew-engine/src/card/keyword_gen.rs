@@ -87,6 +87,18 @@ impl Card {
     /// Generate activated abilities from keywords (e.g. Cycling → AB$ Draw).
     /// Mirrors Java's `CardFactoryUtil.setupKeywordedAbilities()`.
     pub(super) fn generate_keyword_abilities(&mut self) {
+        if let Some(ninjutsu) = self.get_keyword_cost("Ninjutsu") {
+            let mut parts = ninjutsu.split(':');
+            let cost = parts.next().unwrap_or_default();
+            let commander = parts.any(|part| part.eq_ignore_ascii_case("Commander"));
+            for zone in if commander { vec!["Hand", "Command"] } else { vec!["Hand"] } {
+                let text = format!("AB$ ChangeZone | Cost$ {cost} Return<1/Creature.attacking+unblocked> | ActivationZone$ {zone} | Origin$ {zone} | Destination$ Battlefield | Defined$ Self | Tapped$ True | Ninjutsu$ True | SpellDescription$ Ninjutsu");
+                if let Some(ab) = parse_activated_ability(&text, self.activated_abilities.len()) {
+                    self.activated_abilities.push(ab);
+                }
+            }
+        }
+
         // Cycling: K:Cycling:{cost} → AB$ Draw | Cost$ {cost} Discard<1/CARDNAME> | ActivationZone$ Hand
         if let Some(cycling_cost) = self.get_keyword_cost("Cycling") {
             let ab_text = format!(
@@ -419,6 +431,19 @@ impl Card {
     }
 
     fn generate_keyword_trigger_combat(&mut self, kw: &str, next_id: &mut u32) {
+        if let Some(n_str) = crate::keyword::extract_keyword_cost_str(kw, "Firebending") {
+            if let Ok(n) = n_str.parse::<usize>() {
+                let effect = format!("TrigFirebending{n}");
+                let raw = format!("Mode$ Attacks | ValidCard$ Card.Self | Execute$ {effect} | TriggerZones$ Battlefield | TriggerDescription$ Firebending {n}");
+                if let Some(mut trig) = parse_trigger(&raw, next_id) {
+                    trig.execute = effect.clone();
+                    self.add_trigger(trig);
+                }
+                self.svars.entry(effect).or_insert_with(||
+                    format!("DB$ Mana | Produced$ {} | CombatMana$ True", vec!["R"; n].join(" ")));
+            }
+        }
+
         if kw == "Prowess" {
             let raw = "Mode$ SpellCast | ValidCard$ Card.nonCreature | ValidActivatingPlayer$ You | Execute$ TrigProwess | TriggerZones$ Battlefield | TriggerDescription$ Prowess";
             if let Some(mut trig) = parse_trigger(raw, next_id) {

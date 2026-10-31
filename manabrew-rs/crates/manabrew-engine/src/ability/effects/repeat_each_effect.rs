@@ -92,10 +92,47 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
 
         // Clean up remembered cards
         ctx.game.card_mut(source_id).clear_remembered();
+    } else if sa.ir.repeat_targeted.as_deref() == Some("TargetedPlayer") {
+        // Keep previously chosen cards while exposing exactly the current
+        // targeted player to the repeated subability.
+        let previous_players = ctx.game.card(source_id).remembered_players.clone();
+        for pid in sa.target_chosen.all_target_players() {
+            ctx.game.card_mut(source_id).remembered_players = vec![pid];
+            let sub_sa = build_spell_ability(ctx.game, source_id, &sub_text, controller);
+            resolve_sub_chain(ctx, sub_sa);
+            if ctx.game.game_over { break; }
+        }
+        ctx.game.card_mut(source_id).remembered_players = previous_players;
     } else if let Some(repeat_players) = sa.ir.repeat_players.as_deref() {
         // Player iteration path
         let players = resolve_defined_players(repeat_players, controller, ctx.game);
-
+        // Some archived scripts encode "Each player ... then ..." as a
+        // per-player sub-chain. Its printed instruction ordering applies each
+        // stage to everyone before the next stage (e.g. before sacrifices can
+        // remove a life-loss replacement). Do not change other RepeatEach loops.
+        let description = sa.ir.spell_description_text.as_deref().unwrap_or("").to_ascii_lowercase();
+        let mut stages = Vec::new();
+        let mut node = Some(build_spell_ability(ctx.game, source_id, &sub_text, controller));
+        while let Some(mut stage) = node {
+            node = stage.sub_ability.take().map(|next| *next);
+            stages.push(stage);
+        }
+        let per_instruction = repeat_players == "Player" && description.starts_with("each player ")
+            && description.contains(" then ") && stages.len() > 1
+            && stages.iter().all(|stage| stage.defined() == Some("Player.IsRemembered")
+                && stage.ir.unless_cost.is_none());
+        if per_instruction {
+            let previous_players = ctx.game.card(source_id).remembered_players.clone();
+            for stage in stages {
+                for &pid in &players {
+                    ctx.game.card_mut(source_id).remembered_players = vec![pid];
+                    super::resolve_effect(ctx, &stage);
+                    if ctx.game.game_over { break; }
+                }
+                if ctx.game.game_over { break; }
+            }
+            ctx.game.card_mut(source_id).remembered_players = previous_players;
+        } else {
         for pid in players {
             ctx.game.card_mut(source_id).clear_remembered();
             ctx.game.card_mut(source_id).add_remembered_player(pid);
@@ -111,6 +148,7 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
         }
 
         ctx.game.card_mut(source_id).clear_remembered();
+        }
     }
 
     if use_damage_map {

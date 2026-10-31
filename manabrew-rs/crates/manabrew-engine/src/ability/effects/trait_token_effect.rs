@@ -137,7 +137,7 @@ pub fn run(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
 
             // Fire ETB trigger
             super::zone_triggers::emit_zone_trigger(
-                ctx.trigger_handler,
+                ctx.trigger_handler, ctx.game,
                 token_id,
                 forge_foundation::ZoneType::None,
                 forge_foundation::ZoneType::Battlefield,

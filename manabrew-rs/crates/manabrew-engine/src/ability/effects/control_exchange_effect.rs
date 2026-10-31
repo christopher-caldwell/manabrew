@@ -8,6 +8,8 @@ use forge_foundation::ZoneType;
 use super::EffectContext;
 use crate::ability::ability_ir::DefinedRef;
 use crate::ids::CardId;
+use crate::event::RunParams;
+use crate::trigger::TriggerType;
 use crate::parsing::keys;
 
 /// Struct form of this effect so it can participate in the
@@ -73,8 +75,21 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
     let player1 = ctx.game.card(card1).controller;
     let player2 = ctx.game.card(card2).controller;
 
-    ctx.game.card_mut(card1).set_controller(player2);
-    ctx.game.card_mut(card2).set_controller(player1);
+    if !ctx.game.card(card1).can_be_controlled_by(player2) || !ctx.game.card(card2).can_be_controlled_by(player1) { return; }
+    if player1 != player2 {
+        // A control change removes a combatant from combat and must update the
+        // battlefield's controller-indexed zone lists, not just the Card field.
+        if let Some(combat) = ctx.combat.as_deref_mut() {
+            combat.remove_from_combat(card1, ctx.game);
+            combat.remove_from_combat(card2, ctx.game);
+        }
+        ctx.game.change_controller(card1, player2);
+        ctx.game.change_controller(card2, player1);
+        for (card, old, new) in [(card1,player1,player2),(card2,player2,player1)] {
+            ctx.trigger_handler.run_trigger(TriggerType::ChangesController, RunParams {card:Some(card),player:Some(new),original_controller:Some(old),..Default::default()}, false);
+        }
+        crate::staticability::layer::apply_continuous_effects(ctx.game);
+    }
 
     // RememberExchanged$
     if sa.param_is_true(keys::REMEMBER_EXCHANGED) {

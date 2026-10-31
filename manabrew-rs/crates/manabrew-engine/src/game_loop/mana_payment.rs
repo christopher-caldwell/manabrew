@@ -21,6 +21,7 @@ pub(crate) struct ManaPaymentSession<'a> {
 pub(crate) struct ManaPaymentResult {
     pub paid: bool,
     pub preserve_taps_on_failure: bool,
+    pub convoke_used: bool,
 }
 
 impl ManaPaymentResult {
@@ -28,6 +29,7 @@ impl ManaPaymentResult {
         Self {
             paid: true,
             preserve_taps_on_failure: false,
+            convoke_used: false,
         }
     }
 
@@ -35,13 +37,15 @@ impl ManaPaymentResult {
         Self {
             paid: false,
             preserve_taps_on_failure: false,
+            convoke_used: false,
         }
     }
 
-    fn failed_preserving_taps() -> Self {
+    fn failed_preserving_taps(convoke_used: bool) -> Self {
         Self {
             paid: false,
             preserve_taps_on_failure: true,
+            convoke_used,
         }
     }
 }
@@ -112,7 +116,70 @@ where
 {
     let saved_pool = mana_pools[session.player.index()].clone();
     let mut mana_loop_invalid_count = 0u32;
+    // A declined activation is not progress. Hide that ability (all colors)
+    // until a different successful action changes the payment state.
+    let mut rejected_mana_abilities = std::collections::HashSet::new();
     let mut executed_actions: Vec<ManaCostAction> = Vec::new();
+    let mut convoke_used = false;
+    let mut convoke_records: Vec<(CardId, u64)> = Vec::new();
+    // Only the narrowly recognized independent mana/draw path can be
+    // reversed without restoring an irreversible mana activation.
+    let mut convoke_reverse_safe = true;
+
+    macro_rules! fail_with_undo {
+        () => {{
+                // Undoable mana activations may be reversed with the failed
+                // cast. Preserve the prior path for any activation that the
+                // engine cannot prove undoable; do not silently refund it.
+                let mut outstanding = Vec::new();
+                for action in &executed_actions {
+                    match action {
+                        ManaCostAction::TapForMana { card_id, .. } => outstanding.push(*card_id),
+                        ManaCostAction::Untap(card_id) => {
+                            if let Some(index) = outstanding.iter().rposition(|id| id == card_id) {
+                                outstanding.remove(index);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let mut fully_undoable = true;
+                while let Some(&source) = outstanding.last() {
+                    let undoable = undoable_mana_sources(game, mana_pools, session.player);
+                    if !undoable.contains(&source) || !undo_mana_action(game, mana_pools, session.player, source) {
+                        fully_undoable = false;
+                        break;
+                    }
+                    outstanding.pop();
+                    executed_actions.push(ManaCostAction::Untap(source));
+                }
+                executed_actions.push(ManaCostAction::AttemptedAndFailed);
+                notify_mana_payment_resolved(agents, session.player, &executed_actions);
+                if fully_undoable {
+                    mana_pools[session.player.index()] = saved_pool.clone();
+                    return ManaPaymentResult::failed();
+                }
+                // Preserve the completed mana effects but retract pending
+                // convoke contributions, never an arbitrary same-color mana.
+                if convoke_used {
+                    if !convoke_reverse_safe { panic!("unsupported mixed convoke cancellation after complex mana effect"); }
+                    for &(source, epoch) in &convoke_records {
+                        if !outstanding.contains(&source) { continue; } // reversed by the snapshot stack
+                        let active = mana_pools[session.player.index()].mana_entries().iter().any(|m|
+                            m.convoke_for == Some(session.card_id) && m.convoke_source == Some(source));
+                        if !active { panic!("missing pending convoke contribution during cancellation"); }
+                        let card = game.card(source);
+                        if card.zone != ZoneType::Battlefield || card.zone_timestamp != epoch || !card.tapped {
+                            panic!("unsupported mixed convoke cancellation after source changed");
+                        }
+                        assert!(mana_pools[session.player.index()].remove_convoke(session.card_id, source));
+                        // Reversal is not a game untap event and cannot be replaced.
+                        game.card_mut(source).tapped = false;
+                    }
+                }
+                return ManaPaymentResult::failed_preserving_taps(false);
+        }};
+    }
 
     loop {
         let mana_sources =
@@ -121,14 +188,18 @@ where
         let convoke_sources = convoke_payment_sources(game, session.player, session.card_id);
         let mut tappable_lands = lands;
         tappable_lands.extend(convoke_sources.iter().copied());
-        let mana_ability_options = mana_sources.mana_ability_options;
+        let mut mana_ability_options = mana_sources.mana_ability_options;
+        mana_ability_options.retain(|option| !rejected_mana_abilities.contains(&(option.card_id, option.ability_index)));
         let untappable_lands = undoable_mana_sources(game, mana_pools, session.player);
         let pool_ref = mana_pools[session.player.index()].clone();
         let can_confirm_from_pool = {
             let mut confirm_pool = pool_ref.clone();
             confirm_pool.source_colors = None;
             confirm_pool.total_sources = None;
-            confirm_pool.try_pay(session.mana_cost)
+            // `try_pay` treats an unpaid Phyrexian shard as if life can
+            // always cover it. This prompt promises a pool-only payment, so
+            // require the colored alternative instead of assuming life.
+            confirm_pool.try_pay(&session.mana_cost.phyrexian_to_colored())
         };
 
         agents[session.player.index()].snapshot_state(game, mana_pools);
@@ -154,15 +225,26 @@ where
                 mana_ability_index,
                 express_choice,
             } => {
-                if convoke_sources.contains(&land_id) {
-                    mana_loop_invalid_count = 0;
+                if mana_ability_index == Some(usize::MAX) && convoke_sources.contains(&land_id) {
                     let player_idx = session.player.index();
                     let atom = express_choice
                         .filter(|&a| a != 0)
                         .unwrap_or_else(|| convoke_atom(game, land_id, session.mana_cost));
-                    game.tap(land_id);
-                    mana_pools[player_idx].add(atom, 1);
-                    game.card_mut(land_id).last_mana_produced = Some(vec![atom]);
+                    let undo_record = begin_mana_undo(game, mana_pools, session.player, land_id);
+                    if !game.tap(land_id) {
+                        mana_loop_invalid_count += 1;
+                        if mana_loop_invalid_count > 3 { fail_with_undo!(); }
+                        continue;
+                    }
+                    convoke_used = true;
+                    mana_loop_invalid_count = 0;
+                    rejected_mana_abilities.clear();
+                    let mut contribution = mana::Mana::simple(atom);
+                    contribution.convoke_for = Some(session.card_id);
+                    contribution.convoke_source = Some(land_id);
+                    mana_pools[player_idx].add_convoke_contribution(contribution);
+                    convoke_records.push((land_id, game.card(land_id).zone_timestamp));
+                    finish_mana_undo(game, mana_pools, undo_record, 1);
                     executed_actions.push(ManaCostAction::TapForMana {
                         card_id: land_id,
                         mana_ability_index: None,
@@ -170,45 +252,18 @@ where
                     });
                     continue;
                 }
-                if !tappable_lands.contains(&land_id) {
+                if !tappable_lands.contains(&land_id)
+                    || mana_ability_index.is_some_and(|idx| rejected_mana_abilities.contains(&(land_id, idx))) {
                     mana_loop_invalid_count += 1;
-                    if mana_loop_invalid_count > 3 {
-                        mana_pools[session.player.index()] = saved_pool.clone();
-                        return ManaPaymentResult::failed();
-                    }
+                    if mana_loop_invalid_count > 3 { fail_with_undo!(); }
                     continue;
                 }
-                mana_loop_invalid_count = 0;
                 let mana_ab = {
                     let c = game.card(land_id);
-                    mana_ability_index
-                        .and_then(|idx| c.activated_abilities.get(idx))
-                        .filter(|ab| {
-                            ab.is_mana_ability
-                                && mana_ability_available(
-                                    game,
-                                    session.player,
-                                    land_id,
-                                    ab,
-                                    session.reserved_sacrifices,
-                                )
-                        })
-                        .cloned()
-                        .or_else(|| {
-                            c.activated_abilities
-                                .iter()
-                                .find(|ab| {
-                                    ab.is_mana_ability
-                                        && mana_ability_available(
-                                            game,
-                                            session.player,
-                                            land_id,
-                                            ab,
-                                            session.reserved_sacrifices,
-                                        )
-                                })
-                                .cloned()
-                        })
+                    match mana_ability_index {
+                        Some(idx) => c.activated_abilities.iter().find(|ab| ab.ability_index == idx),
+                        None => c.activated_abilities.iter().find(|ab| ab.is_mana_ability && mana_ability_available(game, session.player, land_id, ab, session.reserved_sacrifices)),
+                    }.filter(|ab| ab.is_mana_ability && mana_ability_available(game, session.player, land_id, ab, session.reserved_sacrifices)).cloned()
                 };
                 if let Some(ab) = mana_ab {
                     // Snapshot BEFORE the ability produces mana so we can
@@ -220,18 +275,29 @@ where
                     // mana orphaned in the pool.
                     let player_idx = session.player.index();
                     let undo_record = begin_mana_undo(game, mana_pools, session.player, land_id);
+                    let old_tapped = game.card(land_id).tapped;
+                    let old_timestamp = game.card(land_id).zone_timestamp;
+                    let old_life = game.player(session.player).life;
+                    let old_counters = game.card(land_id).counters.clone();
                     let pool_snapshot = mana_pools[player_idx].begin_tap_tracking();
+                    let independent = convoke_records.is_empty() ||
+                        (independent_mana_draw_only(game, land_id, &ab)
+                            && !convoke_records.iter().any(|(source, _)| *source == land_id));
+                    // A convoke tap pays this spell, never the activation cost
+                    // of a mana ability used while casting it.
+                    let held = mana_pools[player_idx].take_convoke_contributions(session.card_id);
                     let resolved = resolve_mana_ability(
-                        game,
-                        agents,
-                        mana_pools,
-                        session.player,
-                        land_id,
-                        &ab,
-                        express_choice,
+                        game, agents, mana_pools, session.player, land_id, &ab, express_choice,
                     );
+                    mana_pools[player_idx].restore_convoke_contributions(held);
+                    if resolved { convoke_reverse_safe &= independent; }
                     let produced = mana_pools[player_idx].end_tap_tracking(&pool_snapshot);
                     let produced_count = produced.len();
+                    let progressed = resolved && (produced_count > 0
+                        || game.card(land_id).tapped != old_tapped
+                        || game.card(land_id).zone_timestamp != old_timestamp
+                        || game.card(land_id).counters != old_counters
+                        || game.player(session.player).life != old_life);
                     if resolved {
                         executed_actions.push(ManaCostAction::TapForMana {
                             card_id: land_id,
@@ -239,11 +305,20 @@ where
                             express_choice,
                         });
                     }
+                    if progressed {
+                        mana_loop_invalid_count = 0;
+                        rejected_mana_abilities.clear();
+                    } else {
+                        rejected_mana_abilities.insert((land_id, ab.ability_index));
+                        mana_loop_invalid_count += 1;
+                    }
                     if resolved && !produced.is_empty() {
                         game.card_mut(land_id).last_mana_produced = Some(produced);
                     }
                     finish_mana_undo(game, mana_pools, undo_record, produced_count);
-                } else if let Some(atom) = basic_land_mana_atom(game.card(land_id)) {
+                } else if let Some(atom) = mana_ability_index.is_none().then(|| basic_land_mana_atom(game.card(land_id))).flatten() {
+                    mana_loop_invalid_count = 0;
+                    rejected_mana_abilities.clear();
                     executed_actions.push(ManaCostAction::TapForMana {
                         card_id: land_id,
                         mana_ability_index: Some(0),
@@ -252,6 +327,10 @@ where
                     let player_idx = session.player.index();
                     let undo_record = begin_mana_undo(game, mana_pools, session.player, land_id);
                     let pool_snapshot = mana_pools[player_idx].begin_tap_tracking();
+                    if !convoke_records.is_empty() {
+                        convoke_reverse_safe &= no_active_trigger_or_replacement(game)
+                            && !convoke_records.iter().any(|(source, _)| *source == land_id);
+                    }
                     game.tap(land_id);
                     // Fire ProduceMana replacement (e.g. Nyxbloom Ancient triples mana)
                     // before adding to pool. Mirrors Java AbilityManaPart.produceMana
@@ -294,13 +373,22 @@ where
                         game.card_mut(land_id).last_mana_produced = Some(produced);
                     }
                     finish_mana_undo(game, mana_pools, undo_record, produced_count);
+                } else {
+                    if let Some(idx) = mana_ability_index { rejected_mana_abilities.insert((land_id, idx)); }
+                    mana_loop_invalid_count += 1;
                 }
+                if mana_loop_invalid_count > 3 { fail_with_undo!(); }
             }
             ManaCostAction::Untap(land_id) => {
                 if !untappable_lands.contains(&land_id) {
                     continue;
                 }
                 if undo_mana_action(game, mana_pools, session.player, land_id) {
+                    if let Some(index) = convoke_records.iter().rposition(|(source, _)| *source == land_id) {
+                        convoke_records.remove(index);
+                    }
+                    mana_loop_invalid_count = 0;
+                    rejected_mana_abilities.clear();
                     executed_actions.push(ManaCostAction::Untap(land_id));
                 }
             }
@@ -312,20 +400,27 @@ where
                         executed_actions.append(&mut auto_trace);
                         if attempted_and_failed {
                             notify_mana_payment_resolved(agents, session.player, &executed_actions);
-                            mana_pools[session.player.index()] = saved_pool.clone();
-                            return ManaPaymentResult::failed();
+                            // The auto-payer refunded consumed mana objects and
+                            // retained its activations; do not restore a stale pool.
+                            return ManaPaymentResult::failed_preserving_taps(convoke_used);
+                        }
+                        if mana_pools[session.player.index()].mana_entries().iter().any(|m| m.convoke_for == Some(session.card_id)) {
+                            panic!("unsupported unused convoke contribution after auto payment");
                         }
                         executed_actions.push(ManaCostAction::Pay { auto: false });
                         notify_mana_payment_resolved(agents, session.player, &executed_actions);
                         return ManaPaymentResult::paid();
                     }
-                    executed_actions.push(ManaCostAction::AttemptedAndFailed);
-                    notify_mana_payment_resolved(agents, session.player, &executed_actions);
-                    mana_pools[session.player.index()] = saved_pool.clone();
-                    return ManaPaymentResult::failed();
+                    // A failed automatic plan can follow manual activations.
+                    // Undo those actions or preserve their irreversible effects,
+                    // exactly as for an explicit cancellation.
+                    fail_with_undo!();
                 }
 
                 if try_pay_from_pool(game, mana_pools, session.player) {
+                    if mana_pools[session.player.index()].mana_entries().iter().any(|m| m.convoke_for == Some(session.card_id)) {
+                        panic!("unsupported unused convoke contribution after payment");
+                    }
                     executed_actions.push(ManaCostAction::Pay { auto: false });
                     notify_mana_payment_resolved(agents, session.player, &executed_actions);
                     return ManaPaymentResult::paid();
@@ -333,18 +428,10 @@ where
 
                 mana_loop_invalid_count += 1;
                 if mana_loop_invalid_count > 3 {
-                    executed_actions.push(ManaCostAction::AttemptedAndFailed);
-                    notify_mana_payment_resolved(agents, session.player, &executed_actions);
-                    mana_pools[session.player.index()] = saved_pool.clone();
-                    return ManaPaymentResult::failed();
+                    fail_with_undo!();
                 }
             }
-            ManaCostAction::AttemptedAndFailed => {
-                executed_actions.push(ManaCostAction::AttemptedAndFailed);
-                notify_mana_payment_resolved(agents, session.player, &executed_actions);
-                mana_pools[session.player.index()] = saved_pool.clone();
-                return ManaPaymentResult::failed_preserving_taps();
-            }
+            ManaCostAction::AttemptedAndFailed => { fail_with_undo!(); }
         }
     }
 }
@@ -459,7 +546,7 @@ impl GameLoop {
                         false,
                     );
                     crate::ability::effects::emit_zone_trigger_with_lki_counters(
-                        trigger_handler,
+                        trigger_handler, game,
                         sacrificed_id,
                         ZoneType::Battlefield,
                         ZoneType::Graveyard,
@@ -594,6 +681,29 @@ impl GameLoop {
         );
         self.invalidate_mana_undo_for_player(session.player);
         paid
+    }
+}
+
+// Deliberately narrow proof for selective reversal: ordinary tap mana, with
+// at most a direct draw for its controller, and no active global triggered or
+// replacement effects. Other cases keep the existing unsupported guard.
+fn no_active_trigger_or_replacement(game: &GameState) -> bool {
+    !game.cards.iter().any(|c| matches!(c.zone, ZoneType::Battlefield | ZoneType::Command)
+        && (!c.triggers.is_empty() || !c.replacement_effects.is_empty()))
+}
+
+fn independent_mana_draw_only(game: &GameState, source: CardId, ab: &ActivatedAbility) -> bool {
+    if !ab.ability_kind.eq_ignore_ascii_case("Mana") || ab.cost.parts.len() != 1
+        || !matches!(ab.cost.parts[0], crate::cost::CostPart::Tap) { return false; }
+    if !no_active_trigger_or_replacement(game) { return false; }
+    match &ab.sub_ability {
+        None => true,
+        Some(key) => game.card(source).svars.get(key).is_some_and(|raw| {
+            let p = crate::parsing::Params::from_raw(raw);
+            p.get("DB") == Some("Draw") && p.get("Defined") == Some("You")
+                && p.get("NumCards").is_some_and(|n| n.parse::<u32>().is_ok())
+                && p.inner().keys().all(|k| matches!(k.as_str(), "DB" | "Defined" | "NumCards" | "SpellDescription"))
+        }),
     }
 }
 

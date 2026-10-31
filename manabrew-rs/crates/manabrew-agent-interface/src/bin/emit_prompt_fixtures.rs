@@ -89,6 +89,8 @@ fn main() {
         ChooseAttackers(choose_attackers::ChooseAttackersInput {
             attackers: vec![],
             attack_targets: vec![],
+            max_attackers: None,
+            target_limits: Default::default(),
         }),
         ChooseBlockers(choose_blockers::ChooseBlockersInput {
             attackers: vec![],

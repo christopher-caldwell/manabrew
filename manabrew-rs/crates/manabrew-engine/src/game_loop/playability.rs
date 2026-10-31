@@ -88,6 +88,7 @@ impl GameLoop {
         );
         let payment_ctx = mana::ManaPaymentContext {
             is_spell: true,
+            payment_card: Some(host.id),
             is_activated_ability: false,
             sa_on_stack: false,
             type_line: Some(host.type_line.clone()),
@@ -392,6 +393,7 @@ impl GameLoop {
                 // must not count toward availability.
                 let payment_ctx = mana::ManaPaymentContext {
                     is_spell: true,
+                    payment_card: Some(card_id),
                     is_activated_ability: false,
                     sa_on_stack: false,
                     type_line: Some(card.type_line.clone()),
@@ -558,14 +560,13 @@ impl GameLoop {
                 };
 
                 // Blitz: alt cost
-                let blitz_ok = if let Some(blitz_cost_str) = card.get_blitz_cost() {
-                    let adjusted = cost_adj
-                        .apply(&forge_foundation::ManaCost::parse(&blitz_cost_str))
-                        .add(&raise_mana);
-                    available_mana.can_pay(&adjusted)
-                } else {
-                    false
-                };
+                let blitz_cost = card.get_blitz_cost().map(|s| forge_foundation::ManaCost::parse(&s))
+                    .or_else(|| crate::cost::cost_adjustment::granted_stack_blitz_cost(game, card, player));
+                let blitz_ok = if let Some(blitz_cost) = blitz_cost {
+                    let blitz_adjustment = crate::cost::cost_adjustment::compute_cost_adjustment_for_alt(
+                        game, card, player, ZoneType::Hand, &[], Some(crate::spellability::AlternativeCost::Blitz));
+                    available_mana.can_pay(&blitz_adjustment.apply(&blitz_cost).add(&raise_mana))
+                } else { false };
 
                 // Overload: alt cost
                 let overload_ok = if let Some(ovl_cost_str) = card.get_overload_cost() {
@@ -1195,6 +1196,7 @@ impl GameLoop {
                 // from chosen-type-gated sources.
                 let payment_ctx = mana::ManaPaymentContext {
                     is_spell: true,
+                    payment_card: Some(card_id),
                     is_activated_ability: false,
                     sa_on_stack: false,
                     type_line: Some(card.type_line.clone()),

@@ -130,7 +130,7 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
 
             if !countered_sa.is_activated && !countered_sa.is_trigger {
                 ctx.move_card(source_card, dest_zone, owner);
-                emit_zone_trigger(ctx.trigger_handler, source_card, ZoneType::Stack, dest_zone);
+                emit_zone_trigger(ctx.trigger_handler, ctx.game, source_card, ZoneType::Stack, dest_zone);
             }
 
             // Fire Countered trigger

@@ -473,6 +473,11 @@ pub struct StackObjectDto {
     pub source_ability_text: Option<String>,
     pub is_permanent_spell: bool,
     pub is_casting: bool,
+    /// An estimate for a directly targeted damage effect when its amount is known.
+    /// Absence means unknown, not zero or guaranteed prevention.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub known_damage: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub source_card: Option<CardDto>,

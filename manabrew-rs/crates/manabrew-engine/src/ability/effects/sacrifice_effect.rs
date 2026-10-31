@@ -55,11 +55,6 @@ fn do_sacrifice(
         .card_mut(card_id)
         .set_lki_power_toughness(Some(lki_power), Some(lki_toughness));
 
-    // Clear temporary Animate triggers before firing events (CR 400.7).
-    {
-        let card = ctx.game.card_mut(card_id);
-        card.clear_pump_triggers();
-    }
     // Fire Sacrificed trigger
     ctx.trigger_handler.run_trigger(
         TriggerType::Sacrificed,
@@ -73,7 +68,7 @@ fn do_sacrifice(
     // Emit ChangesZone before move so LKI state (counters, keywords)
     // is still available for trigger matching.
     emit_zone_trigger_with_lki_counters(
-        ctx.trigger_handler,
+        ctx.trigger_handler, ctx.game,
         card_id,
         ZoneType::Battlefield,
         ZoneType::Graveyard,
@@ -81,8 +76,9 @@ fn do_sacrifice(
         lki_power,
         lki_toughness,
     );
-    ctx.move_card(card_id, ZoneType::Graveyard, owner);
     ctx.trigger_handler.flush_waiting_triggers(ctx.game);
+    ctx.game.card_mut(card_id).clear_pump_triggers();
+    ctx.move_card(card_id, ZoneType::Graveyard, owner);
     // Fire Exploited trigger when the sacrifice is from the Exploit keyword
     if let Some(source_id) = exploit_source {
         ctx.trigger_handler.run_trigger(
@@ -317,11 +313,8 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
         .clone()
         .unwrap_or_else(|| "Self".to_string());
     // How many permanents to sacrifice (e.g. Annihilator N).
-    let amount: usize = sa
-        .ir
-        .amount
-        .as_deref()
-        .and_then(|s| s.parse().ok())
+    let amount: usize = sa.ir.amount.as_deref()
+        .map(|value| crate::svar::resolve_numeric_value(ctx.game, sa, value, 1).max(0) as usize)
         .unwrap_or(1);
 
     // Detect Exploit keyword sacrifice — fires TriggerType::Exploited after each sacrifice.
@@ -332,7 +325,12 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
     let is_strict = sa.ir.strict_amount;
     let defined = sa.defined().map(|s| s.to_lowercase()).unwrap_or_default();
 
-    let sacrificing_players = get_target_players(ctx.game, sa);
+    let sacrificing_players = if let Some(uid) = defined.strip_prefix("carduid_").and_then(|s| s.parse::<u32>().ok()) {
+        let id = CardId(uid);
+        ctx.game.cards.get(id.index()).filter(|card| card.zone == ZoneType::Battlefield
+            && sa.trigger_source_zone_timestamp.is_none_or(|timestamp| card.zone_timestamp == timestamp))
+            .map(|card| vec![card.controller]).unwrap_or_default()
+    } else { get_target_players(ctx.game, sa) };
 
     // Track per-controller batches so a single SacrificedOnce trigger fires after
     // each player's batch (mirrors Java GameAction.sacrifice line 2133-2138).

@@ -89,7 +89,7 @@ pub fn resolve(ctx: &mut EffectContext, sa: &SpellAbility, is_cloak: bool) {
 
         // Fire zone change triggers
         super::zone_triggers::emit_zone_trigger(
-            ctx.trigger_handler,
+            ctx.trigger_handler, ctx.game,
             card_id,
             forge_foundation::ZoneType::Library,
             forge_foundation::ZoneType::Battlefield,

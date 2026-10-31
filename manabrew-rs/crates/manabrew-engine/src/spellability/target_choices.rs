@@ -27,6 +27,9 @@ pub struct TargetChoices {
     /// Mirrors Java's `TargetChoices.dividedMap`.
     #[serde(skip)]
     pub divided_map: HashMap<CardId, i32>,
+    /// Object identity for additional card targets.
+    #[serde(default)]
+    pub additional_card_timestamps: HashMap<CardId, u64>,
 }
 
 impl TargetChoices {
@@ -85,6 +88,7 @@ impl TargetChoices {
             self.target_card_zone_timestamp = None;
         }
         self.divided_map.remove(&card);
+        self.additional_card_timestamps.remove(&card);
     }
 
     /// Clear all targets.
@@ -96,6 +100,7 @@ impl TargetChoices {
         self.additional_target_players.clear();
         self.target_stack_entry = None;
         self.divided_map.clear();
+        self.additional_card_timestamps.clear();
     }
 
     /// Check if a card is targeted.
@@ -107,6 +112,7 @@ impl TargetChoices {
     /// Replace one card target with another.
     /// Mirrors Java's `TargetChoices.replaceTargetCard(Card, Card)`.
     pub fn replace_target_card(&mut self, old: CardId, new: CardId) {
+        self.additional_card_timestamps.remove(&old);
         if self.target_card == Some(old) {
             self.target_card = Some(new);
             self.target_card_zone_timestamp = None;

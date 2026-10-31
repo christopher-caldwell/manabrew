@@ -88,5 +88,9 @@ pub struct AgentPrompt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub source_ability_text: Option<String>,
+    /// Known prospective damage for the ability currently choosing targets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub known_damage: Option<i32>,
     pub input: PromptInput,
 }

@@ -284,9 +284,16 @@ fn matches_condition_filter_no_self_exclude(
 ) -> bool {
     let card = game.card(cid);
     let source = game.card(source_id);
-    alternatives
-        .iter()
-        .any(|alt| crate::card::valid_filter::matches_valid(alt, Some(card), None, source, player))
+    alternatives.iter().any(|alt| {
+        let selector = crate::parsing::cached_compiled_selector(alt);
+        crate::card::valid_filter::matches_valid_card_selector_with_context(
+            &selector,
+            card,
+            crate::card::valid_filter::MatchContext::from_source(source)
+                .with_game(game)
+                .with_source_controller(player),
+        )
+    })
 }
 
 #[cfg(test)]

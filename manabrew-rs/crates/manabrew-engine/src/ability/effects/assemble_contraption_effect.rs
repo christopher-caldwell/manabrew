@@ -57,7 +57,7 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
             ctx.game
                 .move_card(card_id, ZoneType::Battlefield, controller);
             super::emit_zone_trigger(
-                ctx.trigger_handler,
+                ctx.trigger_handler, ctx.game,
                 card_id,
                 old_zone,
                 ZoneType::Battlefield,

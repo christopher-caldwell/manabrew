@@ -166,6 +166,17 @@ impl SpellAbilityRestriction {
             }
         }
 
+        // Numeric activation conditions are separate from presence restrictions.
+        if let Some(value) = get("CheckSVar") {
+            self.variables.sets_var_to_check(value);
+        }
+        if let Some(compare) = get("SVarCompare") {
+            if let (Some(operator), Some(operand)) = (compare.get(..2), compare.get(2..)) {
+                self.variables.sets_var_operator(operator);
+                self.variables.sets_var_operand(operand);
+            }
+        }
+
         // Parse cards in hand requirement
         if let Some(count_str) = get("ActivateCardsInHand") {
             if let Ok(count) = count_str.parse::<i32>() {
@@ -262,6 +273,30 @@ impl SpellAbilityRestriction {
 
         if !self.check_presence_restriction(game, card_id, player, sa) {
             return false;
+        }
+
+        if let Some(value) = self.variables.gets_var_to_check() {
+            let fallback = SpellAbility::new_empty(Some(card_id), player);
+            let ability = sa.unwrap_or(&fallback);
+            let actual = crate::svar::resolve_numeric_value(game, ability, value, i32::MIN);
+            let operand = crate::svar::resolve_numeric_value(
+                game,
+                ability,
+                self.variables.gets_var_operand().unwrap_or("1"),
+                i32::MIN,
+            );
+            if actual == i32::MIN || operand == i32::MIN {
+                return false;
+            }
+            let expression = format!(
+                "{}{operand}",
+                self.variables.gets_var_operator().unwrap_or("GE")
+            );
+            if !crate::parsing::compare::CompareExpr::parse(&expression)
+                .is_some_and(|comparison| comparison.evaluate(actual))
+            {
+                return false;
+            }
         }
 
         if let Some(class_level) = self.variables.class_level() {

@@ -159,6 +159,8 @@ thread_local! {
 }
 
 const RESTRICTION_KEYS: &[&str] = &[
+    "CheckSVar",
+    "SVarCompare",
     "Activation",
     "ActivationZone",
     "ActivationPhases",
@@ -401,6 +403,7 @@ pub fn build_spell_ability_for_host_card_cast(card: &Card, player: PlayerId) -> 
         optional_costs: Vec::new(),
         paid_hash: std::collections::HashMap::new(),
         paying_mana: Vec::new(),
+        paying_mana_sources: Vec::new(),
         paid_abilities: Vec::new(),
         mana_part: None,
         express_mana_choice: None,
@@ -561,6 +564,7 @@ fn build_spell_ability_of_type_with_params(
         optional_costs: Vec::new(),
         paid_hash: std::collections::HashMap::new(),
         paying_mana: Vec::new(),
+        paying_mana_sources: Vec::new(),
         paid_abilities: Vec::new(),
         mana_part,
         express_mana_choice: None,

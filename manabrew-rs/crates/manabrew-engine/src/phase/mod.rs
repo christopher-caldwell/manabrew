@@ -149,6 +149,9 @@ pub struct TurnState {
     pub priority_player: PlayerId,
     #[serde(default)]
     pub is_extra_turn: bool,
+    /// The regular-turn player whose turn was interrupted by extra turns.
+    #[serde(default)]
+    pub extra_turn_anchor: Option<PlayerId>,
     pub num_players: u32,
 
     // Combat tracking
@@ -170,6 +173,7 @@ impl TurnState {
             priority_player: active_player,
             num_players,
             is_extra_turn: false,
+            extra_turn_anchor: None,
             combat_attackers_declared: false,
             combat_blockers_declared: false,
             combat_block_assignments: vec![],
@@ -226,6 +230,7 @@ impl TurnState {
         player_order: &[PlayerId],
     ) -> Option<(PlayerId, bool)> {
         if let Some(extra_turn) = extra_turns.pop_front() {
+            if !self.is_extra_turn { self.extra_turn_anchor = Some(self.active_player); }
             let player = extra_turn.player;
             self.active_player = player;
             self.priority_player = player;
@@ -241,6 +246,7 @@ impl TurnState {
                 None
             }
         } else {
+            if let Some(anchor) = self.extra_turn_anchor.take() { self.active_player = anchor; }
             self.is_extra_turn = false;
             self.next_player_turn(player_order);
             None

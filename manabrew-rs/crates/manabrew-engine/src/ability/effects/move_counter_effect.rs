@@ -26,7 +26,9 @@ use crate::parsing::keys;
 fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
     let counter_type = sa.ir.counter_type.clone().unwrap_or(CounterType::P1P1);
     let count = resolve_numeric_svar(ctx.game, sa, keys::COUNTER_NUM, 1);
-    if count <= 0 {
+    let all_types = sa.ir.counter_type_text.as_deref() == Some("All");
+    let all_count = sa.ir.counter_num_text.as_deref() == Some("All");
+    if count <= 0 && !all_count {
         return;
     }
 
@@ -78,32 +80,16 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
         return;
     }
 
-    // Calculate how many we can actually move
-    let available = ctx.game.card(from).counter_count(&counter_type);
-    let actual = count.min(available);
-    if actual <= 0 {
-        return;
+    let counters: Vec<_> = if all_types {
+        ctx.game.card(from).counters.iter().filter(|(_, n)| **n > 0).map(|(kind, n)| (kind.clone(), *n)).collect()
+    } else {
+        vec![(counter_type.clone(), ctx.game.card(from).counter_count(&counter_type))]
+    };
+    for (kind, available) in counters {
+        let amount = if all_count { available } else { count.min(available) };
+        if amount <= 0 || ctx.game.card(to).phased_out
+            || crate::staticability::static_ability_cant_put_counter::any_cant_put_counter_on_card(&ctx.game.cards, ctx.game.card(to), &kind) { continue; }
+        let moved = super::effect_context::remove_counter_with_context(ctx.game, ctx.trigger_handler, from, &kind, amount, RunParams { player: Some(sa.activating_player), ..Default::default() });
+        ctx.add_counter(to, &kind, moved, sa, RunParams::default());
     }
-
-    if ctx.game.card(to).phased_out
-        || crate::staticability::static_ability_cant_put_counter::any_cant_put_counter_on_card(
-            &ctx.game.cards,
-            ctx.game.card(to),
-            &counter_type,
-        )
-    {
-        return;
-    }
-    let actual = super::effect_context::remove_counter_with_context(
-        ctx.game,
-        ctx.trigger_handler,
-        from,
-        &counter_type,
-        actual,
-        RunParams {
-            player: Some(sa.activating_player),
-            ..Default::default()
-        },
-    );
-    ctx.add_counter(to, &counter_type, actual, sa, RunParams::default());
 }

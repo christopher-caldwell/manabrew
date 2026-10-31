@@ -224,6 +224,11 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
             }
             let old_zone = ctx.game.card(card_id).zone;
             ctx.move_card(card_id, dest_zone, dest_owner);
+            if sa.is_remember_changed() {
+                if let Some(source) = sa.source {
+                    ctx.game.card_mut(source).add_remembered_card(card_id);
+                }
+            }
             if dest_zone == ZoneType::Library {
                 moved_to_library.push((card_id, dest_owner));
             }
@@ -241,7 +246,7 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
                 ctx.trigger_handler
                     .register_active_trigger(ctx.game, card_id);
             }
-            emit_zone_trigger(ctx.trigger_handler, card_id, old_zone, dest_zone);
+            emit_zone_trigger(ctx.trigger_handler, ctx.game, card_id, old_zone, dest_zone);
         }
 
         if dest_zone == ZoneType::Library && sa.library_position() == Some("-1") {

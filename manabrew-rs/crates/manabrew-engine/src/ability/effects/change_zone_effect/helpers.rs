@@ -300,6 +300,7 @@ pub(super) fn apply_post_move(
     dest_zone: ZoneType,
     dest_owner: PlayerId,
     lib_position: &str,
+    defer_entry_event: bool,
 ) {
     let controller = sa.activating_player;
     let exile_source = sa.source.and_then(|source_id| {
@@ -551,8 +552,10 @@ pub(super) fn apply_post_move(
         }
     }
 
-    emit_zone_trigger(ctx.trigger_handler, card_id, old_zone, dest_zone);
-    ctx.trigger_handler.flush_waiting_triggers(ctx.game);
+    if !defer_entry_event {
+        emit_zone_trigger(ctx.trigger_handler, ctx.game, card_id, old_zone, dest_zone);
+        ctx.trigger_handler.flush_waiting_triggers(ctx.game);
+    }
 }
 
 // ─── Warp Effect ────────────────────────────────────────────────────────────

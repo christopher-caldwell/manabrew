@@ -18,9 +18,15 @@ pub struct ManaPaymentOutcome {
     pub life_paid: i32,
     pub colors_spent: u16,
     pub paying_mana: Vec<u16>,
+    pub paying_mana_sources: Vec<Option<CardId>>,
+    // Original objects permit cancellation to return restrictions and metadata intact.
+    pub paying_mana_details: Vec<Mana>,
 }
 
 fn mana_matches_context(mana: &Mana, ctx: &ManaPaymentContext) -> bool {
+    if let Some(spell) = mana.convoke_for {
+        if !ctx.is_spell || ctx.payment_card != Some(spell) { return false; }
+    }
     let Some(restriction) = &mana.restriction else {
         return true;
     };
@@ -50,6 +56,8 @@ pub struct ManaPool {
     mana: Vec<Mana>,
     #[serde(skip)]
     last_payment_atoms: Vec<u16>,
+    #[serde(skip)]
+    last_payment_sources: Vec<Option<CardId>>,
     #[serde(skip)]
     record_payment_atoms: bool,
     /// `(svar_name, source_card)` pairs from mana spent during the most
@@ -83,7 +91,10 @@ impl ManaPool {
 
     pub fn clear_last_payment_atoms(&mut self) {
         self.last_payment_atoms.clear();
+        self.last_payment_sources.clear();
     }
+
+    pub fn last_payment_sources(&self) -> &[Option<CardId>] { &self.last_payment_sources }
 
     pub fn last_payment_atoms(&self) -> &[u16] {
         &self.last_payment_atoms
@@ -177,6 +188,31 @@ impl ManaPool {
         &self.mana
     }
 
+    pub(crate) fn add_convoke_contribution(&mut self, contribution: Mana) {
+        debug_assert!(contribution.convoke_for.is_some());
+        // Consume the player's selected contribution before equivalent mana.
+        self.mana.insert(0, contribution);
+    }
+
+    /// Remove only this exact pending spell's convoke contribution.
+    pub(crate) fn remove_convoke(&mut self, spell: CardId, source: CardId) -> bool {
+        if let Some(index) = self.mana.iter().position(|m| m.convoke_for == Some(spell) && m.convoke_source == Some(source)) {
+            self.mana.remove(index); true
+        } else { false }
+    }
+
+    pub(crate) fn take_convoke_contributions(&mut self, spell: CardId) -> Vec<Mana> {
+        let mut held = Vec::new();
+        self.mana.retain(|m| {
+            if m.convoke_for == Some(spell) { held.push(m.clone()); false } else { true }
+        });
+        held
+    }
+
+    pub(crate) fn restore_convoke_contributions(&mut self, held: Vec<Mana>) {
+        for contribution in held.into_iter().rev() { self.mana.insert(0, contribution); }
+    }
+
     /// Get a bitmask of all colors present in the pool.
     pub fn colors_present(&self) -> u16 {
         let mut mask = 0u16;
@@ -232,6 +268,7 @@ impl ManaPool {
             if self.mana[idx].color == atom {
                 if self.record_payment_atoms {
                     self.last_payment_atoms.push(atom);
+                    self.last_payment_sources.push(self.mana[idx].source_card);
                 }
                 self.mana.remove(idx);
                 remaining -= 1;
@@ -341,7 +378,7 @@ impl ManaPool {
     }
 
     /// Create a clone with restricted mana filtered out based on context.
-    fn filtered_for_context(&self, ctx: &ManaPaymentContext) -> ManaPool {
+    pub(crate) fn filtered_for_context(&self, ctx: &ManaPaymentContext) -> ManaPool {
         let mut pool = self.clone();
         pool.mana.retain(|m| mana_matches_context(m, ctx));
         pool
@@ -501,14 +538,20 @@ impl ManaPool {
                 break;
             };
             let mana = self.mana.remove(idx);
-            outcome.colors_spent |= spent_color;
-            outcome.paying_mana.push(spent_color);
+            if mana.convoke_for.is_none() {
+                outcome.colors_spent |= spent_color;
+                outcome.paying_mana.push(spent_color);
+                outcome.paying_mana_sources.push(mana.source_card);
+            }
+            // Keep the exact contribution for rollback even though it is not mana spent.
+            outcome.paying_mana_details.push(mana.clone());
             if let (Some(svar), Some(src)) = (mana.triggers_when_spent, mana.source_card) {
                 self.last_payment_triggers_consumed.push((svar, src));
             }
         }
 
         self.last_payment_atoms = outcome.paying_mana.clone();
+        self.last_payment_sources = outcome.paying_mana_sources.clone();
         outcome
     }
 
@@ -743,13 +786,18 @@ impl ManaPool {
         if self.total_mana() < extra_generic {
             return false;
         }
+        self.last_payment_atoms.clear();
+        self.last_payment_sources.clear();
+        self.record_payment_atoms = true;
         self.pay_generic(extra_generic);
+        self.record_payment_atoms = false;
         true
     }
 
     /// Try to pay a mana cost, deducting from the pool. Returns true if successful.
     pub fn try_pay(&mut self, cost: &forge_foundation::ManaCost) -> bool {
         self.last_payment_atoms.clear();
+        self.last_payment_sources.clear();
         self.record_payment_atoms = true;
         // First, pay colored shards
         for shard in cost.shards() {
@@ -764,6 +812,7 @@ impl ManaPool {
                 if let Some(idx) = self.mana.iter().position(|m| m.is_snow) {
                     if self.record_payment_atoms {
                         self.last_payment_atoms.push(self.mana[idx].color);
+                        self.last_payment_sources.push(self.mana[idx].source_card);
                     }
                     self.mana.remove(idx);
                     continue;
@@ -849,6 +898,7 @@ impl ManaPool {
     /// All colored mana can pay for any colored shard.
     pub fn try_pay_any_color(&mut self, cost: &forge_foundation::ManaCost) -> bool {
         self.last_payment_atoms.clear();
+        self.last_payment_sources.clear();
         self.record_payment_atoms = true;
         for shard in cost.shards() {
             if shard.is_x() {
@@ -859,6 +909,7 @@ impl ManaPool {
                 if let Some(idx) = self.mana.iter().position(|m| m.is_snow) {
                     if self.record_payment_atoms {
                         self.last_payment_atoms.push(self.mana[idx].color);
+                        self.last_payment_sources.push(self.mana[idx].source_card);
                     }
                     self.mana.remove(idx);
                     continue;
@@ -1059,6 +1110,7 @@ impl ManaPool {
     ) -> Option<ManaPaymentOutcome> {
         use super::mana_cost_being_paid::ManaCostBeingPaid;
         self.last_payment_atoms.clear();
+        self.last_payment_sources.clear();
         self.record_payment_atoms = true;
         let unpaid = ManaCostBeingPaid::from_mana_cost(cost);
         let mut best: Option<(i32, Vec<usize>)> = None;
@@ -1077,10 +1129,14 @@ impl ManaPool {
         };
         let mut colors_spent = 0u16;
         let mut paying_mana = Vec::new();
+        let mut paying_mana_sources = Vec::new();
         let mut triggers_consumed: Vec<(String, CardId)> = Vec::new();
         for &idx in &spent_indices {
-            colors_spent |= self.mana[idx].color;
-            paying_mana.push(self.mana[idx].color);
+            if self.mana[idx].convoke_for.is_none() {
+                colors_spent |= self.mana[idx].color;
+                paying_mana.push(self.mana[idx].color);
+                paying_mana_sources.push(self.mana[idx].source_card);
+            }
             if let (Some(svar), Some(src)) = (
                 self.mana[idx].triggers_when_spent.as_ref(),
                 self.mana[idx].source_card,
@@ -1092,12 +1148,15 @@ impl ManaPool {
             self.mana.remove(idx);
         }
         self.last_payment_atoms = paying_mana.clone();
+        self.last_payment_sources = paying_mana_sources.clone();
         self.last_payment_triggers_consumed = triggers_consumed;
         self.record_payment_atoms = false;
         Some(ManaPaymentOutcome {
             life_paid: life_to_pay,
             colors_spent,
             paying_mana,
+            paying_mana_sources,
+            paying_mana_details: Vec::new(),
         })
     }
 
@@ -1328,6 +1387,39 @@ impl ManaPool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn convoke_commit_is_not_reported_as_mana_spent() {
+        use super::*;
+        use forge_foundation::{mana::ManaAtom, ManaCost};
+        let spell=CardId(3); let source=CardId(4);
+        let mut pool=ManaPool::new(); let mut real=Mana::simple(ManaAtom::GREEN); real.source_card=Some(CardId(9)); pool.add_mana(real);
+        let mut convoke=Mana::simple(ManaAtom::GREEN); convoke.convoke_for=Some(spell); convoke.convoke_source=Some(source); pool.add_convoke_contribution(convoke);
+        let ctx=ManaPaymentContext {is_spell:true,payment_card:Some(spell),..Default::default()};
+        let paid=pool.try_pay_for_spell_converted_with_phyrexian_life_result(&ManaCost::parse("1 G"),&ctx,false,40).unwrap();
+        assert_eq!(paid.paying_mana,vec![ManaAtom::GREEN]); assert_eq!(paid.paying_mana_sources,vec![Some(CardId(9))]); assert_eq!(pool.total_mana(),0);
+    }
+
+    #[test]
+    fn convoke_contribution_is_spell_scoped_and_removal_preserves_real_mana() {
+        use super::*;
+        use forge_foundation::mana::ManaAtom;
+        let spell=CardId(3); let source=CardId(4);
+        let mut pool=ManaPool::new();
+        let mut ordinary=Mana::simple(ManaAtom::GREEN); ordinary.source_card=Some(CardId(9));
+        let mut restricted=Mana::simple(ManaAtom::GREEN); restricted.restriction=Some("Spell.Creature".into());
+        let mut contribution=Mana::simple(ManaAtom::GREEN); contribution.convoke_for=Some(spell); contribution.convoke_source=Some(source);
+        pool.add_mana(ordinary.clone()); pool.add_mana(restricted.clone()); pool.add_mana(contribution);
+        let nested=ManaPaymentContext {is_spell:false,is_activated_ability:true,payment_card:Some(CardId(8)),..Default::default()};
+        let wrong_spell=ManaPaymentContext {is_spell:true,payment_card:Some(CardId(5)),..Default::default()};
+        let same_spell=ManaPaymentContext {is_spell:true,payment_card:Some(spell),..Default::default()};
+        assert_eq!(pool.filtered_for_context(&nested).total_mana(),1);
+        assert_eq!(pool.filtered_for_context(&wrong_spell).total_mana(),1);
+        assert_eq!(pool.filtered_for_context(&same_spell).total_mana(),2);
+        let held=pool.take_convoke_contributions(spell); assert_eq!(held.len(),1); assert_eq!(pool.total_mana(),2);
+        pool.restore_convoke_contributions(held);
+        assert!(pool.remove_convoke(spell,source)); assert!(!pool.remove_convoke(spell,source));
+        assert_eq!(pool.mana_entries(),&[ordinary,restricted]);
+    }
     use super::*;
     use forge_foundation::ManaCost;
 
@@ -1375,5 +1467,50 @@ mod tests {
 
         assert_eq!(life_paid, Some(4));
         assert_eq!(pool.total_mana(), 0);
+    }
+}
+
+#[cfg(test)]
+mod source_attribution_regression {
+    use super::*;
+    use forge_foundation::{mana::ManaAtom, ManaCost};
+    use crate::ids::CardId;
+
+    #[test]
+    fn multicolor_single_source_and_unknown_source_are_not_invented() {
+        let mut pool = ManaPool::new();
+        for color in [ManaAtom::GREEN, ManaAtom::BLUE] {
+            let mut mana = Mana::simple(color);
+            mana.source_card = Some(CardId(17));
+            pool.add_mana(mana);
+        }
+        assert_eq!(pool.try_pay_with_phyrexian_life_unrestricted(&ManaCost::parse("G U"), 40), Some(0));
+        assert_eq!(pool.last_payment_atoms().len(), 2);
+        assert_eq!(pool.last_payment_sources(), &[Some(CardId(17)), Some(CardId(17))]);
+        pool.add(ManaAtom::GREEN, 1);
+        assert_eq!(pool.try_pay_with_phyrexian_life_unrestricted(&ManaCost::parse("G"), 40), Some(0));
+        assert_eq!(pool.last_payment_sources(), &[None]);
+    }
+
+    #[test]
+    fn generic_extra_payment_retains_actual_source() {
+        let mut pool = ManaPool::new();
+        let mut mana = Mana::simple(ManaAtom::BLUE);
+        mana.source_card = Some(CardId(9));
+        pool.add_mana(mana);
+        assert!(pool.try_pay_extra_generic(1));
+        assert_eq!(pool.last_payment_atoms(), &[ManaAtom::BLUE]);
+        assert_eq!(pool.last_payment_sources(), &[Some(CardId(9))]);
+    }
+
+    #[test]
+    fn unsuccessful_payment_does_not_claim_sources_or_consume_mana() {
+        let mut pool = ManaPool::new();
+        let mut mana = Mana::simple(ManaAtom::GREEN);
+        mana.source_card = Some(CardId(17));
+        pool.add_mana(mana);
+        assert!(pool.try_pay_with_phyrexian_life_unrestricted(&ManaCost::parse("G U"), 40).is_none());
+        assert!(pool.last_payment_sources().is_empty());
+        assert_eq!(pool.total_mana(), 1);
     }
 }

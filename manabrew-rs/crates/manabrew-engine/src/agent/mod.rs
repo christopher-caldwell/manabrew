@@ -131,6 +131,8 @@ pub trait PlayerAgent {
         request_action_space: &mut dyn FnMut() -> PriorityActionSpace,
     ) -> PlayerAction;
 
+    fn set_attack_requirements(&mut self, _required: &[CardId], _goaded: &[(CardId, PlayerId)], _legal: &[(CardId, Vec<DefenderId>)], _max_attackers: Option<usize>, _target_limits: &[(DefenderId, usize)]) {}
+
     /// Choose attackers from available creatures, assigning each to a defender.
     /// `possible_defenders` lists valid attack targets (opponent players + their planeswalkers).
     /// Returns (attacker, defender) pairs.
@@ -299,6 +301,27 @@ pub trait PlayerAgent {
         valid: &[PlayerId],
         sa: Option<&SpellAbility>,
     ) -> Option<PlayerId>;
+
+    /// Select distinct target players, with an explicit legal minimum and maximum.
+    /// The default supports non-interactive agents by asking from remaining candidates.
+    fn choose_target_players(
+        &mut self,
+        player: PlayerId,
+        valid: &[PlayerId],
+        _min: usize,
+        max: usize,
+        sa: Option<&SpellAbility>,
+    ) -> Vec<PlayerId> {
+        let mut remaining = valid.to_vec();
+        let mut selected = Vec::new();
+        while selected.len() < max && !remaining.is_empty() {
+            let Some(chosen) = self.choose_target_player(player, &remaining, sa) else { break; };
+            if !remaining.contains(&chosen) { break; }
+            selected.push(chosen);
+            remaining.retain(|&id| id != chosen);
+        }
+        selected
+    }
 
     /// Choose a target card (e.g. for Lightning Bolt targeting a creature).
     fn choose_target_card(

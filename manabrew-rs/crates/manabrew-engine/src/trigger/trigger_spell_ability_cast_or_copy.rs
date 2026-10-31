@@ -91,8 +91,8 @@ impl TriggerBehavior for TriggerSpellAbilityCastOrCopy {
         if let Some(lki) = params.card_lki {
             sa.set_triggering_object(crate::ability::AbilityKey::CardLKI, lki.0.to_string());
         }
-        if let Some(p) = params.activator {
-            sa.set_triggering_object(crate::ability::AbilityKey::Activator, p.0.to_string());
+        if let Some(p) = params.activator.or(params.spell_controller) {
+            sa.set_triggering_object(crate::ability::AbilityKey::Activator, p);
         }
         // TODO: port CurrentStormCount triggering object - not yet in RunParams
         // TODO: port CurrentCastSpells triggering object - not yet in RunParams

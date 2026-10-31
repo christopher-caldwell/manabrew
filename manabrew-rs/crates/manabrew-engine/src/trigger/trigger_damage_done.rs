@@ -13,6 +13,8 @@ pub struct TriggerDamageDone {
     pub valid_source: Option<crate::parsing::CompiledSelector>,
     pub valid_target: Option<crate::parsing::CompiledSelector>,
     pub combat_damage_only: bool,
+    #[serde(default)]
+    pub damage_amount: Option<String>,
 }
 
 impl TriggerDamageDone {
@@ -21,6 +23,7 @@ impl TriggerDamageDone {
             valid_source: params.selector_cloned(keys::VALID_SOURCE),
             valid_target: params.selector_cloned(keys::VALID_TARGET),
             combat_damage_only: params.is_true(keys::COMBAT_DAMAGE),
+            damage_amount: params.get_cloned(keys::DAMAGE_AMOUNT),
         })
     }
 }
@@ -39,6 +42,24 @@ impl TriggerBehavior for TriggerDamageDone {
     ) -> bool {
         if self.combat_damage_only && params.is_combat_damage != Some(true) {
             return false;
+        }
+        if let Some(expression) = &self.damage_amount {
+            let Some(actual) = params.damage_amount else {
+                return false;
+            };
+            let expression = if let Some(operator) = expression.strip_suffix("TargetToughness") {
+                let Some(target) = params.damage_target_card else {
+                    return false;
+                };
+                format!("{operator}{}", game.card(target).toughness())
+            } else {
+                expression.clone()
+            };
+            if !crate::parsing::compare::CompareExpr::parse(&expression)
+                .is_some_and(|comparison| comparison.evaluate(actual))
+            {
+                return false;
+            }
         }
         trigger.matches_optional_valid_card_filter(&self.valid_source, params.damage_source, game)
             && trigger.matches_damage_target_filter(&self.valid_target, params, game, true)

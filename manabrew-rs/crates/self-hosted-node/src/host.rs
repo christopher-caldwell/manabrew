@@ -2874,6 +2874,7 @@ mod local_bot_tests {
             deciding_player_id: player_slot(seat),
             source_card: None,
             source_ability_text: None,
+        known_damage: None,
             input: PromptInput::ChooseAction(ChooseActionInput {
                 actions: Vec::new(),
             }),

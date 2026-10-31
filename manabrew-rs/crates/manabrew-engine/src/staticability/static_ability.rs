@@ -884,6 +884,9 @@ pub struct CardFilter {
     pub commander_only: bool,
     /// Only match cards with this subtype (e.g. `"Goblin"`, `"Warrior"`).
     pub subtype: Option<String>,
+    /// Exclude this creature subtype (for example, nonHuman).
+    #[serde(default)]
+    pub excluded_subtype: Option<String>,
     /// Only match non-land permanents.
     pub nonland_only: bool,
     /// Only match land permanents.
@@ -953,6 +956,9 @@ impl CardFilter {
             "sharesCreatureTypeWith" => f.shares_creature_type_with_source = true,
             "SharesColorWith Equipped" => f.shares_color_with_equipped = true,
             "sharesCreatureTypeWith Equipped" => f.shares_creature_type_with_equipped = true,
+            s if s.starts_with("non") && s.len()>3 && crate::game::TypeRegistry::is_creature_type(&s[3..]) => {
+                f.excluded_subtype = Some(s[3..].to_string());
+            }
             s if s.starts_with("named") => {
                 f.card_name = Some(s["named".len()..].to_string());
             }
@@ -987,6 +993,9 @@ impl CardFilter {
             if !card.has_subtype(sub) {
                 return false;
             }
+        }
+        if self.excluded_subtype.as_ref().is_some_and(|sub| card.has_subtype(sub)) {
+            return false;
         }
         if self.nonland_only && card.is_land() {
             return false;

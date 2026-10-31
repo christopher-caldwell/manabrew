@@ -15,26 +15,116 @@ use crate::ids::{CardId, PlayerId};
 /// Phase in all directly-phased-out permanents controlled by the active player.
 /// Phase out all permanents with phasing controlled by the active player.
 pub fn do_phasing(game: &mut GameState, turn_player: PlayerId) {
-    // Phase in: all phased-out permanents controlled by turn_player
-    for i in 0..game.cards.len() {
-        if game.cards[i].phased_out
-            && game.cards[i].controller == turn_player
-            && game.cards[i].zone == ZoneType::Battlefield
-        {
-            game.cards[i].phased_out = false;
-        }
+    // Determine both sets before changing status. A permanent phasing in must
+    // not immediately phase back out because it has the Phasing keyword.
+    let returning: Vec<CardId> = game
+        .cards
+        .iter()
+        .filter(|c| {
+            c.zone == ZoneType::Battlefield
+                && c.phased_out
+                && c.phased_out_with.is_none()
+                && c.phased_out_controller.unwrap_or(c.controller) == turn_player
+                && !crate::staticability::static_ability_cant_phase::cant_phase_in(&game.cards, c)
+        })
+        .map(|c| c.id)
+        .collect();
+    let leaving: Vec<CardId> = game
+        .cards
+        .iter()
+        .filter(|c| {
+            c.zone == ZoneType::Battlefield
+                && !c.phased_out
+                && c.controller == turn_player
+                && c.has_keyword("Phasing")
+        })
+        .map(|c| c.id)
+        .collect();
+    phase_out_many(game, &leaving);
+    for id in returning {
+        phase_in(game, id);
     }
+}
 
-    // Phase out: all permanents with Phasing keyword controlled by turn_player
-    for i in 0..game.cards.len() {
-        if !game.cards[i].phased_out
-            && game.cards[i].controller == turn_player
-            && game.cards[i].zone == ZoneType::Battlefield
-            && game.cards[i].has_keyword("Phasing")
-        {
-            game.cards[i].phased_out = true;
+/// Apply simultaneous phasing with ancestors first, so a targeted attachment
+/// also attached to a targeted permanent phases indirectly (CR 702.26h).
+pub fn phase_out_many(game: &mut GameState, cards: &[CardId]) -> Vec<CardId> {
+    let mut ordered = cards.to_vec();
+    ordered.sort_by_key(|&id| {
+        let mut depth = 0;
+        let mut parent = game.card(id).attached_to;
+        while let Some(id) = parent {
+            depth += 1;
+            if depth >= game.cards.len() {
+                break;
+            }
+            parent = game.card(id).attached_to;
         }
+        depth
+    });
+    let mut changed = Vec::new();
+    for id in ordered {
+        changed.extend(phase_out(game, id));
     }
+    changed
+}
+
+/// Change status without zone movement, retaining counters and attachments.
+/// Attachments already phased out directly do not become indirect (CR 702.26g).
+pub fn phase_out(game: &mut GameState, root: CardId) -> Vec<CardId> {
+    if game.card(root).zone != ZoneType::Battlefield || game.card(root).phased_out {
+        return Vec::new();
+    }
+    let controller = game.card(root).controller;
+    game.card_mut(root).phased_out = true;
+    game.card_mut(root).phased_out_controller = Some(controller);
+    game.card_mut(root).phased_out_with = None;
+    let mut changed = vec![root];
+    let mut index = 0;
+    while index < changed.len() {
+        let host = changed[index];
+        let attached: Vec<_> = game
+            .cards
+            .iter()
+            .filter(|c| {
+                c.zone == ZoneType::Battlefield && !c.phased_out && c.attached_to == Some(host)
+            })
+            .map(|c| c.id)
+            .collect();
+        for id in attached {
+            game.card_mut(id).phased_out = true;
+            game.card_mut(id).phased_out_with = Some(root);
+            game.card_mut(id).phased_out_controller = None;
+            changed.push(id);
+        }
+        index += 1;
+    }
+    changed
+}
+
+pub fn phase_in(game: &mut GameState, root: CardId) -> Vec<CardId> {
+    if game.card(root).zone != ZoneType::Battlefield
+        || !game.card(root).phased_out
+        || game.card(root).phased_out_with.is_some()
+    {
+        return Vec::new();
+    }
+    let changed: Vec<_> = game
+        .cards
+        .iter()
+        .filter(|c| {
+            c.zone == ZoneType::Battlefield
+                && c.phased_out
+                && (c.id == root || c.phased_out_with == Some(root))
+        })
+        .map(|c| c.id)
+        .collect();
+    for &id in &changed {
+        game.card_mut(id).phased_out = false;
+        game.card_mut(id).phased_out_with = None;
+        game.card_mut(id).phased_out_controller = None;
+    }
+    changed
 }
 
 /// Handles day/night transitions at the beginning of untap.
@@ -85,7 +175,7 @@ pub fn do_untap(game: &mut GameState, active: PlayerId) -> Vec<CardId> {
     let mut untapped = Vec::new();
 
     for cid in cards {
-        if !game.card(cid).tapped {
+        if game.card(cid).phased_out || !game.card(cid).tapped {
             continue;
         }
 

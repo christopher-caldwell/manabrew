@@ -22,7 +22,7 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
     let trigger_params = Params::from_raw(&sa.ability_text);
     let mode = parsed.kind;
 
-    let execute_svar = if let Some(exec) = sa.ir.execute.as_deref() {
+    let mut execute_svar = if let Some(exec) = sa.ir.execute.as_deref() {
         if let Some(svar_text) = ctx.game.card(source_id).get_s_var(exec) {
             svar_text.to_string()
         } else {
@@ -31,6 +31,24 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
     } else {
         return;
     };
+
+    // CR 701.28: a delayed self-transform must retain the physical object and
+    // transformation identity at registration, not acquire fresh identity when
+    // the delayed trigger fires. These execution parameters are scoped runtime
+    // metadata, analogous to Forge's StoredTransform SVar, not card-name rules.
+    let execute_params = Params::from_raw(&execute_svar);
+    if execute_params.get("Mode") == Some("Transform")
+        && execute_params.get("Defined") == Some("Self")
+    {
+        let host = ctx.game.card(source_id);
+        execute_svar.push_str(&format!(
+            " | StoredTransform$ {} | StoredTransformZone$ {}",
+            host.transform_timestamp,
+            sa.trigger_source_zone_timestamp
+                .or(sa.source_zone_timestamp)
+                .unwrap_or(host.zone_timestamp),
+        ));
+    }
 
     let mut remembered_amount = 0;
     if sa.ir.remember_number {

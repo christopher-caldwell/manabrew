@@ -13,6 +13,7 @@ pub struct TriggerDrawn {
     pub valid_card: Option<crate::parsing::CompiledSelector>,
     pub valid_player: Option<crate::parsing::CompiledSelector>,
     pub number: Option<i32>,
+    pub first_card_in_draw_step: Option<bool>,
 }
 
 impl TriggerDrawn {
@@ -21,6 +22,7 @@ impl TriggerDrawn {
             valid_card: params.selector_cloned(keys::VALID_CARD),
             valid_player: params.selector_cloned(keys::VALID_PLAYER),
             number: params.as_i32(keys::NUMBER),
+            first_card_in_draw_step: params.get("FirstCardInDrawStep").and_then(|v| v.to_ascii_lowercase().parse::<bool>().ok()),
         })
     }
 }
@@ -39,6 +41,9 @@ impl TriggerBehavior for TriggerDrawn {
     ) -> bool {
         let _host_card = trigger.base.card_trait_base.host_card_id();
         let host_controller = trigger.base.card_trait_base.host_controller(game);
+        if let Some(expected) = self.first_card_in_draw_step {
+            if params.first_card_in_draw_step_snapshot != Some(expected) { return false; }
+        }
         if let Some(n) = self.number {
             let drawn_count = params.drawn_this_turn_snapshot.unwrap_or_else(|| {
                 let player = params.player.unwrap_or(host_controller);

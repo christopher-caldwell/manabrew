@@ -86,7 +86,7 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
     for cid in chosen_pile {
         if ctx.game.card(cid).zone == ZoneType::Library {
             ctx.move_card(cid, zone1, controller);
-            emit_zone_trigger(ctx.trigger_handler, cid, ZoneType::Library, zone1);
+            emit_zone_trigger(ctx.trigger_handler, ctx.game, cid, ZoneType::Library, zone1);
         }
     }
 
@@ -94,7 +94,7 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
     for cid in unchosen_pile {
         if ctx.game.card(cid).zone == ZoneType::Library {
             ctx.move_card(cid, zone2, controller);
-            emit_zone_trigger(ctx.trigger_handler, cid, ZoneType::Library, zone2);
+            emit_zone_trigger(ctx.trigger_handler, ctx.game, cid, ZoneType::Library, zone2);
         }
     }
 }

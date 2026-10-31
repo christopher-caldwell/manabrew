@@ -63,7 +63,7 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
     if old_zone != ZoneType::Exile {
         ctx.game
             .move_card(source_id, ZoneType::Exile, ctx.game.card(source_id).owner);
-        emit_zone_trigger(ctx.trigger_handler, source_id, old_zone, ZoneType::Exile);
+        emit_zone_trigger(ctx.trigger_handler, ctx.game, source_id, old_zone, ZoneType::Exile);
     }
 
     // Link: set exiled_by to the haunted creature

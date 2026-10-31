@@ -72,6 +72,8 @@ pub(crate) fn parse_express_mana_choice(color: Option<&str>) -> Option<u16> {
 /// Answers the prompts a `PromptAgent` builds.
 ///
 pub trait Responder {
+    fn observe_engine(&mut self, _game: &GameState, _mana_pools: &[ManaPool]) {}
+    fn notify_engine(&mut self, _event: &GameNotification) {}
     fn respond(&mut self, prompt: AgentPrompt) -> ClientToServerMessage;
     fn present(&mut self, _message: &AgentMessage) {}
     fn await_ack(&mut self) -> ClientToServerMessage {
@@ -90,7 +92,15 @@ pub struct PromptAgent<R: Responder> {
     pub responder: R,
     pending_prompt: Option<AgentPrompt>,
     pub(crate) latest_view: Option<GameViewDto>,
+    pub(crate) required_attackers: Vec<CardId>,
+    pub(crate) max_attackers: Option<usize>,
+    pub(crate) attack_target_limits: Vec<(DefenderId, usize)>,
+    pub(crate) goaded_attackers: Vec<(CardId, PlayerId)>,
+    pub(crate) legal_attack_targets: Vec<(CardId, Vec<DefenderId>)>,
     source_cards: HashMap<CardId, CardDto>,
+    targeting_source: Option<CardId>,
+    targeting_known_damage: Option<i32>,
+    targeting_source_ability_text: Option<String>,
     pub pass_until: Option<manabrew_engine::agent::PassUntilTarget>,
     conceded: bool,
     next_prompt_id: u32,
@@ -106,7 +116,15 @@ impl<R: Responder> PromptAgent<R> {
             responder,
             pending_prompt: None,
             latest_view: None,
+            required_attackers: Vec::new(),
+            max_attackers: None,
+            attack_target_limits: Vec::new(),
+            goaded_attackers: Vec::new(),
+            legal_attack_targets: Vec::new(),
             source_cards: HashMap::new(),
+            targeting_source: None,
+            targeting_known_damage: None,
+            targeting_source_ability_text: None,
             pass_until: None,
             conceded: false,
             next_prompt_id: 0,
@@ -118,7 +136,7 @@ impl<R: Responder> PromptAgent<R> {
     fn build_prompt(&mut self, inner: PromptInput, source: Option<CardId>) -> AgentPrompt {
         self.next_prompt_id += 1;
         let source_card = source.and_then(|card_id| self.source_cards.get(&card_id).cloned());
-        let source_ability_text = source_card.as_ref().and_then(|card| {
+        let source_ability_text = self.targeting_source_ability_text.clone().or_else(|| source_card.as_ref().and_then(|card| {
             self.latest_view
                 .as_ref()?
                 .stack
@@ -127,12 +145,13 @@ impl<R: Responder> PromptAgent<R> {
                 .find(|entry| entry.source_id == card.id)?
                 .source_ability_text
                 .clone()
-        });
+        }));
         AgentPrompt {
             prompt_id: self.next_prompt_id,
             deciding_player_id: player_id_str(self.player_id),
             source_card,
             source_ability_text,
+            known_damage: self.targeting_known_damage,
             input: inner,
         }
     }
@@ -507,7 +526,13 @@ impl<R: Responder> PlayerAgent for PromptAgent<R> {
         mana_pools: &[ManaPool],
     ) -> bool {
         self.targeting_cancelled = false;
+        self.targeting_source = sa.source;
+        self.targeting_known_damage = crate::game_view_dto::known_direct_damage(game, sa);
+        self.targeting_source_ability_text = crate::game_view_dto::stack_source_ability_text(game, sa);
         let ok = manabrew_engine::spellability::choose_targets_by_kind(self, sa, game, mana_pools);
+        self.targeting_source = None;
+        self.targeting_known_damage = None;
+        self.targeting_source_ability_text = None;
         ok && !self.targeting_cancelled
     }
 
@@ -524,15 +549,17 @@ impl<R: Responder> PlayerAgent for PromptAgent<R> {
     }
 
     fn snapshot_state(&mut self, game: &GameState, mana_pools: &[ManaPool]) {
+        self.responder.observe_engine(game, mana_pools);
         self.source_cards = game
             .cards
             .iter()
-            .filter(|card| card_face_visible_to(card, Some(self.player_id)))
+            .filter(|card| card_face_visible_to(card, Some(self.player_id))
+                || (Some(card.id) == self.targeting_source && card.is_token && !card.face_down && card.zone == forge_foundation::ZoneType::None))
             .map(|card| {
-                (
-                    card.id,
-                    card_to_dto_for_viewer(game, card.id, Some(self.player_id)),
-                )
+                let dto = if Some(card.id) == self.targeting_source && card.is_token && !card.face_down && card.zone == forge_foundation::ZoneType::None {
+                    crate::game_view_dto::revealed_card_to_dto(game, card.id, self.player_id)
+                } else { card_to_dto_for_viewer(game, card.id, Some(self.player_id)) };
+                (card.id, dto)
             })
             .collect();
         self.latest_view = Some(GameViewDto::from_engine(
@@ -765,6 +792,14 @@ impl<R: Responder> PlayerAgent for PromptAgent<R> {
         }
     }
 
+    fn set_attack_requirements(&mut self, required: &[CardId], goaded: &[(CardId, PlayerId)], legal: &[(CardId, Vec<DefenderId>)], max_attackers: Option<usize>, target_limits: &[(DefenderId, usize)]) {
+        self.attack_target_limits = target_limits.to_vec();
+        self.max_attackers = max_attackers;
+        self.required_attackers = required.to_vec();
+        self.goaded_attackers = goaded.to_vec();
+        self.legal_attack_targets = legal.to_vec();
+    }
+
     fn choose_attackers(
         &mut self,
         player: PlayerId,
@@ -826,6 +861,16 @@ impl<R: Responder> PlayerAgent for PromptAgent<R> {
             .unwrap_or(crate::game_view_dto::TargetingIntent::Hostile);
         let hostile = crate::game_view_dto::intent_is_hostile(intent);
         targeting::choose_target_player(self, player, valid, source, hostile, intent)
+    }
+
+    fn choose_target_players(
+        &mut self, _player: PlayerId, valid: &[PlayerId], min: usize, max: usize,
+        sa: Option<&manabrew_engine::spellability::SpellAbility>,
+    ) -> Vec<PlayerId> {
+        let source = sa.and_then(|s| s.source);
+        let intent = sa.map(crate::game_view_dto::targeting_intent_of)
+            .unwrap_or(crate::game_view_dto::TargetingIntent::Hostile);
+        targeting::choose_target_players(self, valid, min, max, source, intent)
     }
 
     fn choose_target_card(
@@ -1426,6 +1471,7 @@ impl<R: Responder> PlayerAgent for PromptAgent<R> {
     }
 
     fn notify(&mut self, event: GameNotification) {
+        self.responder.notify_engine(&event);
         match event {
             GameNotification::Event(log_event) => {
                 self.responder

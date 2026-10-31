@@ -135,6 +135,38 @@ pub(super) fn choose_target_player<T: Responder>(
     agent.recv_player_choice_or_first(valid)
 }
 
+pub(super) fn choose_target_players<T: Responder>(
+    agent: &mut PromptAgent<T>, valid: &[PlayerId], min: usize, max: usize,
+    source: Option<CardId>, intent: TargetingIntent,
+) -> Vec<PlayerId> {
+    let candidates = PromptAgent::<T>::player_ids(valid).into_iter().map(target_ref_player).collect();
+    agent.send_prompt(PromptInput::ChooseBoardTargets(
+        manabrew_protocol::prompts::choose_board_targets::ChooseBoardTargetsInput {
+            presentation: PromptPresentation { title: player_target_title(intent), description: None, text: None, targets: Vec::new() },
+            candidates, hostile: intent_is_hostile(intent), intent,
+            min_targets: min as i32, max_targets: max.min(valid.len()) as i32,
+            chosen_targets: 0, cancellable: agent.targeting_cancellable,
+        }), source);
+    match agent.recv_action() {
+        PromptOutput::ChooseBoardTargets(ChooseBoardTargetsOutput::Cancel) => {
+            agent.targeting_cancelled = true; Vec::new()
+        }
+        PromptOutput::ChooseBoardTargets(ChooseBoardTargetsOutput::BoardTargets { chosen }) => {
+            let mut result = Vec::new();
+            for target in chosen {
+                let id = if target.kind == TargetKind::Player { parse_player_id(&target.id) } else { None };
+                match id {
+                    Some(id) if valid.contains(&id) && !result.contains(&id) => result.push(id),
+                    _ => { agent.targeting_cancelled = true; return Vec::new(); }
+                }
+            }
+            if result.len() < min || result.len() > max { agent.targeting_cancelled = true; }
+            result
+        }
+        _ => { agent.targeting_cancelled = true; Vec::new() }
+    }
+}
+
 pub(super) fn choose_target_card<T: Responder>(
     agent: &mut PromptAgent<T>,
     _player: PlayerId,
@@ -286,4 +318,43 @@ pub(super) fn choose_sacrifice<T: Responder>(
         source,
     );
     agent.recv_card_choice_or_first(valid)
+}
+
+#[cfg(test)]
+mod multi_player_targets_regression {
+    use super::*;
+    use manabrew_engine::agent::PlayerAgent;
+    use manabrew_protocol::transport::{AgentPrompt, ClientToServerMessage};
+    use serde_json::json;
+    struct Capture { chosen: Vec<&'static str>, cancel: bool, prompt: Option<AgentPrompt> }
+    impl Responder for Capture {
+        fn respond(&mut self, prompt: AgentPrompt) -> ClientToServerMessage {
+            let id = prompt.prompt_id;
+            self.prompt = Some(prompt);
+            let chosen: Vec<_> = self.chosen.iter().map(|id|json!({"kind":"player","id":id})).collect();
+            let output = if self.cancel {json!({"type":"cancel"})} else {json!({"type":"boardTargets","chosen":chosen})};
+            serde_json::from_value(json!({"kind":"response","promptId":id,"action":{"type":"chooseBoardTargets","output":output}})).unwrap()
+        }
+    }
+    #[test]
+    fn optional_player_targets_allow_finish_without_conflating_cancel() {
+        for (chosen, cancel, expected, cancelled) in [
+            (vec![],false,vec![],false),
+            (vec!["player-2"],false,vec![PlayerId(2)],false),
+            (vec!["player-1","player-2","player-3"],false,vec![PlayerId(1),PlayerId(2),PlayerId(3)],false),
+            (vec![],true,vec![],true),
+            (vec!["player-1","player-1"],false,vec![],true),
+            (vec!["player-0"],false,vec![],true),
+        ] {
+            let mut agent=PromptAgent::new(PlayerId(0),"fixture".into(),Capture{chosen,cancel,prompt:None});
+            agent.set_targeting_cancellable(true);
+            let result=agent.choose_target_players(PlayerId(0),&[PlayerId(1),PlayerId(2),PlayerId(3)],0,3,None);
+            assert_eq!(result,expected);
+            assert_eq!(agent.targeting_cancelled,cancelled);
+            let prompt=serde_json::to_value(agent.responder.prompt.as_ref().unwrap()).unwrap();
+            assert_eq!(prompt["input"]["minTargets"],0);
+            assert_eq!(prompt["input"]["maxTargets"],3);
+            assert_eq!(prompt["input"]["cancellable"],true);
+        }
+    }
 }

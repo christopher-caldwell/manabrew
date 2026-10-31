@@ -10,10 +10,7 @@ use crate::trigger::TriggerType;
 /// `DestroyEffect` class extending `SpellAbilityEffect`.
 #[manabrew_engine_macros::spell_effect(DestroyEffect)]
 fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
-    let mut targets = Vec::new();
-    if let Some(target_card) = sa.target_chosen.target_card {
-        targets.push(target_card);
-    }
+    let mut targets = sa.target_chosen.all_target_cards();
     targets.extend(card_util::get_radiance(ctx.game, sa).iter().copied());
     targets.sort_unstable_by_key(|cid| cid.0);
     targets.dedup();
@@ -89,7 +86,7 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
             ctx.move_card(target_card, ZoneType::Graveyard, owner);
 
             emit_zone_trigger_with_lki_counters(
-                ctx.trigger_handler,
+                ctx.trigger_handler, ctx.game,
                 target_card,
                 ZoneType::Battlefield,
                 ZoneType::Graveyard,

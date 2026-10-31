@@ -25,7 +25,10 @@ pub fn can_discard_by(game: &GameState, player: PlayerId, other: PlayerId) -> bo
 
 pub fn has_counters(game: &GameState, player: PlayerId) -> bool {
     let p = game.player(player);
-    p.poison_counters > 0 || p.energy_counters > 0 || p.radiation_counters > 0
+    p.poison_counters > 0
+        || p.energy_counters > 0
+        || p.radiation_counters > 0
+        || p.other_counters.values().any(|v| *v > 0)
 }
 
 pub fn life_less_or_equal_to(game: &GameState, player: PlayerId, life: i32) -> bool {
@@ -41,7 +44,7 @@ pub fn has_counter(game: &GameState, player: PlayerId, counter: &str) -> bool {
         "Poison" => game.player(player).poison_counters > 0,
         "Energy" => game.player(player).energy_counters > 0,
         "Rad" | "Radiation" => game.player(player).radiation_counters > 0,
-        _ => false,
+        name => crate::player::counter_count(game, player, name) > 0,
     }
 }
 

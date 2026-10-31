@@ -215,6 +215,8 @@ pub struct SpellAbility {
     /// Java parity: mana atoms used to pay this spell or ability.
     #[serde(default)]
     pub paying_mana: Vec<u16>,
+    #[serde(default)]
+    pub paying_mana_sources: Vec<Option<CardId>>,
     /// Java parity: paid abilities list.
     #[serde(default)]
     pub paid_abilities: Vec<SpellAbility>,
@@ -625,6 +627,7 @@ impl SpellAbility {
             optional_costs: Vec::new(),
             paid_hash: HashMap::new(),
             paying_mana: Vec::new(),
+            paying_mana_sources: Vec::new(),
             paid_abilities: Vec::new(),
             mana_part: None,
             express_mana_choice: None,
@@ -1106,6 +1109,7 @@ impl SpellAbility {
         clone.prevent_map = self.prevent_map.clone();
         clone.change_zone_table = self.change_zone_table.clone();
         clone.paying_mana = self.paying_mana.clone();
+        clone.paying_mana_sources = self.paying_mana_sources.clone();
         clone.paid_abilities = Vec::new();
         clone.paid_hash = self.paid_hash.clone();
 
@@ -1905,8 +1909,9 @@ pub fn choose_targets_by_kind(
 
     let min_targets = tr.get_min_targets(game, sa);
     let max_targets = tr.get_max_targets(game, sa);
+    sa.target_chosen.remove_all();
     if max_targets <= 0 {
-        return true;
+        return min_targets <= 0;
     }
 
     if !matches!(tr.target_kind, TargetKind::CardInZone { .. })
@@ -1914,10 +1919,6 @@ pub fn choose_targets_by_kind(
     {
         return min_targets <= 0;
     }
-
-    sa.target_chosen.target_card = None;
-    sa.target_chosen.target_card_zone_timestamp = None;
-    sa.target_chosen.divided_map.clear();
 
     match &tr.target_kind {
         TargetKind::None => {}
@@ -1932,46 +1933,52 @@ pub fn choose_targets_by_kind(
                 .into_iter()
                 .filter(|&pid| !is_opponent_only || pid != player)
                 .collect();
-            if max_targets > 1 {
-                let mut chosen = Vec::new();
-                while (chosen.len() as i32) < max_targets {
-                    let Some(pid) = agent.choose_target_player(player, &valid_players, Some(&*sa))
-                    else {
-                        break;
-                    };
-                    if !chosen.contains(&pid) {
-                        chosen.push(pid);
-                    }
-                    if chosen.len() == valid_players.len() {
-                        break;
-                    }
+            if valid_players.len() < min_targets.max(0) as usize { return false; }
+            if max_targets > 1 || min_targets == 0 {
+                let chosen = agent.choose_target_players(player, &valid_players,
+                    min_targets.max(0) as usize, max_targets.max(0) as usize, Some(&*sa));
+                let mut distinct = std::collections::HashSet::new();
+                if chosen.len() > max_targets as usize
+                    || chosen.iter().any(|id| !valid_players.contains(id) || !distinct.insert(*id)) {
+                    return false;
                 }
                 sa.target_chosen.target_player = chosen.first().copied();
                 sa.target_chosen.additional_target_players = chosen.into_iter().skip(1).collect();
             } else {
-                sa.target_chosen.target_player =
-                    agent.choose_target_player(player, &valid_players, Some(&*sa));
+                sa.target_chosen.target_player = agent.choose_target_player(player, &valid_players, Some(&*sa));
             }
         }
         TargetKind::Any => {
-            let valid_players: Vec<PlayerId> =
+            let mut valid_players: Vec<PlayerId> =
                 if target_restrictions::any_target_allows_players(&tr.valid_tgts) {
                     game.alive_players().into_iter().collect()
                 } else {
                     Vec::new()
                 };
-            let valid_cards: Vec<CardId> = card_util::get_valid_cards_to_target(game, sa);
-            agent.snapshot_state(game, mana_pools);
-            match agent.choose_target_any(player, &valid_players, &valid_cards, Some(&*sa)) {
-                crate::agent::TargetChoice::Player(pid) => {
-                    sa.target_chosen.target_player = Some(pid)
+            let mut valid_cards: Vec<CardId> = card_util::get_valid_cards_to_target(game, sa);
+            sa.target_chosen.target_player = None;
+            sa.target_chosen.additional_target_players.clear();
+            let mut chosen = 0;
+            while chosen < max_targets && (!valid_players.is_empty() || !valid_cards.is_empty()) {
+                agent.snapshot_state(game, mana_pools);
+                match agent.choose_target_any(player, &valid_players, &valid_cards, Some(&*sa)) {
+                    crate::agent::TargetChoice::Player(pid) if valid_players.contains(&pid) => {
+                        valid_players.retain(|&candidate| candidate != pid);
+                        sa.target_chosen.add(None, Some(pid));
+                    }
+                    crate::agent::TargetChoice::Card(cid) if valid_cards.contains(&cid) => {
+                        valid_cards.retain(|&candidate| candidate != cid);
+                        if sa.target_chosen.target_card.is_none() {
+                            sa.target_chosen.target_card = Some(cid);
+                            sa.target_chosen.target_card_zone_timestamp = Some(game.card(cid).zone_timestamp);
+                        } else {
+                            sa.target_chosen.divided_map.insert(cid, 0);
+                            sa.target_chosen.additional_card_timestamps.insert(cid, game.card(cid).zone_timestamp);
+                        }
+                    }
+                    _ => break,
                 }
-                crate::agent::TargetChoice::Card(cid) => {
-                    sa.target_chosen.target_card = Some(cid);
-                    sa.target_chosen.target_card_zone_timestamp =
-                        Some(game.card(cid).zone_timestamp);
-                }
-                crate::agent::TargetChoice::None => {}
+                chosen += 1;
             }
         }
         TargetKind::Creature(_) => {
@@ -1993,6 +2000,7 @@ pub fn choose_targets_by_kind(
                         Some(game.card(first).zone_timestamp);
                     for &extra in chosen.iter().skip(1) {
                         sa.target_chosen.divided_map.insert(extra, 0);
+                        sa.target_chosen.additional_card_timestamps.insert(extra, game.card(extra).zone_timestamp);
                     }
                 }
             } else {
@@ -2022,6 +2030,7 @@ pub fn choose_targets_by_kind(
                         Some(game.card(first).zone_timestamp);
                     for &extra in chosen.iter().skip(1) {
                         sa.target_chosen.divided_map.insert(extra, 0);
+                        sa.target_chosen.additional_card_timestamps.insert(extra, game.card(extra).zone_timestamp);
                     }
                 }
             } else {
@@ -2054,6 +2063,7 @@ pub fn choose_targets_by_kind(
                         Some(game.card(first).zone_timestamp);
                     for &extra in chosen.iter().skip(1) {
                         sa.target_chosen.divided_map.insert(extra, 0);
+                        sa.target_chosen.additional_card_timestamps.insert(extra, game.card(extra).zone_timestamp);
                     }
                 }
             } else {

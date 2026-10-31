@@ -40,10 +40,7 @@ impl GameSnapshot {
         combat: &mut CombatState,
         trigger_handler: &mut TriggerHandler,
     ) {
-        *game = self.game.clone();
-        *mana_pools = self.mana_pools.clone();
-        *combat = self.combat.clone();
-        *trigger_handler = self.trigger_handler.clone();
+        self.restore_game_state_with_mana_slice(game, mana_pools, combat, trigger_handler);
     }
 
     /// Restore this snapshot while preserving the caller-owned mana-pool

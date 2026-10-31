@@ -27,12 +27,20 @@ pub fn can_pay(
     game: &GameState,
     available_mana: &crate::mana::ManaPool,
     source: CardId,
-    _player: crate::ids::PlayerId,
+    player: crate::ids::PlayerId,
     ability: Option<&crate::spellability::SpellAbility>,
     part: &super::CostPart,
 ) -> bool {
     let mana_cost = get_mana_cost_for(game, source, ability, part);
-    available_mana.can_pay(&mana_cost)
+    if mana_cost.shards().iter().any(|shard| shard.is_phyrexian()) {
+        if crate::staticability::static_ability_cant_gain_lose_pay_life::cant_pay_life(game, player, true, ability) {
+            available_mana.can_pay(&mana_cost.phyrexian_to_colored())
+        } else {
+            available_mana.can_pay_with_phyrexian_life(&mana_cost, game.player(player).life)
+        }
+    } else {
+        available_mana.can_pay(&mana_cost)
+    }
 }
 
 /// Mirrors Java `CostPartMana.payAsDecided(Player, PaymentDecision, SpellAbility, boolean)`.

@@ -152,12 +152,21 @@ pub(super) fn pay_mana_cost<T: Responder>(
     mana_cost_display: &str,
     can_confirm_from_pool: bool,
     mana_ability_options: &[ManaAbilityOption],
-    _tappable_lands: &[CardId],
+    tappable_lands: &[CardId],
     untappable_lands: &[CardId],
     _mana_pool: &ManaPool,
 ) -> ManaCostAction {
     let card_id_s = card_id_str(card_id);
     let mut actions = mana_payment_actions(mana_ability_options);
+    let convoke = agent.source_cards.get(&card_id).is_some_and(|card| card.keywords.iter().any(|kw| kw == "Convoke"));
+    if convoke {
+        for &id in tappable_lands {
+            if agent.source_cards.get(&id).is_some_and(|card| card.types.iter().any(|t| t == "Creature")) {
+                let card_id = card_id_str(id);
+                actions.push(PaymentAction { id: format!("convoke:{card_id}"), kind: PaymentActionKind::UseResource { card_id, resource: manabrew_protocol::prompts::common::PaymentResourceKind::Convoke } });
+            }
+        }
+    }
     for &land in untappable_lands {
         let id = card_id_str(land);
         actions.push(PaymentAction {
@@ -216,6 +225,9 @@ pub(super) fn mana_payment_actions(
 }
 
 pub(super) fn parse_mana_cost_action(action_id: &str) -> ManaCostAction {
+    if let Some(id) = action_id.strip_prefix("convoke:") {
+        return parse_card_id(id).map(|card_id| ManaCostAction::TapForMana { card_id, mana_ability_index: Some(usize::MAX), express_choice: None }).unwrap_or(ManaCostAction::AttemptedAndFailed);
+    }
     if let Some(rest) = action_id.strip_prefix("tap:") {
         let tap = parse_tap_action_id(rest);
         return match parse_card_id(tap.card_id) {

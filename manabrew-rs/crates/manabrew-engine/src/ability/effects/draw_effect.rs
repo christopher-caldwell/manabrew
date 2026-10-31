@@ -88,6 +88,8 @@ fn draw_for_player(
     let remember_drawn = sa.ir.remember_drawn;
     let mut drawn: Vec<crate::ids::CardId> = Vec::new();
     for _ in 0..actual_num {
+        let first_in_step = ctx.game.turn.phase == forge_foundation::PhaseType::Draw
+            && ctx.game.active_player() == target && ctx.game.player(target).drawn_this_draw_step == 0;
         if let Some(card_id) = ctx.game.draw_card_with_agents(target, ctx.agents) {
             drawn.push(card_id);
             // Snapshot drawn_this_turn AFTER draw_card increments it.
@@ -99,6 +101,7 @@ fn draw_for_player(
                     card: Some(card_id),
                     player: Some(target),
                     drawn_this_turn_snapshot: Some(drawn_snapshot),
+                    first_card_in_draw_step_snapshot: Some(first_in_step),
                     ..Default::default()
                 },
                 false,

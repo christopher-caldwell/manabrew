@@ -110,6 +110,7 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
                 let mut m = crate::mana::Mana::simple(atom);
                 m.source_card = Some(source_id);
                 m.is_snow = source_is_snow;
+            m.is_combat_mana = sa.mana_part.as_ref().is_some_and(|part| part.is_combat_mana());
                 m.restriction = restriction.clone();
                 m.adds_no_counter = adds_no_counter;
                 m.adds_keywords = adds_keywords.clone();
@@ -278,6 +279,7 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
             let mut m = crate::mana::Mana::simple(atom);
             m.source_card = Some(source_id);
             m.is_snow = source_is_snow;
+            m.is_combat_mana = sa.mana_part.as_ref().is_some_and(|part| part.is_combat_mana());
             m.restriction = restriction.clone();
             m.adds_no_counter = adds_no_counter;
             m.adds_keywords = adds_keywords.clone();

@@ -171,7 +171,7 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
                 }
             }
         }
-        emit_zone_trigger(ctx.trigger_handler, id, ZoneType::Library, dest_zone1);
+        emit_zone_trigger(ctx.trigger_handler, ctx.game, id, ZoneType::Library, dest_zone1);
     }
 
     // Move rest to dest_zone2.
@@ -197,7 +197,7 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
                 owner
             };
             ctx.move_card(id, dest_zone2, dest_owner);
-            emit_zone_trigger(ctx.trigger_handler, id, ZoneType::Library, dest_zone2);
+            emit_zone_trigger(ctx.trigger_handler, ctx.game, id, ZoneType::Library, dest_zone2);
         }
     }
 }

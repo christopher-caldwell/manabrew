@@ -41,7 +41,19 @@ pub struct SimpleAi {
     turn: Option<u32>,
     attempted_actions: HashSet<String>,
     payment_attempt: Option<String>,
+    payment_actions: HashSet<String>,
+    payment_state: Option<String>,
+    pending_mana_color: Option<manabrew_protocol::game::ManaColor>,
+    awaiting_mana_color: bool,
+    auto_payment_active: bool,
+    selected_mana_source: Option<String>,
     has_command_cards: bool,
+    pending_hand_refill_source: Option<String>,
+    last_lifelink_combo_progress: Option<i32>,
+    pending_lifelink_combo_cost: Option<String>,
+    last_tutor_sacrifice_state: Option<String>,
+    known_tutor_targets: Option<HashSet<String>>,
+    pending_voluntary_cast: Option<String>,
 }
 
 struct Combatant {
@@ -302,7 +314,9 @@ impl SimpleAi {
         for segment in card.text.split("Add ").skip(1) {
             let clause = segment.split(['.', '\n']).next().unwrap_or("");
             let lower = clause.to_ascii_lowercase();
-            let symbols = clause.matches('{').count() as i32;
+            // Alternative colors from one activation do not create multiple
+            // mana. Count the largest offered bundle, not all alternatives.
+            let symbols = clause.split(" or ").map(|option| option.matches('{').count() as i32).max().unwrap_or(0);
             let mut produced = 0;
             for symbol in clause.chars() {
                 if let Some(i) = "WUBRG".find(symbol) {
@@ -326,6 +340,10 @@ impl SimpleAi {
             }
             amount = amount.max(produced.max(symbols));
         }
+        // Basic land subtype and its printed mana ability describe the same
+        // activation; do not count the same source twice for one color.
+        for count in &mut colors { *count = (*count).min(amount); }
+        any = any.min(amount);
         (amount > 0).then_some((colors, any, amount))
     }
 
@@ -346,6 +364,15 @@ impl SimpleAi {
                 }
             }
         }
+        if let Some(player) = self.view.as_ref().and_then(|v| v.players.iter().find(|p| p.id == player_id)) {
+            use manabrew_protocol::game::ManaColor;
+            for (color, &amount) in &player.mana_pool {
+                let amount = amount as i32;
+                total += amount;
+                let i = match color { ManaColor::White => Some(0), ManaColor::Blue => Some(1), ManaColor::Black => Some(2), ManaColor::Red => Some(3), ManaColor::Green => Some(4), ManaColor::Colorless => None };
+                if let Some(i) = i { colors[i] += amount; }
+            }
+        }
         (colors, any, total)
     }
 
@@ -354,10 +381,19 @@ impl SimpleAi {
             .effective_mana_cost
             .as_deref()
             .unwrap_or(card.mana_cost.as_str());
-        if cost.contains('X') || cost.contains('/') || cost.is_empty() {
+        if cost.contains('/') || cost.is_empty() {
             return true;
         }
-        let (colors, any, total) = self.mana_sources(player_id);
+        let (mut colors, any, mut total) = self.mana_sources(player_id);
+        if card.keywords.iter().any(|kw| kw.eq_ignore_ascii_case("Convoke")) {
+            for creature in self.battlefield(player_id).filter(|c| !c.tapped && c.types.iter().any(|t| t == "Creature")) {
+                // A source already counted by mana_sources cannot be tapped twice.
+                let already_counted = !creature.summoning_sick && creature.text.contains("{T}: Add") && Self::mana_output(creature).is_some();
+                if already_counted { continue; }
+                total += 1;
+                for color in creature.color.chars() { if let Some(i) = "WUBRG".find(color) { colors[i] += 1; } }
+            }
+        }
         let tax = card.commander_tax.unwrap_or(0);
         if card.cmc + tax > total {
             return false;
@@ -390,7 +426,7 @@ impl SimpleAi {
     }
 
     fn sane(&self, action: &AvailableAction, player_id: &str) -> bool {
-        let AvailableActionKind::Cast { card_id, .. } = &action.kind else {
+        let AvailableActionKind::Cast { card_id, mode, .. } = &action.kind else {
             return true;
         };
         if self.is_land_play(action) {
@@ -399,8 +435,16 @@ impl SimpleAi {
         let Some(card) = self.card(card_id) else {
             return true;
         };
-        if !self.affordable(card, player_id) {
-            return false;
+        let offered_blitz = matches!(mode, PlayCardMode::Alternative { cost: AlternativeCostKind::Blitz });
+        if !offered_blitz && !self.affordable(card, player_id) {
+            // The engine's offered action already checks static reductions.
+            // Our estimate uses printed mana value and otherwise discards
+            // payable discounted spells before the payment session.
+            let has_reducer = self.battlefield(player_id).any(|source| {
+                let text = source.text.to_ascii_lowercase();
+                text.contains("cost") && text.contains("less to cast")
+            });
+            if !has_reducer { return false; }
         }
         let Some(view) = self.view.as_ref() else {
             return true;
@@ -413,7 +457,31 @@ impl SimpleAi {
             .iter()
             .any(|item| item.controller_id != player_id);
         let opponents = self.opponent_creatures(player_id);
+        // Mass phasing of our own board is a defensive response, not ordinary
+        // main-phase development when no opposing spell is on the stack.
+        if text.contains("permanents you control phase out") {
+            let threatened = view.stack.iter().filter(|item| item.controller_id != player_id).any(|item| {
+                let effect = item.source_ability_text.as_deref().filter(|s| !s.is_empty()).unwrap_or(&item.text).to_ascii_lowercase();
+                let destructive = ["destroy", "exile", "sacrifice", "damage", "return", "-x/-x", "-1/-1"].iter().any(|word| effect.contains(word));
+                let wide = ["all creature", "each creature", "all permanent", "each permanent", "each nonland"].iter().any(|word| effect.contains(word));
+                let ours = item.targets.iter().any(|target| self.card(&target.id).is_some_and(|c| c.controller_id == player_id));
+                destructive && (wide || ours)
+            });
+            if !threatened { return false; }
+        }
         let roles = Self::roles(card);
+        if own_turn && view.step == StepKind::Main1 && !foreign_stack
+            && card.types.iter().any(|t| t == "Instant")
+            && (roles.contains(Roles::DRAW) || text.contains("draw"))
+            && self.battlefield(player_id).any(|c| {
+                let ability = c.text.to_ascii_lowercase();
+                c.types.iter().any(|t| t == "Creature") && !c.tapped && !c.summoning_sick
+                    && ability.contains("whenever you cast a spell while") && ability.contains("is attacking") && ability.contains("copy")
+            }) {
+            // Wait for an available attack-copy window; if no attack is made,
+            // normal main-two selection remains available.
+            return false;
+        }
         let creature_removal = text.contains("destroy target creature")
             || text.contains("exile target creature")
             || (text.contains("damage to target creature") && !text.contains("player"));
@@ -619,7 +687,8 @@ impl SimpleAi {
             }
             AvailableActionKind::ActivateAbility(info) if !info.is_mana_ability => {
                 let text = info.description.to_ascii_lowercase();
-                if text.contains("search your library") {
+                if self.useful_lifelink_activation(info) || self.useful_creature_tutor_sacrifice(info) { 1_000 }
+                else if text.contains("search your library") {
                     240
                 } else if text.contains("draw") || text.contains("create") {
                     210
@@ -635,8 +704,67 @@ impl SimpleAi {
         }
     }
 
+    fn life_counter_pinger<'a>(&'a self, player_id: &'a str, require_lifelink: bool) -> Option<&'a CardDto> {
+        let has_counter_engine = self.battlefield(player_id).any(|card| {
+            let text = card.text.to_ascii_lowercase();
+            text.contains("whenever you gain life") && text.contains("+1/+1 counter")
+        });
+        if !has_counter_engine { return None; }
+        self.battlefield(player_id).find(|card| {
+            let text = card.text.to_ascii_lowercase();
+            text.contains("remove a +1/+1 counter") && text.contains("damage to any target")
+                && card.counters.iter().any(|(name,count)| (name.contains("+1/+1") || name.eq_ignore_ascii_case("P1P1")) && *count >= 1)
+                && (!require_lifelink || Self::has_keyword(card, "Lifelink"))
+        })
+    }
+
+    fn death_tutor_plan_target<'a>(&'a self, player: &'a str) -> Option<&'a CardDto> {
+        let view=self.view.as_ref()?;
+        if !view.stack.is_empty() { return None; }
+        let life=view.players.iter().find(|p|p.id==player)?.life;
+        let library=view.zones.iter().find(|z|z.owner_id==player && z.zone==ZoneKind::Library).map(|z|z.count).unwrap_or(0);
+        if life<=7 || library==0 || self.known_tutor_targets.as_ref().is_some_and(|known|known.is_empty()) { return None; }
+        let is_tutor = |card: &CardDto| {
+            let text=card.text.to_ascii_lowercase();
+            text.contains("dies") && text.contains("search your library") && text.contains("creature cards") && text.contains("onto the battlefield")
+        };
+        if let Some(tutor)=self.battlefield(player).find(|card|is_tutor(card)) { return Some(tutor); }
+        let tutor_in_grave=view.zones.iter().any(|zone|zone.owner_id==player && zone.zone==ZoneKind::Graveyard
+            && zone.cards.iter().any(|card|matches!(card,CardView::Visible(card) if is_tutor(card))));
+        let undying_engine=self.battlefield(player).any(|card| {
+            let text=card.text.to_ascii_lowercase();text.contains("other non-human creatures you control") && text.contains("have undying")
+        });
+        if tutor_in_grave && undying_engine {
+            return self.battlefield(player).find(|card| {
+                card.text.to_ascii_lowercase().contains("return target creature card from your graveyard to the battlefield")
+                    && !card.counters.iter().any(|(name,count)|(name.contains("+1/+1") || name.eq_ignore_ascii_case("P1P1")) && *count>0)
+            });
+        }
+        None
+    }
+
+    fn useful_creature_tutor_sacrifice(&self, info: &ActivatableAbilityInfo) -> bool {
+        let Some(source)=self.card(&info.card_id) else { return false; };
+        info.cost.as_deref().is_some_and(|cost|cost.to_ascii_lowercase().contains("sac"))
+            && self.death_tutor_plan_target(&source.controller_id).is_some()
+    }
+
+    fn useful_lifelink_activation(&self, info: &ActivatableAbilityInfo) -> bool {
+        let Some(source) = self.card(&info.card_id) else { return false; };
+        info.description.to_ascii_lowercase().contains("target creature gains lifelink")
+            && self.life_counter_pinger(&source.controller_id, false)
+                .is_some_and(|card| !Self::has_keyword(card, "Lifelink") && card.counters.values().any(|count| *count >= 2))
+    }
+
     fn wasted_activation(&self, info: &ActivatableAbilityInfo) -> bool {
         let text = info.description.to_ascii_lowercase();
+        if let Some(source) = self.card(&info.card_id) {
+            let pending_lifelink = self.view.as_ref().is_some_and(|view| view.stack.iter().any(|item| {
+                item.controller_id == source.controller_id && item.source_ability_text.as_deref().unwrap_or(&item.text).to_ascii_lowercase().contains("lifelink")
+            }));
+            if pending_lifelink && self.life_counter_pinger(&source.controller_id, false).is_some_and(|card| card.id == source.id && !Self::has_keyword(card, "Lifelink")) { return true; }
+        }
+        if self.useful_lifelink_activation(info) || self.useful_creature_tutor_sacrifice(info) { return false; }
         if info
             .cost
             .as_deref()
@@ -1054,6 +1182,22 @@ impl SimpleAi {
         number.parse().ok()
     }
 
+    // Recompute from the current stack each prompt, so countered, removed or
+    // retargeted objects cannot leave persistent reservations. This is only a
+    // prospective estimate; prevention, replacements and future play differ.
+    fn pending_damage(&self, player_id: &str, target_id: &str) -> i32 {
+        let Some(view)=&self.view else { return 0; };
+        view.stack.iter().enumerate().filter_map(|(i,item)| {
+            if item.controller_id!=player_id || item.is_casting {return None;}
+            let amount=item.known_damage?;
+            if amount<=0 || item.targets.len()!=1 || !item.targets.iter().any(|t|
+                matches!(t.kind,TargetKind::Player | TargetKind::Card) && t.id==target_id && matches!(t.intent,Some(TargetingIntent::Damage))) {return None;}
+            if view.stack[i+1..].iter().any(|threat|threat.targets.iter().any(|t|
+                t.id==item.id && matches!(t.kind,TargetKind::Spell))) {return None;}
+            Some(amount)
+        }).fold(0i32,|sum,amount|sum.saturating_add(amount))
+    }
+
     fn damage_target_score(&self, target: &TargetRef, player_id: &str, damage: i32) -> i32 {
         match target.kind {
             TargetKind::Player => {
@@ -1087,6 +1231,68 @@ impl SimpleAi {
             }
             TargetKind::Spell => 0,
         }
+    }
+
+    // Suppress only a narrowly established redundant voluntary answer. Unknown,
+    // conditional, threatened or potentially illegal answers remain available.
+    fn covered_by_friendly_answer(&self, target: &TargetRef, player_id: &str) -> bool {
+        let Some(view) = &self.view else { return false; };
+        if !matches!(target.kind, TargetKind::Spell | TargetKind::Card) { return false; }
+        if matches!(target.kind, TargetKind::Spell) {
+            let Some(object) = view.stack.iter().find(|item| item.id == target.id && !item.is_casting) else { return false; };
+            if object.source_card.as_ref().is_none_or(|c| c.text.to_ascii_lowercase().contains("can't be countered") || c.text.to_ascii_lowercase().contains("cannot be countered")) { return false; }
+        } else {
+            let Some(card) = self.card(&target.id) else { return false; };
+            if card.zone != Some(ZoneKind::Battlefield) || card.keywords.iter().any(|k| {
+                let k=k.to_ascii_lowercase(); k.contains("shroud") || k.contains("hexproof") || k.contains("protection")
+            }) { return false; }
+        }
+        view.stack.iter().enumerate().any(|(index, answer)| {
+            if answer.controller_id != player_id || answer.is_casting { return false; }
+            let effect=answer.source_ability_text.as_deref().unwrap_or(&answer.text).to_ascii_lowercase();
+            if ["unless", "you may", "if you", "if that", "indestructible"].iter().any(|word| effect.contains(word)) { return false; }
+            let clause = effect.split('.').next().unwrap_or("").trim();
+            let sufficient = answer.targets.iter().any(|t| {
+                if t.id != target.id || t.kind != target.kind { return false; }
+                match (t.intent, target.kind) {
+                    (Some(TargetingIntent::Counter), TargetKind::Spell) => {
+                        let Some(object)=view.stack.iter().find(|item| item.id==t.id) else { return false; };
+                        let Some(card)=object.source_card.as_ref() else { return false; };
+                        match clause {
+                            "counter target spell" => true,
+                            "counter target noncreature spell" => !card.types.iter().any(|ty|ty=="Creature"),
+                            "counter target creature spell" => card.types.iter().any(|ty|ty=="Creature"),
+                            _ => false,
+                        }
+                    }
+                    (Some(intent @ (TargetingIntent::Destroy | TargetingIntent::Exile | TargetingIntent::Bounce)), TargetKind::Card) => {
+                        let Some(card)=self.card(&t.id) else { return false; };
+                        if matches!(intent,TargetingIntent::Destroy) && card.keywords.iter().any(|k|k.eq_ignore_ascii_case("indestructible")) { return false; }
+                        let restriction = match intent {
+                            TargetingIntent::Destroy => clause.strip_prefix("destroy target "),
+                            TargetingIntent::Exile => clause.strip_prefix("exile target "),
+                            TargetingIntent::Bounce => clause.strip_prefix("return target ").and_then(|s|s.strip_suffix(" to its owner's hand"))
+                                .or_else(||clause.strip_prefix("put target ").and_then(|s|s.strip_suffix(" on top of its owner's library"))),
+                            _ => None,
+                        };
+                        match restriction {
+                            Some("creature") => card.types.iter().any(|ty|ty=="Creature"),
+                            Some("nonblack creature") => !card.color.contains('B') && card.types.iter().any(|ty|ty=="Creature"),
+                            Some("artifact") => card.types.iter().any(|ty|ty=="Artifact"),
+                            Some("nonland permanent") => !card.types.iter().any(|ty|ty=="Land"),
+                            _ => false,
+                        }
+                    }
+                    _ => false,
+                }
+            });
+            if !sufficient { return false; }
+            // Stack is in resolution order bottom to top. A later hostile
+            // counter/removal targeting this answer may save the original.
+            !view.stack[index+1..].iter().any(|threat| threat.controller_id != player_id
+                && threat.targets.iter().any(|t| t.id == answer.id && matches!(t.intent,
+                    Some(TargetingIntent::Counter | TargetingIntent::Exile | TargetingIntent::Bounce))))
+        })
     }
 
     fn target_score(&self, target: &TargetRef, player_id: &str, prompt_hostile: bool) -> i32 {
@@ -1124,7 +1330,7 @@ impl SimpleAi {
                 let Some(card) = self.card(&target.id) else {
                     return 0;
                 };
-                let value = Self::card_value(card);
+                let value = Self::card_value(card) + if !hostile && self.life_counter_pinger(player_id, false).is_some_and(|pinger| pinger.id == card.id) { 10_000 } else { 0 };
                 let own = card.controller_id == player_id;
                 if hostile == own {
                     -value
@@ -1181,7 +1387,13 @@ impl BotAgent for SimpleAi {
         if self.turn != Some(view.turn) {
             self.turn = Some(view.turn);
             self.attempted_actions.clear();
+            self.last_lifelink_combo_progress = None;
+            self.pending_lifelink_combo_cost = None;
+            self.last_tutor_sacrifice_state = None;
+            self.known_tutor_targets = None;
             self.payment_attempt = None;
+            self.payment_actions.clear();
+            self.payment_state = None;
             self.recent_prompts.clear();
             self.failed_attack_targets.clear();
         }
@@ -1206,6 +1418,8 @@ impl BotAgent for SimpleAi {
             .source_card
             .as_ref()
             .map_or_else(|| "none".to_string(), |card| card.id.clone());
+        let prompt_card_text = prompt.source_card.as_ref().map(|card| card.text.to_ascii_lowercase()).unwrap_or_default();
+        let pending_hand_refill = self.pending_hand_refill_source.take();
         let prompt_source_text = prompt
             .source_ability_text
             .as_deref()
@@ -1249,6 +1463,30 @@ impl BotAgent for SimpleAi {
                 }))
             }
             PromptInput::ChooseAction(manabrew_protocol::prompts::choose_action::ChooseActionInput { actions }) => {
+                self.awaiting_mana_color = false;
+                self.pending_mana_color = None;
+                self.auto_payment_active = false;
+                self.selected_mana_source = None;
+                if let Some(target) = self.death_tutor_plan_target(&deciding_player_id) {
+                    let state=format!("{}:{:?}:{}:{}", target.id, target.counters,
+                        self.view.as_ref().and_then(|v|v.players.iter().find(|p|p.id==deciding_player_id)).map(|p|p.life).unwrap_or(0),
+                        self.battlefield(&deciding_player_id).map(|c|c.id.as_str()).collect::<Vec<_>>().join(","));
+                    if self.last_tutor_sacrifice_state.as_ref().is_some_and(|prior| prior != &state) {
+                        for action in &actions { if let AvailableActionKind::ActivateAbility(info)=&action.kind {
+                            if info.cost.as_deref().is_some_and(|cost|cost.to_ascii_lowercase().contains("sac")) {
+                                self.attempted_actions.remove(&Self::action_key(action));
+                            }
+                        }}
+                    }
+                    self.last_tutor_sacrifice_state=Some(state);
+                }
+                if let Some(pinger_id) = self.life_counter_pinger(&deciding_player_id, true).filter(|card| card.counters.values().any(|count| *count >= 2)).map(|c| c.id.clone()) {
+                    let progress = self.view.as_ref().map(|v| v.players.iter().filter(|p| p.id != deciding_player_id).map(|p| p.life.max(0)).sum::<i32>()).unwrap_or(0);
+                    if self.last_lifelink_combo_progress.is_some_and(|previous| progress < previous) {
+                        self.attempted_actions.retain(|key| !key.starts_with(&format!("ability:{pinger_id}:")));
+                    }
+                    self.last_lifelink_combo_progress = Some(progress);
+                }
                 let pick = actions
                     .iter()
                     .filter(|action| {
@@ -1265,10 +1503,20 @@ impl BotAgent for SimpleAi {
                             && self.sane(action, &deciding_player_id)
                     })
                     .max_by_key(|action| self.action_score(action, &deciding_player_id));
+                self.pending_lifelink_combo_cost = pick.and_then(|action| match &action.kind {
+                    AvailableActionKind::ActivateAbility(info) if self.life_counter_pinger(&deciding_player_id, true).is_some_and(|card| card.id == info.card_id) => Some(info.card_id.clone()),
+                    _ => None,
+                });
+                self.pending_voluntary_cast = pick.and_then(|action| match &action.kind {
+                    AvailableActionKind::Cast { card_id, .. } => Some(card_id.clone()),
+                    _ => None,
+                });
                 let pick = pick.map(|action| {
                     (action.id.clone(), Self::action_key(action))
                 });
                 self.payment_attempt = None;
+                self.payment_actions.clear();
+                self.payment_state = None;
                 if let Some((_, key)) = &pick {
                     self.attempted_actions.insert(key.clone());
                 }
@@ -1287,7 +1535,8 @@ impl BotAgent for SimpleAi {
             PromptInput::ChooseAttackers(manabrew_protocol::prompts::choose_attackers::ChooseAttackersInput {
                 attackers,
                 attack_targets,
-                ..
+                max_attackers,
+                target_limits,
             }) => {
                 let default_target = attack_targets
                     .iter()
@@ -1328,31 +1577,88 @@ impl BotAgent for SimpleAi {
                         &attackers.iter().map(|a| a.attacker_id.clone()).collect::<Vec<_>>(),
                     )
                 };
-                let mut assignments = Vec::new();
-                if !reprompted {
-                    for a in &attackers {
-                        if keep.contains(&a.attacker_id) && !a.must_attack {
-                            continue;
+                // Minimum-cost maximum matching satisfies as many required
+                // attacks as possible, then minimizes avoidable attacks at the
+                // goader/non-player targets across the entire declaration.
+                let mut required: Vec<_> = attackers.iter().filter(|a| a.must_attack).collect();
+                required.sort_by_key(|a| a.valid_target_ids.len());
+                #[derive(Clone)]
+                struct Edge { to: usize, rev: usize, cap: i32, cost: i32 }
+                fn add_edge(graph: &mut [Vec<Edge>], from: usize, to: usize, cap: i32, cost: i32) {
+                    let rev_to = graph[to].len(); let rev_from = graph[from].len();
+                    graph[from].push(Edge { to, rev: rev_to, cap, cost });
+                    graph[to].push(Edge { to: from, rev: rev_from, cap: 0, cost: -cost });
+                }
+                let source = 0; let attacker_base = 1; let target_base = attacker_base + required.len();
+                let sink = target_base + attack_targets.len();
+                let mut graph: Vec<Vec<Edge>> = vec![Vec::new(); sink + 1];
+                for (index, attacker) in required.iter().enumerate() {
+                    add_edge(&mut graph, source, attacker_base + index, 1, 0);
+                    let mut targets: Vec<_> = attacker.valid_target_ids.iter()
+                        .filter(|target| !self.failed_attack_targets.contains(*target)).collect();
+                    targets.sort_by_key(|target| std::cmp::Reverse((attacker.goaded_by.as_ref().is_some_and(|g|
+                        target.starts_with("player-") && *target != g), self.attack_target_score(target))));
+                    for target in targets {
+                        if let Some(position) = attack_targets.iter().position(|item| item.id == *target) {
+                            let penalty = i32::from(attacker.goaded_by.as_ref().is_some_and(|g|
+                                !target.starts_with("player-") || target == g));
+                            add_edge(&mut graph, attacker_base + index, target_base + position, 1, penalty);
                         }
-                        let target_id = match a
-                            .valid_target_ids
-                            .iter()
-                            .filter(|target| !self.failed_attack_targets.contains(*target))
-                            .max_by_key(|target| self.attack_target_score(target))
-                        {
-                            Some(t) => t.clone(),
-                            None if a.valid_target_ids.is_empty() => default_target.clone(),
-                            None => continue,
+                    }
+                }
+                for (index, target) in attack_targets.iter().enumerate() {
+                    let cap = target_limits.get(&target.id).copied().unwrap_or(required.len()).min(required.len());
+                    add_edge(&mut graph, target_base + index, sink, cap as i32, 0);
+                }
+                let maximum = max_attackers.unwrap_or(required.len()).min(required.len());
+                for _ in 0..maximum {
+                    let mut distance = vec![i32::MAX; graph.len()];
+                    let mut previous: Vec<Option<(usize, usize)>> = vec![None; graph.len()];
+                    distance[source] = 0;
+                    for _ in 0..graph.len() {
+                        let mut changed = false;
+                        for node in 0..graph.len() {
+                            if distance[node] == i32::MAX { continue; }
+                            for (edge_id, edge) in graph[node].iter().enumerate() {
+                                let next = distance[node] + edge.cost;
+                                if edge.cap > 0 && next < distance[edge.to] {
+                                    distance[edge.to] = next; previous[edge.to] = Some((node, edge_id)); changed = true;
+                                }
+                            }
+                        }
+                        if !changed { break; }
+                    }
+                    if previous[sink].is_none() { break; }
+                    let mut node = sink;
+                    while node != source {
+                        let (prior, edge_id) = previous[node].expect("reachable matching path");
+                        let reverse = graph[prior][edge_id].rev;
+                        graph[prior][edge_id].cap -= 1;
+                        graph[node][reverse].cap += 1;
+                        node = prior;
+                    }
+                }
+                let mut assignments: Vec<AttackAssignment> = Vec::new();
+                for (index, attacker) in required.iter().enumerate() {
+                    if let Some(edge) = graph[attacker_base + index].iter()
+                        .find(|edge| edge.to >= target_base && edge.to < sink && edge.cap == 0) {
+                        assignments.push(AttackAssignment { attacker_id: attacker.attacker_id.clone(),
+                            target_id: attack_targets[edge.to - target_base].id.clone() });
+                    }
+                }
+                // Optional attacks use only capacity left after requirements.
+                for a in attackers.iter().filter(|a| !a.must_attack) {
+                    if max_attackers.is_some_and(|max| assignments.len() >= max) { break; }
+                    if reprompted || keep.contains(&a.attacker_id) { continue; }
+                    let target_id = match a.valid_target_ids.iter()
+                        .filter(|target| !self.failed_attack_targets.contains(*target))
+                        .filter(|target| target_limits.get(*target).is_none_or(|limit|
+                            assignments.iter().filter(|entry| entry.target_id.as_str() == target.as_str()).count() < *limit))
+                        .max_by_key(|target| self.attack_target_score(target)) {
+                            Some(target) => target.clone(), None => continue,
                         };
-                        if a.must_attack
-                            || (lethal_target && target_id == default_target)
-                            || self.should_attack(&a.attacker_id, &target_id)
-                        {
-                            assignments.push(AttackAssignment {
-                                attacker_id: a.attacker_id.clone(),
-                                target_id,
-                            });
-                        }
+                    if (lethal_target && target_id == default_target) || self.should_attack(&a.attacker_id, &target_id) {
+                        assignments.push(AttackAssignment { attacker_id: a.attacker_id.clone(), target_id });
                     }
                 }
                 self.last_attack_declaration = assignments
@@ -1373,23 +1679,62 @@ impl BotAgent for SimpleAi {
                 Some(PromptOutput::ChooseBlockers(ChooseBlockersOutput::DeclareBlockers { assignments }))
             }
             PromptInput::ChooseBoardTargets(manabrew_protocol::prompts::choose_board_targets::ChooseBoardTargetsInput {
-                candidates, hostile, min_targets, max_targets, chosen_targets, ..
+                candidates, hostile, min_targets, max_targets, chosen_targets, presentation, cancellable, intent, ..
             }) => {
                 let take = (max_targets - chosen_targets).max(min_targets - chosen_targets).max(0)
                     as usize;
-                let damage = prompt
+                let damage = prompt.known_damage.or_else(|| prompt
                     .source_ability_text
                     .as_deref()
                     .and_then(Self::damage_amount)
-                    .or_else(|| prompt.source_card.as_ref().and_then(|card| Self::damage_amount(&card.text)));
+                    .or_else(|| prompt.source_card.as_ref().and_then(|card| Self::damage_amount(&card.text))));
                 let mut candidates = candidates;
+                let voluntary = cancellable && hostile && min_targets == 1 && max_targets == 1
+                    && prompt.source_card.as_ref().is_some_and(|card| self.pending_voluntary_cast.as_deref() == Some(card.id.as_str()));
+                // TargetingIntent::Counter is also used by ChangeTargets spells;
+                // never treat a redirect or another action as a counter effect.
+                let effect = prompt.source_ability_text.as_deref()
+                    .or_else(|| prompt.source_card.as_ref().map(|card| card.text.as_str()))
+                    .unwrap_or("").trim().to_ascii_lowercase();
+                let direct_answer = match intent {
+                    TargetingIntent::Counter => effect.starts_with("counter "),
+                    TargetingIntent::Destroy => effect.starts_with("destroy "),
+                    TargetingIntent::Exile => effect.starts_with("exile "),
+                    TargetingIntent::Bounce => effect.starts_with("return ") || effect.starts_with("put target "),
+                    _ => false,
+                };
+                if voluntary && direct_answer {
+                    candidates.retain(|target| {
+                        let own_spell = matches!(intent, TargetingIntent::Counter) && matches!(target.kind,TargetKind::Spell)
+                            && self.view.as_ref().and_then(|view|view.stack.iter().find(|item|item.id==target.id))
+                                .is_some_and(|item|item.controller_id==deciding_player_id);
+                        !own_spell && !self.covered_by_friendly_answer(target, &deciding_player_id)
+                    });
+                    if candidates.is_empty() {
+                        self.pending_voluntary_cast = None;
+                        return Some(PromptOutput::ChooseBoardTargets(ChooseBoardTargetsOutput::Cancel));
+                    }
+                }
                 candidates.sort_by_key(|target| {
-                    std::cmp::Reverse(match damage {
-                        Some(damage) if hostile => {
-                            self.damage_target_score(target, &deciding_player_id, damage)
-                        }
+                    let death_tutor = presentation.title.eq_ignore_ascii_case("Sacrifice")
+                        && self.death_tutor_plan_target(&deciding_player_id).is_some_and(|card|card.id==target.id);
+                    let base=if death_tutor { 100_000 } else { match damage {
+                        Some(damage) if hostile => self.damage_target_score(target, &deciding_player_id, damage),
                         _ => self.target_score(target, &deciding_player_id, hostile),
-                    })
+                    }};
+                    let covered = hostile && matches!(intent,TargetingIntent::Damage) && match target.kind {
+                        TargetKind::Player if target.id!=deciding_player_id => self.view.as_ref().and_then(|view|view.players.iter().find(|p|p.id==target.id))
+                            .is_some_and(|p| p.life>0 && self.pending_damage(&deciding_player_id,&target.id)>=p.life),
+                        TargetKind::Card => self.card(&target.id).and_then(|card| card.toughness.as_deref().and_then(|n|n.parse::<i32>().ok()).map(|t| (t-card.damage).max(1)))
+                            .is_some_and(|remaining| self.pending_damage(&deciding_player_id,&target.id)>=remaining),
+                        _ => false,
+                    };
+                    let friendly = matches!(intent,TargetingIntent::Damage) && hostile && match target.kind {
+                        TargetKind::Player => target.id == deciding_player_id,
+                        TargetKind::Card => self.card(&target.id).is_some_and(|card| card.controller_id == deciding_player_id),
+                        _ => false,
+                    };
+                    std::cmp::Reverse(base - if covered {100_000} else {0} - if friendly {200_000} else {0})
                 });
                 Some(PromptOutput::ChooseBoardTargets(ChooseBoardTargetsOutput::BoardTargets {
                     chosen: candidates.into_iter().take(take).collect(),
@@ -1426,9 +1771,35 @@ impl BotAgent for SimpleAi {
                 let repeated = self.looping_on(signature);
                 let title = presentation.title.to_ascii_lowercase();
                 let always_accept = title.contains("cancel search")
-                    || title.starts_with("do you want to draw")
                     || (title.contains("commander")
                         && title.contains("put it into the command zone"));
+                let useful_single_draw = (title == "do you want to draw a card?"
+                    || title == "do you want to draw 1 card(s)?"
+                    || (confirm_label == "Accept" && title.ends_with(", you may draw a card.")))
+                    && self.view.as_ref().is_some_and(|view| view.zones.iter().any(|zone| {
+                        zone.zone == ZoneKind::Library && zone.owner_id == deciding_player_id && zone.count > 0
+                    }));
+                // Decline a hand replacement when it destroys a prepared hand,
+                // but take a four-card refill from a depleted hand when the
+                // library can supply it. This is not a general optional-effect rule.
+                let useful_hand_refill = title.contains("discard your hand")
+                    && title.contains("draw four cards")
+                    && self.view.as_ref().is_some_and(|view| {
+                        let count = |kind| view.zones.iter()
+                            .find(|zone| zone.zone == kind && zone.owner_id == deciding_player_id)
+                            .map(|zone| zone.count).unwrap_or(0);
+                        count(ZoneKind::Hand) <= 1 && count(ZoneKind::Library) >= 4
+                    });
+                let pay_single_draw_tax = title == "pay {1} to prevent an opponent drawing a card?"
+                    && self.view.as_ref().is_some_and(|view| {
+                        let floating: u32 = view.players.iter().find(|p| p.id == deciding_player_id)
+                            .map(|p| p.mana_pool.values().sum()).unwrap_or(0);
+                        let untapped_lands = view.zones.iter().filter(|z| z.zone == ZoneKind::Battlefield)
+                            .flat_map(|z| &z.cards).filter(|c| matches!(c,
+                                CardView::Visible(card) if card.controller_id == deciding_player_id
+                                    && !card.tapped && card.types.iter().any(|kind| kind == "Land"))).count();
+                        floating > 0 || untapped_lands >= 2
+                    });
                 let constructed_duel = self.is_constructed_duel();
                 let duel_cost = title.starts_with("pay 1 life")
                     || title.starts_with("pay 2 life")
@@ -1462,7 +1833,47 @@ impl BotAgent for SimpleAi {
                     || title.contains("sacrifice strip mine")
                     || title.contains("exile simian spirit guide")
                     || title.starts_with("use triggered ability");
-                let value = always_accept || (accept_once && !repeated);
+                let refill_cost = confirm_label == "Pay" && title.starts_with("pay cost for ")
+                    && prompt_source_id != "none"
+                    && pending_hand_refill.as_deref() == Some(prompt_source_id.as_str());
+                let combo_cost = confirm_label == "Pay" && title.starts_with("pay cost for ")
+                    && self.pending_lifelink_combo_cost.take().as_deref() == Some(prompt_source_id.as_str());
+                let safe_copy_kicker = confirm_label == "Pay Kicker" && title == "pay kicker?"
+                    && self.card(&prompt_source_id).is_some_and(|card| card.text.to_ascii_lowercase().contains("create five of those tokens instead"))
+                    && self.battlefield(&deciding_player_id).any(|card| {
+                        let text=card.text.to_ascii_lowercase();
+                        text.contains("you draw x cards") && text.contains("you lose x life") && text.contains("number of demons you control")
+                    })
+                    && self.view.as_ref().is_some_and(|view| {
+                        let demons=self.battlefield(&deciding_player_id).filter(|card| card.subtypes.iter().any(|t|t=="Demon")).count() as i32;
+                        let legend_rule_disabled = self.battlefield(&deciding_player_id).any(|card| {
+                            let text = card.text.to_ascii_lowercase();
+                            text.contains("legend rule") && (text.contains("doesn't apply") || text.contains("does not apply"))
+                        });
+                        let upper_bound=5*(demons + if legend_rule_disabled {5} else {0});
+                        let life=view.players.iter().find(|p|p.id==deciding_player_id).map(|p|p.life).unwrap_or(0);
+                        let library=view.zones.iter().find(|z|z.owner_id==deciding_player_id && z.zone==ZoneKind::Library).map(|z|z.count as i32).unwrap_or(0);
+                        life>upper_bound && library>=upper_bound
+                    });
+                let mana_payment_context = self.auto_payment_active
+                    || self.selected_mana_source.as_deref() == Some(prompt_source_id.as_str());
+                let life_cost = prompt_card_text.split("pay ").skip(1).filter_map(|part| {
+                    let mut words=part.split_whitespace();
+                    let amount=words.next()?.parse::<i32>().ok()?;
+                    words.next().filter(|word| word.trim_matches(|c: char| !c.is_alphabetic()) == "life")?;
+                    (amount > 0).then_some(amount)
+                }).max();
+                let title_life_cost = title.strip_prefix("pay ").and_then(|rest| rest.split_whitespace().next())
+                    .and_then(|amount| amount.parse::<i32>().ok()).filter(|amount| *amount > 0);
+                let safe_life_payment = life_cost.or(title_life_cost).zip(life).is_some_and(|(amount, current)| current > amount);
+                let mana_cost_confirmation = mana_payment_context && confirm_label == "Pay" && prompt_source_id != "none"
+                    && (matches!(title.as_str(), "remove counter for mana" | "exile for mana" | "sacrifice for mana")
+                        || (title.starts_with("pay cost for ") && self.selected_mana_source.as_deref() == Some(prompt_source_id.as_str()))
+                        || ((title == "pay life for mana" || (title.starts_with("pay ") && title.contains("{life}"))) && safe_life_payment));
+                let value = always_accept || mana_cost_confirmation || useful_single_draw || useful_hand_refill || refill_cost || combo_cost || safe_copy_kicker || pay_single_draw_tax || (accept_once && !repeated);
+                if useful_hand_refill && prompt_source_id != "none" {
+                    self.pending_hand_refill_source = Some(prompt_source_id.clone());
+                }
                 Some(PromptOutput::ChooseBoolean(ChooseBooleanOutput::Decision { value }))
             }
             PromptInput::ChooseFromSelection(manabrew_protocol::prompts::choose_from_selection::ChooseFromSelectionInput {
@@ -1478,7 +1889,10 @@ impl BotAgent for SimpleAi {
                     .attempted_actions
                     .iter()
                     .any(|key| key.starts_with(&format!("ability:{prompt_source_id}:")));
-                let target = if search || self.looping_on(signature) {
+                let useful_extra_recovery_mode = presentation.title.eq_ignore_ascii_case("Choose Mode") && max_total >= 2
+                    && options.iter().any(|option| option.label.to_ascii_lowercase().contains("return target creature card from your graveyard to the battlefield"))
+                    && self.view.as_ref().is_some_and(|view| view.zones.iter().any(|zone| zone.zone==ZoneKind::Graveyard && zone.owner_id==deciding_player_id && zone.cards.iter().any(|card| matches!(card, CardView::Visible(card) if card.types.iter().any(|kind|kind=="Creature")))));
+                let target = if useful_extra_recovery_mode || search || self.looping_on(signature) {
                     max_total
                 } else if own_activation {
                     min_total.max(1).min(max_total)
@@ -1534,7 +1948,19 @@ impl BotAgent for SimpleAi {
             }
             PromptInput::ChooseColor(manabrew_protocol::prompts::choose_color::ChooseColorInput { valid_colors, amount, repeat_allowed, .. }) => {
                 let mut chosen: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
-                if repeat_allowed {
+                let preferred = if self.awaiting_mana_color && amount == 1 {
+                    use manabrew_protocol::game::ManaColor;
+                    let name = match self.pending_mana_color {
+                        Some(ManaColor::White) => Some("White"), Some(ManaColor::Blue) => Some("Blue"),
+                        Some(ManaColor::Black) => Some("Black"), Some(ManaColor::Red) => Some("Red"),
+                        Some(ManaColor::Green) => Some("Green"), Some(ManaColor::Colorless) => Some("Colorless"), None => None,
+                    };
+                    name.and_then(|n| valid_colors.iter().find(|c| c.eq_ignore_ascii_case(n)))
+                } else { None };
+                self.awaiting_mana_color = false;
+                if let Some(c) = preferred {
+                    chosen.insert(c.clone(), 1);
+                } else if repeat_allowed {
                     if let Some(c) = valid_colors.first() {
                         chosen.insert(c.clone(), amount);
                     }
@@ -1551,7 +1977,7 @@ impl BotAgent for SimpleAi {
                 let x_cost = presentation.title.to_ascii_lowercase().ends_with("for x");
                 let chosen = if x_cost {
                     let fixed = prompt.source_card.as_ref().map_or(0, |card| card.cmc);
-                    (self.available_mana(&deciding_player_id) - fixed).clamp(min.max(1), max)
+                    (self.available_mana(&deciding_player_id) - fixed).clamp(min.max(1).min(max), max)
                 } else {
                     min.max(1).min(max)
                 };
@@ -1612,7 +2038,41 @@ impl BotAgent for SimpleAi {
                 Some(PromptOutput::ChooseCombatDamageAssignment(ChooseCombatDamageAssignmentOutput::CombatDamageAssignmentDecision { assignments }))
             }
             PromptInput::PayManaCost(input) => {
-                let manual_action = input.actions.iter().find(|action| {
+                self.pending_voluntary_cast = None;
+                let pool = self.view.as_ref().and_then(|view| {
+                    view.players.iter().find(|player| player.id == deciding_player_id)
+                        .map(|player| &player.mana_pool)
+                });
+                use manabrew_protocol::game::ManaColor;
+                let colors = [("W", ManaColor::White), ("U", ManaColor::Blue), ("B", ManaColor::Black),
+                    ("R", ManaColor::Red), ("G", ManaColor::Green), ("C", ManaColor::Colorless)];
+                let (available_colors, _, _) = self.mana_sources(&deciding_player_id);
+                let deficits: Vec<_> = colors.iter().enumerate().filter_map(|(index, (symbol, color))| {
+                    let required = input.mana_cost.split('{').skip(1)
+                        .filter(|part| part.split('}').next() == Some(*symbol)).count() as i32;
+                    let floating = pool.and_then(|p| p.get(color)).copied().unwrap_or(0) as i32;
+                    let source_count = available_colors.get(index).copied().unwrap_or(floating);
+                    (required > floating).then_some((*color, (required - source_count).max(0), required - floating))
+                }).collect();
+                self.pending_mana_color = deficits.into_iter().max_by_key(|(_, scarce, unpaid)| (*scarce, *unpaid)).map(|(color, _, _)| color);
+                self.awaiting_mana_color = false;
+                let state = serde_json::to_string(&(&input, pool)).unwrap();
+                if self.payment_state.as_deref() != Some(state.as_str()) {
+                    self.payment_actions.clear();
+                    self.payment_state = Some(state);
+                }
+                let cost_symbols = input.mana_cost.split('{').skip(1)
+                    .map(|part| part.split('}').next().unwrap_or(""))
+                    .map(|s| s.parse::<i32>().ok().or_else(|| (s == "X").then_some(0)).or_else(|| matches!(s, "W" | "U" | "B" | "R" | "G" | "C").then_some(1)))
+                    .collect::<Option<Vec<_>>>();
+                let need_convoke = cost_symbols.is_some_and(|symbols| {
+                    let floating: i32 = pool.map_or(0, |p| p.values().map(|&n| n as i32).sum());
+                    symbols.iter().sum::<i32>() > floating + self.available_mana(&deciding_player_id)
+                });
+                let manual_action = input.actions.iter().filter(|action| {
+                    if self.payment_actions.contains(&action.id) {
+                        return false;
+                    }
                     matches!(
                         &action.kind,
                         manabrew_protocol::prompts::common::PaymentActionKind::ActivateManaAbility(
@@ -1620,7 +2080,18 @@ impl BotAgent for SimpleAi {
                         ) if info
                             .cost
                             .as_deref()
-                            .is_some_and(|cost| cost.chars().any(|c| c.is_ascii_digit()))
+                            .is_some_and(|cost| {
+                                cost.split(", ").any(|part| {
+                                    part.strip_prefix("Pay ")
+                                        .and_then(|value| value.strip_suffix(" life"))
+                                        .is_some_and(|value| value.parse::<u32>().is_ok())
+                                }) || cost.split('{').skip(1).any(|part| {
+                                    part.split_once('}').is_some_and(|(symbol, _)| {
+                                        !symbol.is_empty()
+                                            && symbol.chars().all(|c| c.is_ascii_digit())
+                                    })
+                                })
+                            })
                     ) || matches!(
                         &action.kind,
                         manabrew_protocol::prompts::common::PaymentActionKind::UseResource {
@@ -1628,25 +2099,54 @@ impl BotAgent for SimpleAi {
                                 manabrew_protocol::prompts::common::PaymentResourceKind::Waterbend,
                             ..
                         }
-                    )
+                    ) || (need_convoke && matches!(
+                        &action.kind,
+                        manabrew_protocol::prompts::common::PaymentActionKind::UseResource {
+                            resource: manabrew_protocol::prompts::common::PaymentResourceKind::Convoke,
+                            ..
+                        }
+                    ))
+                }).rev().max_by_key(|action| {
+                    if let manabrew_protocol::prompts::common::PaymentActionKind::ActivateManaAbility(info) = &action.kind {
+                        if let (Some(needed), Some(produced)) = (self.pending_mana_color, info.produced_mana.as_ref()) {
+                            return if produced.iter().any(|m| m.color == needed && m.amount > 0) { 2 } else { 0 };
+                        }
+                    }
+                    1
                 });
                 let payment = if input.can_confirm_from_pool {
                     self.failed_attack_targets.clear();
                     PayManaCostOutput::Pay { auto: false }
                 } else if let Some(action) = manual_action {
+                    self.payment_actions.insert(action.id.clone());
+                    self.selected_mana_source = action.id.strip_prefix("tap:").and_then(|s| s.split(':').next()).map(str::to_owned);
+                    self.awaiting_mana_color = matches!(action.kind, manabrew_protocol::prompts::common::PaymentActionKind::ActivateManaAbility(_));
                     PayManaCostOutput::Act {
                         action_id: action.id.clone(),
                     }
                 } else if input.actions.is_empty()
                     || self.payment_attempt.as_deref() == Some(input.card_id.as_str())
                 {
-                    self.fail_attack_target(&input.card_id);
-                    self.payment_attempt = None;
-                    PayManaCostOutput::Cancel
+                    let phyrexian_life = input.mana_cost.split('{').skip(1)
+                        .filter(|part| part.split('}').next().is_some_and(|symbol| symbol.ends_with("/P")))
+                        .count() as i32 * 2;
+                    let life = self.view.as_ref().and_then(|view| view.players.iter().find(|p| p.id == deciding_player_id))
+                        .map_or(0, |p| p.life);
+                    if input.actions.is_empty() && phyrexian_life > 0 && life > phyrexian_life
+                        && self.payment_attempt.as_deref() != Some(input.card_id.as_str()) {
+                        self.payment_attempt = Some(input.card_id.clone());
+                        PayManaCostOutput::Pay { auto: true }
+                    } else {
+                        self.fail_attack_target(&input.card_id);
+                        self.payment_attempt = None;
+                        PayManaCostOutput::Cancel
+                    }
                 } else {
                     self.payment_attempt = Some(input.card_id.clone());
                     PayManaCostOutput::Pay { auto: true }
                 };
+                self.auto_payment_active = matches!(payment, PayManaCostOutput::Pay { auto: true });
+                if !matches!(payment, PayManaCostOutput::Act { .. }) { self.selected_mana_source = None; }
                 Some(PromptOutput::PayManaCost(payment))
             }
             PromptInput::ChooseCards(manabrew_protocol::prompts::choose_cards::ChooseCardsInput {
@@ -1668,6 +2168,11 @@ impl BotAgent for SimpleAi {
                     || hand_reorder;
                 let lands = self.lands_in_play(&deciding_player_id);
                 let missing = self.missing_colors(&deciding_player_id);
+                let recover_tutor = title.contains("zone change") && self.view.as_ref().is_some_and(|view| {
+                    view.zones.iter().any(|zone|matches!(zone.zone, ZoneKind::Graveyard | ZoneKind::Battlefield) && zone.owner_id==deciding_player_id && zone.cards.iter().any(|card|matches!(card, CardView::Visible(card) if {
+                        let text=card.text.to_ascii_lowercase();text.contains("dies") && text.contains("search your library") && text.contains("creature cards")
+                    })))
+                });
                 cards.sort_by_key(|card| {
                     let land = card.types.iter().any(|ty| ty == "Land");
                     let value = if land {
@@ -1681,7 +2186,12 @@ impl BotAgent for SimpleAi {
                     } else {
                         Self::card_value(card)
                     };
-                    if prefer_low { value } else { -value }
+                    let tutor_on_death = title.contains("sacrifice") && {
+                        let text=card.text.to_ascii_lowercase();
+                        text.contains("dies") && text.contains("search your library") && text.contains("creature cards") && text.contains("onto the battlefield")
+                    };
+                    let revives_tutor = recover_tutor && card.text.to_ascii_lowercase().contains("return target creature card from your graveyard to the battlefield");
+                    if tutor_on_death || revives_tutor { -10_000 } else if prefer_low { value } else { -value }
                 });
                 let count = if (discard || hand_reorder) && min == 0 {
                     max
@@ -1690,9 +2200,11 @@ impl BotAgent for SimpleAi {
                 } else {
                     max
                 };
-                Some(PromptOutput::ChooseCards(ChooseCardsOutput::ChooseCardsDecision {
-                    chosen_card_ids: cards.iter().take(count).map(|card| card.id.clone()).collect(),
-                }))
+                let chosen_card_ids: Vec<_> = cards.iter().take(count).map(|card| card.id.clone()).collect();
+                if recover_tutor {
+                    self.known_tutor_targets=Some(cards.iter().filter(|card|!chosen_card_ids.contains(&card.id)).map(|card|card.id.clone()).collect());
+                }
+                Some(PromptOutput::ChooseCards(ChooseCardsOutput::ChooseCardsDecision { chosen_card_ids }))
             }
             PromptInput::Reorder(manabrew_protocol::prompts::reorder::ReorderInput { items, .. }) => {
                 Some(PromptOutput::Reorder(ReorderOutput::ReorderDecision {
@@ -1707,5 +2219,472 @@ impl BotAgent for SimpleAi {
                 DiceRolledOutput::DiceRolledAcknowledged,
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod required_attack_regression {
+    use crate::agent::BotAgent;
+    use super::SimpleAi;
+    use manabrew_protocol::transport::AgentPrompt;
+    use serde_json::json;
+
+    #[test]
+    fn required_attacker_is_not_dropped_on_repeated_prompt() {
+        let prompt: AgentPrompt = serde_json::from_value(json!({
+            "promptId":1,"decidingPlayerId":"player-0",
+            "input":{"type":"chooseAttackers", "attackers":[
+                {"attackerId":"card-1", "mustAttack":true, "validTargetIds":["player-1"]}],
+                "attackTargets":[{"id":"player-1", "kind":"player", "label":"Player 1"}]}
+        })).unwrap();
+        let mut bot = SimpleAi::default();
+        for _ in 0..2 {
+            let response = serde_json::to_value(bot.decide(prompt.clone()).unwrap()).unwrap();
+            assert_eq!(response["output"]["assignments"][0]["attackerId"], "card-1", "{response}");
+        }
+    }
+    #[test]
+    fn global_limit_chooses_one_of_two_required_attackers() {
+        let prompt: AgentPrompt = serde_json::from_value(json!({
+            "promptId":1,"decidingPlayerId":"player-0",
+            "input":{"type":"chooseAttackers", "maxAttackers":1, "attackers":[
+                {"attackerId":"card-1", "mustAttack":true, "validTargetIds":["player-1"]},
+                {"attackerId":"card-2", "mustAttack":true, "validTargetIds":["player-1"]}],
+                "attackTargets":[{"id":"player-1", "kind":"player", "label":"Player 1"}]}
+        })).unwrap();
+        let mut bot = SimpleAi::default();
+        for _ in 0..2 {
+            let response = serde_json::to_value(bot.decide(prompt.clone()).unwrap()).unwrap();
+            assert_eq!(response["output"]["assignments"].as_array().unwrap().len(), 1);
+        }
+    }
+    #[test]
+    fn two_required_attackers_respect_per_defender_limit() {
+        let prompt: AgentPrompt = serde_json::from_value(json!({
+            "promptId":1,"decidingPlayerId":"player-0",
+            "input":{"type":"chooseAttackers", "targetLimits":{"player-2":1}, "attackers":[
+                {"attackerId":"card-1", "mustAttack":true, "validTargetIds":["player-1","player-2"]},
+                {"attackerId":"card-2", "mustAttack":true, "validTargetIds":["player-1","player-2"]}],
+                "attackTargets":[{"id":"player-1", "kind":"player", "label":"Player 1"},
+                                 {"id":"player-2", "kind":"player", "label":"Player 2"}]}
+        })).unwrap();
+        let response = serde_json::to_value(SimpleAi::default().decide(prompt).unwrap()).unwrap();
+        let choices = response["output"]["assignments"].as_array().unwrap();
+        assert_eq!(choices.len(), 2);
+        assert!(choices.iter().filter(|choice| choice["targetId"] == "player-2").count() <= 1);
+    }
+    #[test]
+    fn constrained_required_attacker_gets_limited_defender_first() {
+        let prompt: AgentPrompt = serde_json::from_value(json!({
+            "promptId":1,"decidingPlayerId":"player-0", "input":{"type":"chooseAttackers",
+                "targetLimits":{"player-2":1}, "attackers":[
+                    {"attackerId":"card-1", "mustAttack":true, "validTargetIds":["player-1","player-2"]},
+                    {"attackerId":"card-2", "mustAttack":true, "validTargetIds":["player-2"]}],
+                "attackTargets":[{"id":"player-1", "kind":"player", "label":"Player 1"},
+                                 {"id":"player-2", "kind":"player", "label":"Player 2"}]}})).unwrap();
+        let response = serde_json::to_value(SimpleAi::default().decide(prompt).unwrap()).unwrap();
+        let choices = response["output"]["assignments"].as_array().unwrap();
+        assert_eq!(choices.len(), 2);
+        assert_eq!(choices[0]["attackerId"], "card-2");
+        assert_ne!(choices[0]["targetId"], choices[1]["targetId"]);
+    }
+    #[test]
+    fn goaded_attacker_uses_goaders_target_only_when_alternative_full() {
+        let prompt: AgentPrompt = serde_json::from_value(json!({
+            "promptId":1,"decidingPlayerId":"player-0", "input":{"type":"chooseAttackers",
+                "targetLimits":{"player-2":1}, "attackers":[
+                    {"attackerId":"card-1", "mustAttack":true, "goadedBy":"player-1", "validTargetIds":["player-1","player-2"]},
+                    {"attackerId":"card-2", "mustAttack":true, "goadedBy":"player-1", "validTargetIds":["player-1","player-2"]}],
+                "attackTargets":[{"id":"player-1", "kind":"player", "label":"Player 1"},
+                                 {"id":"player-2", "kind":"player", "label":"Player 2"}]}})).unwrap();
+        let response = serde_json::to_value(SimpleAi::default().decide(prompt).unwrap()).unwrap();
+        let choices = response["output"]["assignments"].as_array().unwrap();
+        assert_eq!(choices.len(), 2);
+        let mut targets: Vec<_> = choices.iter().map(|choice| choice["targetId"].as_str().unwrap()).collect();
+        targets.sort();
+        assert_eq!(targets, vec!["player-1", "player-2"]);
+    }
+    #[test]
+    fn goad_keeps_other_player_targets_when_capacity_allows() {
+        let prompt: AgentPrompt = serde_json::from_value(json!({
+            "promptId":1,"decidingPlayerId":"player-0", "input":{"type":"chooseAttackers",
+                "targetLimits":{"player-2":1,"player-3":1}, "attackers":[
+                    {"attackerId":"card-1", "mustAttack":true, "goadedBy":"player-1", "validTargetIds":["player-2","player-1"]},
+                    {"attackerId":"card-2", "mustAttack":true, "goadedBy":"player-1", "validTargetIds":["player-2","player-3","player-1"]}],
+                "attackTargets":[{"id":"player-1", "kind":"player", "label":"Player 1"},
+                    {"id":"player-2", "kind":"player", "label":"Player 2"},
+                    {"id":"player-3", "kind":"player", "label":"Player 3"}]}})).unwrap();
+        let response = serde_json::to_value(SimpleAi::default().decide(prompt).unwrap()).unwrap();
+        let choices = response["output"]["assignments"].as_array().unwrap();
+        assert_eq!(choices.len(), 2);
+        assert!(choices.iter().all(|choice| choice["targetId"] != "player-1"));
+    }
+    #[test]
+    fn required_attacks_reassign_flexible_targets_when_capacities_compete() {
+        let prompt: AgentPrompt = serde_json::from_value(json!({
+            "promptId":1,"decidingPlayerId":"player-0", "input":{"type":"chooseAttackers",
+                "targetLimits":{"player-1":1,"player-2":1,"player-3":1,"player-4":1}, "attackers":[
+                    {"attackerId":"card-1", "mustAttack":true, "validTargetIds":["player-1","player-2"]},
+                    {"attackerId":"card-2", "mustAttack":true, "validTargetIds":["player-2","player-3"]},
+                    {"attackerId":"card-3", "mustAttack":true, "validTargetIds":["player-2","player-3"]},
+                    {"attackerId":"card-4", "mustAttack":true, "validTargetIds":["player-1","player-4"]}],
+                "attackTargets":[{"id":"player-1", "kind":"player", "label":"Player 1"},
+                    {"id":"player-2", "kind":"player", "label":"Player 2"},
+                    {"id":"player-3", "kind":"player", "label":"Player 3"},
+                    {"id":"player-4", "kind":"player", "label":"Player 4"}]}})).unwrap();
+        let response = serde_json::to_value(SimpleAi::default().decide(prompt).unwrap()).unwrap();
+        assert_eq!(response["output"]["assignments"].as_array().unwrap().len(), 4);
+    }
+    #[test]
+    fn required_attacker_with_no_legal_target_is_not_assigned_an_invalid_one() {
+        let prompt: AgentPrompt = serde_json::from_value(json!({
+            "promptId":1,"decidingPlayerId":"player-0",
+            "input":{"type":"chooseAttackers", "attackers":[
+                {"attackerId":"card-1", "mustAttack":true, "validTargetIds":[]}],
+                "attackTargets":[{"id":"player-1", "kind":"player", "label":"Player 1"}]}
+        })).unwrap();
+        let response = serde_json::to_value(SimpleAi::default().decide(prompt).unwrap()).unwrap();
+        assert_eq!(response["output"]["assignments"], json!([]));
+    }
+}
+
+#[cfg(test)]
+mod optional_draw_regression {
+    use crate::agent::BotAgent;
+    use super::SimpleAi;
+    use manabrew_protocol::{game::{GameViewDto, ZoneDto, ZoneKind}, transport::AgentPrompt};
+    use serde_json::json;
+
+    #[test]
+    fn accepts_useful_optional_draw_but_declines_empty_library() {
+        for (count, title, expected) in [(2, "Do you want to draw 1 card(s)?", true), (0, "Do you want to draw 1 card(s)?", false), (2, "Do you want to draw 2 card(s)?", false), (2, "Do you want to draw a card?", true), (2, "Whenever enchanted creature deals damage to an opponent, you may draw a card.", true), (0, "Whenever enchanted creature deals damage to an opponent, you may draw a card.", false), (2, "Whenever this attacks, you may draw a card, then discard a card.", false)] {
+            let mut bot = SimpleAi::default();
+            let mut view = GameViewDto::default();
+            view.zones.push(ZoneDto { zone: ZoneKind::Library, owner_id: "player-0".into(), cards: vec![], count });
+            bot.observe(view);
+            let prompt: AgentPrompt = serde_json::from_value(json!({
+                "promptId":1,"decidingPlayerId":"player-0",
+                "input":{"type":"chooseBoolean","confirmLabel":"Accept","denyLabel":"Decline",
+                    "presentation":{"title":title,"targets":[]}}
+            })).unwrap();
+            let response = serde_json::to_value(bot.decide(prompt).unwrap()).unwrap();
+            assert_eq!(response["output"]["value"], expected);
+        }
+    }
+}
+
+#[cfg(test)]
+mod optional_tax_regression {
+    use crate::agent::BotAgent;
+    use super::SimpleAi;
+    use manabrew_protocol::{game::{CardDto, CardView, GameViewDto, ZoneDto, ZoneKind}, transport::AgentPrompt};
+    use serde_json::json;
+
+    #[test]
+    fn tax_policy_pays_with_spare_land_and_declines_last_source() {
+        for (lands, expected) in [(2, true), (1, false)] {
+            let mut bot = SimpleAi::default();
+            let mut view = GameViewDto::default();
+            view.zones.push(ZoneDto { zone: ZoneKind::Battlefield, owner_id: "player-0".into(), count: lands,
+                cards: (0..lands).map(|i| CardView::Visible(CardDto { id: format!("card-{i}"),
+                    controller_id: "player-0".into(), types: vec!["Land".into()], ..Default::default() })).collect() });
+            bot.observe(view);
+            let prompt: AgentPrompt = serde_json::from_value(json!({
+                "promptId":1,"decidingPlayerId":"player-0",
+                "input":{"type":"chooseBoolean","confirmLabel":"Pay","denyLabel":"Decline",
+                    "presentation":{"title":"Pay {1} to prevent an opponent drawing a card?","targets":[]}}
+            })).unwrap();
+            let response = serde_json::to_value(bot.decide(prompt).unwrap()).unwrap();
+            assert_eq!(response["output"]["value"], expected);
+        }
+    }
+}
+
+#[cfg(test)]
+mod convoke_payment_regression {
+    use crate::agent::BotAgent;
+    use super::SimpleAi;
+    use manabrew_protocol::transport::AgentPrompt;
+    use serde_json::json;
+    #[test]
+    fn uses_convoke_when_payment_is_not_ready_and_confirms_when_ready() {
+        for ready in [false, true] {
+            let prompt: AgentPrompt = serde_json::from_value(json!({
+                "promptId":1,"decidingPlayerId":"player-0",
+                "input":{"type":"payManaCost", "presentation":{"title":"Pay"}, "cardId":"card-9", "cardName":"Convoke spell", "manaCost":"{1}{W}", "canConfirmFromPool":ready, "actions":[
+                    {"id":"convoke:card-1", "type":"useResource", "cardId":"card-1", "resource":"convoke"}]}
+            })).unwrap();
+            let output=serde_json::to_value(SimpleAi::default().decide(prompt).unwrap()).unwrap();
+            if ready { assert_eq!(output["output"]["type"],"pay"); assert_eq!(output["output"]["auto"],false); }
+            else { assert_eq!(output["output"]["type"],"act"); assert_eq!(output["output"]["actionId"],"convoke:card-1"); }
+        }
+    }
+}
+
+#[cfg(test)]
+mod floating_mana_regression {
+    use super::SimpleAi;
+    use crate::agent::BotAgent;
+    use manabrew_protocol::game::{CardDto,CardView,GameViewDto,PlayerDto,ZoneDto,ZoneKind};
+    use serde_json::json;
+    #[test]
+    fn floating_red_plus_wild_source_pays_for_blue_spell_but_red_alone_cannot() {
+        for (red, treasure, expected) in [(2,true,true),(2,false,false),(1,true,false),(0,true,false)] {
+            let mut bot=SimpleAi::default(); let mut view=GameViewDto::default();
+            let p:PlayerDto=serde_json::from_value(json!({"id":"player-0","name":"A","status":"playing","isHuman":false,"life":40,"counters":{},"manaPool":{"R":red},"commanderDamage":{},"hasCityBlessing":false,"hasEnduringStory":false,"ringLevel":0,"speed":0})).unwrap();
+            view.players.push(p);
+            if treasure { view.zones.push(ZoneDto {zone:ZoneKind::Battlefield, owner_id:"player-0".into(),count:1,cards:vec![CardView::Visible(CardDto {id:"card-2".into(),types:vec!["Artifact".into()],text:"{T}, Sacrifice this: Add one mana of any color.".into(),..Default::default()})]}); }
+            bot.observe(view);
+            let spell=CardDto {mana_cost:"{2}{U}".into(),cmc:3,..Default::default()};
+            assert_eq!(bot.affordable(&spell,"player-0"),expected,"red={red}, treasure={treasure}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod convoke_affordability_regression {
+    use super::SimpleAi;
+    use crate::agent::BotAgent;
+    use manabrew_protocol::game::{CardDto,CardView,GameViewDto,ZoneDto,ZoneKind};
+    #[test]
+    fn untapped_white_creatures_can_fund_a_convoke_spell_once_each() {
+        for (n,expected) in [(3,false),(4,true)] {
+            let mut bot=SimpleAi::default(); let mut view=GameViewDto::default();
+            view.zones.push(ZoneDto {zone:ZoneKind::Battlefield,owner_id:"player-0".into(),count:n,cards:(0..n).map(|i|CardView::Visible(CardDto {id:format!("card-{i}"),color:"W".into(),types:vec!["Creature".into()],summoning_sick:true,..Default::default()})).collect()});
+            bot.observe(view);
+            let spell=CardDto {mana_cost:"{2}{W}{W}".into(),cmc:4,keywords:vec!["Convoke".into()],..Default::default()};
+            assert_eq!(bot.affordable(&spell,"player-0"),expected);
+        }
+    }
+}
+
+#[cfg(test)]
+mod attack_copy_timing_regression {
+    use super::SimpleAi;
+    use crate::agent::BotAgent;
+    use manabrew_protocol::game::{CardDto,CardView,GameViewDto,ZoneDto,ZoneKind,StepKind};
+    use manabrew_protocol::transport::AgentPrompt;
+    use serde_json::json;
+    #[test]
+    fn reserve_resource_instant_until_attacking_but_use_it_during_combat() {
+        for (step,own_stack,expected) in [(StepKind::Main1,false,"pass"),(StepKind::Main1,true,"pass"),(StepKind::CombatDeclareAttackers,false,"act"),(StepKind::Main2,false,"act")] {
+            let mut bot=SimpleAi::default(); let mut view=GameViewDto::default(); view.active_player_id="player-0".into(); view.step=step;
+            if own_stack { view.stack.push(manabrew_protocol::game::StackObjectDto {controller_id:"player-0".into(),..Default::default()}); }
+            let source=CardDto {id:"card-1".into(), types:vec!["Creature".into()], text:"Whenever you cast a spell while this creature is attacking, copy that spell.".into(),..Default::default()};
+            let lands=(0..3).map(|i|CardView::Visible(CardDto {id:format!("card-{}",i+3),types:vec!["Land".into()],subtypes:vec!["Island".into()],..Default::default()}));
+            view.zones.push(ZoneDto {zone:ZoneKind::Battlefield,owner_id:"player-0".into(),count:4,cards:std::iter::once(CardView::Visible(source)).chain(lands).collect()});
+            let spell=CardDto {id:"card-2".into(),types:vec!["Instant".into()],mana_cost:"{2}{U}".into(),cmc:3,text:"Draw two cards.".into(),..Default::default()};
+            view.zones.push(ZoneDto {zone:ZoneKind::Hand,owner_id:"player-0".into(),count:1,cards:vec![CardView::Visible(spell)]}); bot.observe(view);
+            let prompt:AgentPrompt=serde_json::from_value(json!({"promptId":1,"decidingPlayerId":"player-0","input":{"type":"chooseAction","actions":[{"type":"cast","id":"cast:card-2:normal","cardId":"card-2","mode":{"type":"normal"},"label":"Cast normally"}]}})).unwrap();
+            let response=serde_json::to_value(bot.decide(prompt).unwrap()).unwrap(); assert_eq!(response["output"]["type"],expected,"{response}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod phasing_timing_regression {
+    use super::SimpleAi;
+    use crate::agent::BotAgent;
+    use manabrew_protocol::game::{CardDto,CardView,GameViewDto,ZoneDto,ZoneKind,StepKind,StackObjectDto};
+    use manabrew_protocol::transport::AgentPrompt;
+    use serde_json::json;
+    #[test]
+    fn mass_phasing_is_not_spent_on_an_unthreatened_own_main_phase() {
+        for (foreign,effect,expected) in [(false,"Destroy all creatures", "pass"),(true,"Draw a card", "pass"),(true,"Destroy all creatures", "act")] {
+            let mut bot=SimpleAi::default(); let mut view=GameViewDto::default(); view.active_player_id="player-0".into();view.step=StepKind::Main1;
+            view.stack.push(StackObjectDto {controller_id: if foreign {"player-1"} else {"player-0"}.into(),text:effect.into(),..Default::default()});
+            view.zones.push(ZoneDto {zone:ZoneKind::Battlefield,owner_id:"player-0".into(),count:4,cards:(0..4).map(|i|CardView::Visible(CardDto {id:format!("card-{}",i+3),types:vec!["Land".into()],subtypes:vec!["Plains".into()],..Default::default()})).collect()});
+            view.zones.push(ZoneDto {zone:ZoneKind::Hand,owner_id:"player-0".into(),count:1,cards:vec![CardView::Visible(CardDto {id:"card-2".into(),types:vec!["Instant".into()],mana_cost:"{2}{W}{W}".into(),cmc:4,text:"Any number of target nonland permanents you control phase out.".into(),..Default::default()})]});bot.observe(view);
+            let prompt:AgentPrompt=serde_json::from_value(json!({"promptId":1,"decidingPlayerId":"player-0","input":{"type":"chooseAction","actions":[{"type":"cast","id":"cast:card-2:normal","cardId":"card-2","mode":{"type":"normal"},"label":"Cast normally"}]}})).unwrap();
+            let output=serde_json::to_value(bot.decide(prompt).unwrap()).unwrap();assert_eq!(output["output"]["type"],expected,"{output}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod discounted_action_regression {
+    use super::SimpleAi;
+    use crate::agent::BotAgent;
+    use manabrew_protocol::game::{CardDto,CardView,GameViewDto,ZoneDto,ZoneKind,StepKind};
+    use manabrew_protocol::transport::AgentPrompt;
+    use serde_json::json;
+    #[test]
+    fn offered_discounted_creature_is_not_rejected_by_printed_mana_value() {
+        for (reducer,expected) in [(false,"pass"),(true,"act")] {
+            let mut bot=SimpleAi::default();let mut view=GameViewDto::default();view.active_player_id="player-0".into();view.step=StepKind::Main1;
+            let mut board:Vec<_>=(0..4).map(|i|CardView::Visible(CardDto {id:format!("card-{}",i+3),types:vec!["Land".into()],subtypes:vec!["Plains".into()],..Default::default()})).collect();
+            if reducer {board.push(CardView::Visible(CardDto {id:"card-9".into(),types:vec!["Creature".into()],text:"The first creature spell with flying you cast each turn costs {1} less to cast.".into(),..Default::default()}));}
+            view.zones.push(ZoneDto {zone:ZoneKind::Battlefield,owner_id:"player-0".into(),count:board.len(),cards:board});
+            view.zones.push(ZoneDto {zone:ZoneKind::Hand,owner_id:"player-0".into(),count:1,cards:vec![CardView::Visible(CardDto {id:"card-2".into(),types:vec!["Creature".into()],mana_cost:"{3}{W}{W}".into(),cmc:5,..Default::default()})]});bot.observe(view);
+            let prompt:AgentPrompt=serde_json::from_value(json!({"promptId":1,"decidingPlayerId":"player-0","input":{"type":"chooseAction","actions":[{"type":"cast","id":"cast:card-2:normal","cardId":"card-2","mode":{"type":"normal"},"label":"Cast normally"}]}})).unwrap();
+            let output=serde_json::to_value(bot.decide(prompt).unwrap()).unwrap();assert_eq!(output["output"]["type"],expected,"{output}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod hand_refill_regression {
+    use super::SimpleAi;
+    use crate::agent::BotAgent;
+    use manabrew_protocol::{game::{GameViewDto, ZoneDto, ZoneKind}, transport::AgentPrompt};
+    use serde_json::json;
+    fn decide(bot:&mut SimpleAi, source:&str, title:&str, label:&str)->bool {
+        let prompt:AgentPrompt=serde_json::from_value(json!({"promptId":1,"decidingPlayerId":"player-0",
+            "sourceCard":{"id":source},"input":{"type":"chooseBoolean","confirmLabel":label,"denyLabel":"Decline",
+            "presentation":{"title":title,"targets":[]}}})).unwrap();
+        serde_json::to_value(bot.decide(prompt).unwrap()).unwrap()["output"]["value"].as_bool().unwrap()
+    }
+    fn bot(hand:usize, library:usize)->SimpleAi {
+        let mut bot=SimpleAi::default();let mut view=GameViewDto::default();
+        for (zone,count) in [(ZoneKind::Hand,hand),(ZoneKind::Library,library)] {
+            view.zones.push(ZoneDto {zone,owner_id:"player-0".into(),cards:vec![],count});
+        }
+        bot.observe(view);bot
+    }
+    #[test]
+    fn refills_only_depleted_hands_and_confirms_only_immediate_matching_cost() {
+        let title="Whenever the Ring tempts you, you may discard your hand. If you do, draw four cards.";
+        for (hand,library,expected) in [(0,8,true),(1,8,true),(2,8,false),(5,8,false),(0,3,false)] {
+            let mut bot=bot(hand,library);
+            assert_eq!(decide(&mut bot,"card-7",title,"Accept"),expected);
+            assert_eq!(decide(&mut bot,"card-7","Pay Cost for Sauron, the Dark Lord?","Pay"),expected);
+        }
+        let mut other=bot(0,8);
+        assert!(decide(&mut other,"card-7",title,"Accept"));
+        assert!(!decide(&mut other,"card-8","Pay Cost for something else?","Pay"));
+        assert!(!decide(&mut other,"card-7","Pay Cost for Sauron, the Dark Lord?","Pay"));
+        let mut interrupted=bot(0,8);
+        assert!(decide(&mut interrupted,"card-7",title,"Accept"));
+        assert!(!decide(&mut interrupted,"card-7","Unrelated choice?","Accept"));
+        assert!(!decide(&mut interrupted,"card-7","Pay Cost for Sauron, the Dark Lord?","Pay"));
+        let mut unrelated=bot(0,8);
+        assert!(!decide(&mut unrelated,"card-7","Pay Cost for Sauron, the Dark Lord?","Pay"));
+    }
+}
+
+#[cfg(test)]
+mod voluntary_answer_scope_regression {
+    use super::SimpleAi;
+    use crate::agent::BotAgent;
+    use manabrew_protocol::game::{GameViewDto, StackObjectDto};
+    use manabrew_protocol::transport::AgentPrompt;
+    use serde_json::json;
+
+    #[test]
+    fn voluntary_redirection_can_target_a_friendly_spell() {
+        let mut bot=SimpleAi::default(); let mut view=GameViewDto::default();
+        view.stack.push(StackObjectDto { id:"stack-1".into(),controller_id:"player-0".into(),..Default::default() });
+        bot.observe(view); bot.pending_voluntary_cast=Some("card-2".into());
+        let prompt:AgentPrompt=serde_json::from_value(json!({"promptId":1,"decidingPlayerId":"player-0",
+            "sourceCard":{"id":"card-2","identity":{"name":"Bolt Bend"}},
+            "sourceAbilityText":"Change the target of target spell or ability with a single target.",
+            "input":{"type":"chooseBoardTargets","presentation":{"title":"Counter","targets":[]},
+                "candidates":[{"kind":"spell","id":"stack-1"}],"hostile":true,"intent":"counter",
+                "minTargets":1,"maxTargets":1,"chosenTargets":0,"cancellable":true}})).unwrap();
+        let output=serde_json::to_value(bot.decide(prompt).unwrap()).unwrap();
+        assert_eq!(output["output"]["type"],"boardTargets","{output}");
+    }
+
+    #[test]
+    fn a_pending_redirect_is_not_a_sufficient_counter() {
+        use manabrew_protocol::game::CardDto;
+        use manabrew_protocol::prompts::common::TargetRef;
+        let target:TargetRef=serde_json::from_value(json!({"id":"stack-1","kind":"spell","intent":"counter"})).unwrap();
+        let mut view=GameViewDto::default();
+        view.stack.push(StackObjectDto { id:"stack-1".into(),controller_id:"player-1".into(),source_card:Some(CardDto::default()),..Default::default() });
+        view.stack.push(StackObjectDto { id:"stack-2".into(),controller_id:"player-0".into(),source_ability_text:Some("Change the target of target spell or ability with a single target.".into()),targets:vec![target.clone()],..Default::default() });
+        let mut bot=SimpleAi::default();bot.observe(view);
+        assert!(!bot.covered_by_friendly_answer(&target,"player-0"));
+    }
+
+    #[test]
+    fn mandatory_and_copied_target_prompts_keep_their_only_legal_target() {
+        // A copied/triggered effect is not an ordinary hand-cast action.
+        // Cancellable is deliberately true in one case to guard that distinction.
+        for cancellable in [false, true] {
+            let mut bot=SimpleAi::default(); let mut view=GameViewDto::default();
+            view.stack.push(StackObjectDto { id:"stack-1".into(),controller_id:"player-0".into(),..Default::default() });
+            bot.observe(view);
+            let prompt:AgentPrompt=serde_json::from_value(json!({"promptId":1,"decidingPlayerId":"player-0",
+                "sourceCard":{"id":"card-2","identity":{"name":"Counterspell"}},
+                "input":{"type":"chooseBoardTargets","presentation":{"title":"Counter","targets":[]},
+                    "candidates":[{"kind":"spell","id":"stack-1"}],"hostile":true,"intent":"counter",
+                    "minTargets":1,"maxTargets":1,"chosenTargets":0,"cancellable":cancellable}})).unwrap();
+            let output=serde_json::to_value(bot.decide(prompt).unwrap()).unwrap();
+            assert_eq!(output["output"]["type"],"boardTargets","{output}");
+            assert_eq!(output["output"]["chosen"][0]["id"],"stack-1","{output}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod pending_damage_scope_regression {
+    use super::SimpleAi;
+    use crate::agent::BotAgent;
+    use manabrew_protocol::game::{GameViewDto,StackObjectDto,PlayerDto};
+    use manabrew_protocol::prompts::common::TargetRef;
+    use manabrew_protocol::transport::AgentPrompt;
+    use serde_json::json;
+
+    fn player_target(id:&str)->TargetRef {
+        serde_json::from_value(json!({"id":id,"kind":"player","intent":"damage"})).unwrap()
+    }
+    #[test]
+    fn reservations_follow_current_stack_targets_and_threats() {
+        let mut view=GameViewDto::default();
+        view.stack.push(StackObjectDto{id:"stack-1".into(),controller_id:"player-0".into(),known_damage:Some(6),targets:vec![player_target("player-1")],..Default::default()});
+        let mut bot=SimpleAi::default();bot.observe(view.clone());assert_eq!(bot.pending_damage("player-0","player-1"),6);
+        view.stack[0].targets=vec![player_target("player-2")];bot.observe(view.clone());
+        assert_eq!(bot.pending_damage("player-0","player-1"),0);assert_eq!(bot.pending_damage("player-0","player-2"),6);
+        let threat:TargetRef=serde_json::from_value(json!({"id":"stack-1","kind":"spell","intent":"counter"})).unwrap();
+        view.stack.push(StackObjectDto{id:"stack-2".into(),controller_id:"player-1".into(),targets:vec![threat],..Default::default()});bot.observe(view.clone());assert_eq!(bot.pending_damage("player-0","player-2"),0);
+        view.stack.pop();view.stack[0].known_damage=None;bot.observe(view.clone());assert_eq!(bot.pending_damage("player-0","player-2"),0);
+        view.stack.clear();bot.observe(view);assert_eq!(bot.pending_damage("player-0","player-2"),0);
+    }
+    #[test]
+    fn selected_damage_target_is_always_in_the_provided_legal_set() {
+        let mut view=GameViewDto::default();
+        for i in 0..4 {let p:PlayerDto=serde_json::from_value(json!({"id":format!("player-{i}"),"name":"player","status":"playing","isHuman":false,"life":40,"counters":{},"manaPool":{},"commanderDamage":{},"hasCityBlessing":false,"hasEnduringStory":false,"ringLevel":0,"speed":0})).unwrap();view.players.push(p);}
+        view.stack.push(StackObjectDto{id:"stack-1".into(),controller_id:"player-0".into(),known_damage:Some(40),targets:vec![player_target("player-2")],..Default::default()});
+        let mut bot=SimpleAi::default();bot.observe(view);
+        // The omitted opponent may be protected or otherwise ineligible. The
+        // engine supplies the authoritative legal candidates, not the bot.
+        let prompt:AgentPrompt=serde_json::from_value(json!({"promptId":1,"decidingPlayerId":"player-0","input":{"type":"chooseBoardTargets","presentation":{"title":"Damage","targets":[]},"candidates":[{"id":"player-2","kind":"player"},{"id":"player-3","kind":"player"}],"hostile":true,"intent":"damage","minTargets":1,"maxTargets":1,"chosenTargets":0,"cancellable":false}})).unwrap();
+        let output=serde_json::to_value(bot.decide(prompt).unwrap()).unwrap();assert_eq!(output["output"]["chosen"][0]["id"],"player-3","{output}");
+    }
+}
+
+#[cfg(test)]
+mod repair_damage_policy_tests {
+    use super::SimpleAi;
+    use crate::agent::BotAgent;
+    use manabrew_protocol::game::{CardDto, CardView, GameViewDto, PlayerDto, StackObjectDto, ZoneDto, ZoneKind};
+    use manabrew_protocol::prompts::common::TargetRef;
+    use manabrew_protocol::transport::AgentPrompt;
+    use serde_json::json;
+
+    fn target(id:&str, kind:&str)->TargetRef {serde_json::from_value(json!({"id":id,"kind":kind,"intent":"damage"})).unwrap()}
+    fn board()->GameViewDto {
+        let mut view=GameViewDto::default();
+        for i in 0..2 {let p:PlayerDto=serde_json::from_value(json!({"id":format!("player-{i}"),"name":"player","status":"playing","isHuman":false,"life":40,"counters":{},"manaPool":{},"commanderDamage":{},"hasCityBlessing":false,"hasEnduringStory":false,"ringLevel":0,"speed":0})).unwrap();view.players.push(p);}
+        let card=CardDto{id:"card-1".into(),controller_id:"player-1".into(),types:vec!["Creature".into()],power:Some("8".into()),toughness:Some("6".into()),..Default::default()};
+        view.zones.push(ZoneDto{zone:ZoneKind::Battlefield,owner_id:"player-1".into(),cards:vec![CardView::Visible(card)],count:1});view
+    }
+    fn choose(bot:&mut SimpleAi)->String {
+        let p:AgentPrompt=serde_json::from_value(json!({"promptId":1,"decidingPlayerId":"player-0","knownDamage":6,"input":{"type":"chooseBoardTargets","presentation":{"title":"Damage","targets":[]},"candidates":[{"id":"player-0","kind":"player"},{"id":"player-1","kind":"player"},{"id":"card-1","kind":"card"}],"hostile":true,"intent":"damage","minTargets":1,"maxTargets":1,"chosenTargets":0,"cancellable":false}})).unwrap();
+        serde_json::to_value(bot.decide(p).unwrap()).unwrap()["output"]["chosen"][0]["id"].as_str().unwrap().to_string()
+    }
+    #[test]
+    fn useful_removal_is_available_but_covered_creature_is_not_repeated() {
+        let mut view=board();let mut bot=SimpleAi::default();bot.observe(view.clone());assert_eq!(choose(&mut bot),"card-1");
+        view.stack.push(StackObjectDto{id:"stack-1".into(),controller_id:"player-0".into(),known_damage:Some(6),targets:vec![target("card-1","card")],..Default::default()});
+        bot.observe(view);assert_eq!(choose(&mut bot),"player-1");
+    }
+    #[test]
+    fn redirect_makes_damage_unknown_and_covered_enemy_still_beats_self() {
+        let mut view=board();view.stack.push(StackObjectDto{id:"stack-1".into(),controller_id:"player-0".into(),known_damage:Some(40),targets:vec![target("player-1","player")],..Default::default()});
+        let mut bot=SimpleAi::default();bot.observe(view.clone());assert_ne!(choose(&mut bot),"player-0");
+        let redirected:TargetRef=serde_json::from_value(json!({"id":"stack-1","kind":"spell","intent":"hostile"})).unwrap();
+        view.stack.push(StackObjectDto{id:"stack-2".into(),controller_id:"player-1".into(),targets:vec![redirected],..Default::default()});bot.observe(view);assert_eq!(bot.pending_damage("player-0","player-1"),0);
     }
 }

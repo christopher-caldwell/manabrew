@@ -45,6 +45,18 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
         })
     }
     .unwrap_or(sa.activating_player);
+    // Copy each kind of counter from the event's immutable departure snapshot.
+    // Reading the live card here would lose counters or use a later object epoch.
+    if sa.ir.each_from_source_text.as_deref() == Some("TriggeredCardLKICopy") {
+        let Some(crate::event::AbilityValue::CounterMap(counter_map)) = sa.trigger_objects.get(&crate::ability::AbilityKey::TriggeredCardCounters) else { return; };
+        let Some(card) = resolve_card_target(ctx.game, sa) else { return; };
+        let mut table = GameEntityCounterTable::default();
+        for (kind, amount) in counter_map {
+            table.put(Some(placer), GameEntity::Card(card), parse_counter_type(kind), *amount);
+        }
+        table.replace_counter_effect(ctx.game, Some(ctx.trigger_handler), Some(ctx.agents), Some(sa), true, RunParams::default());
+        return;
+    }
     if sa.ir.triggered_counter_map {
         let Some(crate::event::AbilityValue::CounterMap(counter_map)) = sa
             .trigger_objects

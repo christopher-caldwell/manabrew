@@ -860,10 +860,10 @@ fn matches_context_predicate(
         ContextPredicate::ControlledBy(reference) => {
             matches_controlled_by_reference(reference, card, context)
         }
+        ContextPredicate::NotDefinedTargeted => !context.targeted_cards.is_empty() && !context.targeted_cards.contains(&card.id),
         ContextPredicate::ActivePlayerCtrl
         | ContextPredicate::DefenderCtrl
-        | ContextPredicate::EnchantedController
-        | ContextPredicate::NotDefinedTargeted => false,
+        | ContextPredicate::EnchantedController => false,
     }
 }
 

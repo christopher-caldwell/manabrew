@@ -80,6 +80,7 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
                 dealt,
                 false,
             );
+            super::life_lose_effect::fire_life_lost_all(ctx, target_player, dealt, Some(card_id));
 
             ctx.trigger_handler.run_trigger(
                 crate::trigger::TriggerType::DamageDone,

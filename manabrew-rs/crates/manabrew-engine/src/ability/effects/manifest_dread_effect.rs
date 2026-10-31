@@ -66,14 +66,14 @@ fn manifest_dread_once(ctx: &mut EffectContext, _sa: &SpellAbility, player: Play
     ctx.move_card(chosen, ZoneType::Battlefield, player);
     ctx.trigger_handler
         .register_active_trigger(ctx.game, chosen);
-    emit_zone_trigger(ctx.trigger_handler, chosen, old_zone, ZoneType::Battlefield);
+    emit_zone_trigger(ctx.trigger_handler, ctx.game, chosen, old_zone, ZoneType::Battlefield);
 
     // Put the rest into graveyard
     for &card_id in &top2 {
         if card_id != chosen {
             let gz = ctx.game.card(card_id).zone;
             ctx.move_card(card_id, ZoneType::Graveyard, player);
-            emit_zone_trigger(ctx.trigger_handler, card_id, gz, ZoneType::Graveyard);
+            emit_zone_trigger(ctx.trigger_handler, ctx.game, card_id, gz, ZoneType::Graveyard);
         }
     }
 }

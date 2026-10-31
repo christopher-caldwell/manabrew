@@ -276,6 +276,12 @@ fn resolve_card_list_property(
 ) -> Option<i32> {
     let cards = resolve_defined_cards_for_svar(defined, game, source_id, sa);
     if cards.is_empty() {
+        // A recognized remembered-LKI mana-value expression over an empty
+        // collection is zero, not an unsupported expression.
+        if defined.eq_ignore_ascii_case("RememberedLKI") && property.starts_with("CardManaCost") {
+            let operators = property.split_once('/').map_or("", |(_, ops)| ops);
+            return Some(do_x_math(0, operators, game, source_id, controller, sa));
+        }
         return None;
     }
     if let Some(rest) = property.strip_prefix("Valid ") {
@@ -726,6 +732,11 @@ fn player_x_property(
         }
         "PoisonCounters" => game.player(player).poison_counters,
         "EnergyCounters" => game.player(player).energy_counters,
+        _ if value.starts_with("YourCounters") => crate::player::counter_count(
+            game,
+            player,
+            value.strip_prefix("YourCounters").unwrap_or(""),
+        ),
         "ManaExpendedThisTurn" => game.player(player).mana_expended_this_turn,
         "RingTemptedYou" => game.player(player).ring_level,
         "OpponentsAttackedThisTurn" => {
@@ -757,6 +768,7 @@ fn player_x_property(
                 game.player(player).poison_counters
                     + game.player(player).energy_counters
                     + game.player(player).radiation_counters
+                    + game.player(player).other_counters.values().sum::<i32>()
             } else if counter_name.eq_ignore_ascii_case("POISON") {
                 game.player(player).poison_counters
             } else if counter_name.eq_ignore_ascii_case("ENERGY") {
@@ -764,7 +776,7 @@ fn player_x_property(
             } else if counter_name.eq_ignore_ascii_case("RADIATION") {
                 game.player(player).radiation_counters
             } else {
-                0
+                crate::player::counter_count(game, player, counter_name)
             }
         }
         _ if value.starts_with("HasProperty") => i32::from(crate::player::player_has_property(
@@ -1318,6 +1330,11 @@ fn resolve_paid_hash_property(
 /// Supports `Count$Kicked.A.B` (returns A if kicked, B otherwise)
 /// and `Count$KickedCount` (returns the multikicker count).
 pub fn evaluate_svar(expr: &str, sa: &SpellAbility) -> i32 {
+    if let Some(rest) = expr.strip_prefix("Count$TimesKicked") {
+        let operators = rest.strip_prefix('/').unwrap_or(rest);
+        let count = sa.kick_count.max(u32::from(sa.kicked));
+        return apply_simple_operator_chain(count as i32, operators);
+    }
     // X mana cost — return the value of X paid when casting
     if let Some(rest) = expr
         .strip_prefix("Count$xPaid")
@@ -1444,6 +1461,9 @@ fn evaluate_cost_amount_count_expr(
             .and_then(|s| s.parse::<i32>().ok())
             .unwrap_or(0);
     }
+    if let Some(counter_name) = expr.strip_prefix("Count$YourCounters") {
+        return crate::player::counter_count(game, source.controller, counter_name);
+    }
     if let Some(counter_name) = expr.strip_prefix("Count$CardCounters.") {
         let counter_type = crate::ability::ability_utils::parse_counter_type(counter_name);
         return source.counter_count(&counter_type);
@@ -1453,6 +1473,9 @@ fn evaluate_cost_amount_count_expr(
             return game.player(source.controller).spells_cast_this_turn;
         }
         return game.player(caster).spells_cast_this_turn;
+    }
+    if expr == "Count$TotalCommanderCastFromCommandZone" {
+        return game.player_total_commander_casts(source.controller) as i32;
     }
     if expr == "Count$YourLifeTotal" {
         return game.player(source.controller).life;
@@ -1495,6 +1518,126 @@ pub fn resolve_count_svar_for_sa(
 ) -> i32 {
     use forge_foundation::ZoneType;
 
+    let remembered_expr = expr.strip_prefix("Count$").unwrap_or(expr);
+    if remembered_expr.starts_with("RememberedLKI$CardManaCost") {
+        if let Some(value) = resolve_card_list_expr(remembered_expr, game, source_id, controller, sa) {
+            return value;
+        }
+    }
+    let (body, operators) = expr.split_once('/').unwrap_or((expr, ""));
+    let count = match body {
+        "Count$ResolvedThisTurn" => Some(
+            sa.source
+                .map(|id| game.card(id).get_ability_resolved_this_turn(Some(sa)))
+                .unwrap_or(0) as i32,
+        ),
+        "Count$YourStartingLife" => Some(game.player(controller).starting_life),
+        "Count$CardNumAttacksThisTurn" => {
+            Some(game.card(source_id).damage_history.attacked_this_turn.len() as i32)
+        }
+        _ => None,
+    };
+    if let Some(count) = count {
+        return do_x_math(count, operators, game, source_id, controller, sa);
+    }
+
+    // MostCardName counts the largest same-name group among matching, present
+    // battlefield permanents. Evaluate the selector against current control.
+    if let Some(valid) = body.strip_prefix("Count$MostCardName ") {
+        let selector = crate::parsing::cached_compiled_selector(valid);
+        let source = game.card(source_id);
+        let mut counts = std::collections::HashMap::new();
+        for card in &game.cards {
+            if card.zone == ZoneType::Battlefield && !card.phased_out
+                && crate::card::valid_filter::matches_valid_card_selector_in_game(
+                    &selector, card, source, game,
+                )
+            {
+                *counts.entry(card.card_name.as_str()).or_insert(0) += 1;
+            }
+        }
+        let count = counts.values().copied().max().unwrap_or(0);
+        return do_x_math(count, operators, game, source_id, controller, sa);
+    }
+
+    if let Some(rest) = expr.strip_prefix("Count$ThisTurnCast_") {
+        let (valid, operators) = rest.split_once('/').unwrap_or((rest, ""));
+        let selector = crate::parsing::cached_compiled_selector(valid);
+        let source = game.card(source_id);
+        let count = game.players.iter().flat_map(|p| p.cast_lki_this_turn.iter())
+            .filter(|card| crate::card::valid_filter::matches_valid_card_selector_in_game(&selector, card, source, game))
+            .count() as i32;
+        return do_x_math(count, operators, game, source_id, controller, sa);
+    }
+
+    for (prefix, this_turn) in [
+        ("Count$ThisTurnEntered_", true),
+        ("Count$LastTurnEntered_", false),
+    ] {
+        let Some(rest) = expr.strip_prefix(prefix) else {
+            continue;
+        };
+        let (body, operators) = rest.split_once('/').unwrap_or((rest, ""));
+        let parts: Vec<&str> = body.splitn(4, '_').collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let Some(destination) = crate::ability::ability_utils::parse_zone_type(parts[0]) else {
+            continue;
+        };
+        let has_from = parts[1] == "from";
+        let origin = if has_from {
+            let Some(zone) = parts
+                .get(2)
+                .and_then(|z| crate::ability::ability_utils::parse_zone_type(z))
+            else {
+                continue;
+            };
+            Some(zone)
+        } else {
+            None
+        };
+        let valid = if has_from {
+            parts.get(3).copied().unwrap_or("")
+        } else {
+            parts[1]
+        };
+        if valid.is_empty() {
+            continue;
+        }
+        let cards = if this_turn {
+            crate::card::card_util::get_this_turn_entered(
+                game,
+                destination,
+                origin,
+                valid,
+                source_id,
+                controller,
+            )
+        } else {
+            crate::card::card_util::get_last_turn_entered(
+                game,
+                destination,
+                origin,
+                valid,
+                source_id,
+                controller,
+            )
+        };
+        return do_x_math(
+            cards.len() as i32,
+            operators,
+            game,
+            source_id,
+            controller,
+            sa,
+        );
+    }
+    if let Some(rest) = expr.strip_prefix("Sacrificed$") {
+        let (property, operators) = rest.split_once('/').unwrap_or((rest, ""));
+        let amount = sacrificed_card_property_value(game, sa, property);
+        return do_x_math(amount, operators, game, source_id, controller, sa);
+    }
     if let Some(rest) = expr
         .strip_prefix("Count$xPaid")
         .or_else(|| expr.strip_prefix("Count$XPaid"))
@@ -1658,6 +1801,43 @@ pub fn resolve_count_svar_for_sa(
                 unpaid_val
             };
         }
+    }
+
+    // Count actual paid kicker magnitude, including the host cast for ETB/static contexts.
+    if let Some(rest) = expr.strip_prefix("Count$TimesKicked") {
+        let operators = rest.strip_prefix('/').unwrap_or(rest);
+        let cast = if sa.source == Some(source_id) && (sa.is_spell || sa.is_copy) {
+            Some(sa)
+        } else {
+            game.card(source_id).cast_sa.as_deref()
+        };
+        let count = cast.map(|cast| cast.kick_count.max(u32::from(cast.kicked))).unwrap_or(0);
+        return do_x_math(count as i32, operators, game, source_id, controller, sa);
+    }
+
+    // Each creature can fill only one of Cleric/Rogue/Warrior/Wizard.
+    // Bitmask matching handles overlapping types without double counting a body.
+    if let Some(rest) = expr.strip_prefix("Count$Party") {
+        let operators = rest.strip_prefix('/').unwrap_or(rest);
+        let roles = ["Cleric", "Rogue", "Warrior", "Wizard"];
+        let mut reachable = [false; 16];
+        reachable[0] = true;
+        for &id in game.cards_in_zone(ZoneType::Battlefield, controller) {
+            let card = game.card(id);
+            if !card.is_creature() || card.phased_out { continue; }
+            let previous = reachable;
+            for used in 0..16 {
+                if !previous[used] { continue; }
+                for (bit, role) in roles.iter().enumerate() {
+                    if used & (1 << bit) == 0 && card.has_subtype(role) {
+                        reachable[used | (1 << bit)] = true;
+                    }
+                }
+            }
+        }
+        let count = (0usize..16).filter(|&mask| reachable[mask])
+            .map(|mask| mask.count_ones()).max().unwrap_or(0) as i32;
+        return do_x_math(count, operators, game, source_id, controller, sa);
     }
 
     if expr == "Count$KickedCount" {
@@ -1858,7 +2038,10 @@ pub fn resolve_count_svar_for_sa(
 
     // Count$Devotion.COLOR — count mana symbols of a color among permanents you control.
     if let Some(color_str) = expr.strip_prefix("Count$Devotion.") {
-        let color_mask: u16 = match color_str.to_uppercase().as_str() {
+        let selected = if color_str.eq_ignore_ascii_case("Chosen") {
+            game.card(source_id).chosen_colors.first().map(String::as_str).unwrap_or("")
+        } else { color_str };
+        let color_mask: u16 = match selected.to_uppercase().as_str() {
             "W" | "WHITE" => forge_foundation::ManaAtom::WHITE,
             "U" | "BLUE" => forge_foundation::ManaAtom::BLUE,
             "B" | "BLACK" => forge_foundation::ManaAtom::BLACK,
@@ -1871,6 +2054,7 @@ pub fn resolve_count_svar_for_sa(
             let mut count = 0i32;
             for &cid in battlefield {
                 let card = game.card(cid);
+                if card.phased_out { continue; }
                 for shard in card.mana_cost.shards() {
                     if (shard.shard() & color_mask) != 0 {
                         count += 1;
@@ -1947,6 +2131,18 @@ pub fn resolve_count_svar_for_sa(
             sa,
         );
     }
+    if let Some(rest) = expr.strip_prefix("Count$YourCounters") {
+        let (counter, operators) = rest.split_once('/').unwrap_or((rest, ""));
+        return do_x_math(
+            crate::player::counter_count(game, controller, counter),
+            operators,
+            game,
+            source_id,
+            controller,
+            sa,
+        );
+    }
+
     // Count$CardCounters.TYPE
     if let Some(counter_type) = expr.strip_prefix("Count$CardCounters.") {
         let ct = crate::ability::effects::parse_counter_type(counter_type);

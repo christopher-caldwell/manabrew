@@ -165,7 +165,7 @@ pub fn compute_cost_adjustment(
     caster: PlayerId,
     cast_zone: ZoneType,
 ) -> CostAdjustment {
-    compute_cost_adjustment_inner(game, spell_card, caster, cast_zone, &[], true)
+    compute_cost_adjustment_inner(game, spell_card, caster, cast_zone, &[], true, None)
 }
 
 /// Like `compute_cost_adjustment`, but also checks ValidTarget$ against chosen targets.
@@ -176,7 +176,7 @@ pub fn compute_cost_adjustment_with_targets(
     cast_zone: ZoneType,
     targets: &[CardId],
 ) -> CostAdjustment {
-    compute_cost_adjustment_inner(game, spell_card, caster, cast_zone, targets, true)
+    compute_cost_adjustment_inner(game, spell_card, caster, cast_zone, targets, true, None)
 }
 
 /// Payment-time variant. Includes the spell card itself so self-reducing
@@ -192,7 +192,40 @@ pub fn compute_cost_adjustment_for_payment(
     cast_zone: ZoneType,
     targets: &[CardId],
 ) -> CostAdjustment {
-    compute_cost_adjustment_inner(game, spell_card, caster, cast_zone, targets, true)
+    compute_cost_adjustment_inner(game, spell_card, caster, cast_zone, targets, true, None)
+}
+
+pub fn compute_cost_adjustment_for_alt(game: &GameState, card: &Card, caster: PlayerId, zone: ZoneType, targets: &[CardId], alternative: Option<crate::spellability::AlternativeCost>) -> CostAdjustment {
+    compute_cost_adjustment_inner(game, card, caster, zone, targets, true, alternative)
+}
+
+/// Resolve a stack-granted blitz cost for a prospective creature spell. The
+/// source must actually grant the keyword to this spell; never grant by name.
+pub fn granted_stack_blitz_cost(game: &GameState, card: &Card, caster: PlayerId) -> Option<ManaCost> {
+    let mut prospective = card.clone();
+    prospective.zone = ZoneType::Stack;
+    prospective.cast_from = Some(card.zone);
+    prospective.controller = caster;
+    for source in game.cards.iter().filter(|c| c.zone == ZoneType::Battlefield && !c.phased_out) {
+        for st in &source.static_abilities {
+            if !st.check_mode(&StaticMode::Continuous) || !st.check_conditions(source, game)
+                || !st.ir.affected_zones.contains(&ZoneType::Stack)
+                || !crate::card::valid_filter::matches_valid_card_selector_opt_in_game(st.ir.affected.as_ref(), &prospective, source, game) { continue; }
+            for keyword in st.ir.add_keyword_text.as_deref().unwrap_or_default().split('&').map(str::trim) {
+                let Some(spec) = keyword.strip_prefix("Blitz:") else { continue; };
+                let mut parts=spec.split(':');
+                let cost=parts.next().unwrap_or_default();
+                let filter=parts.next().unwrap_or_default();
+                // Spell filters need their own ability context, not a card
+                // selector. Handle the supported creature/cmc predicate only.
+                let Some(min)=filter.strip_prefix("Spell.Creature+cmcGE").and_then(|x|x.parse::<i32>().ok()) else { continue; };
+                if card.is_creature() && card.mana_cost.cmc() >= min {
+                    return Some(if cost=="CardManaCost" {card.mana_cost.clone()} else {ManaCost::parse(cost)});
+                }
+            }
+        }
+    }
+    None
 }
 
 fn compute_cost_adjustment_inner(
@@ -202,6 +235,7 @@ fn compute_cost_adjustment_inner(
     _cast_zone: ZoneType,
     targets: &[CardId],
     include_spell_self: bool,
+    alternative: Option<crate::spellability::AlternativeCost>,
 ) -> CostAdjustment {
     let mut adj = CostAdjustment::default();
 
@@ -306,7 +340,7 @@ fn compute_cost_adjustment_inner(
 
             // ── checkRequirement: ValidSpell$ ────────────────────────
             if let Some(valid_spell) = st_ab.ir.valid_spell.as_deref() {
-                if !check_valid_spell(valid_spell, spell_card) {
+                if !check_valid_spell(valid_spell, spell_card, alternative) {
                     continue;
                 }
             }
@@ -491,7 +525,7 @@ pub fn compute_raise_cost_parts_with_targets(
             }
 
             if let Some(valid_spell) = st_ab.ir.valid_spell.as_deref() {
-                if !check_valid_spell(valid_spell, spell_card) {
+                if !check_valid_spell(valid_spell, spell_card, None) {
                     continue;
                 }
             }
@@ -632,7 +666,7 @@ fn substitute_part_amount(part: &CostPart, amount: i32) -> CostPart {
 
 /// Check a ValidSpell$ parameter.
 /// Mirrors the `ValidSpell` check in Java's `CostAdjustment.checkRequirement`.
-fn check_valid_spell(valid_spell: &str, spell_card: &Card) -> bool {
+fn check_valid_spell(valid_spell: &str, spell_card: &Card, alternative: Option<crate::spellability::AlternativeCost>) -> bool {
     // Split comma-separated options — any match passes
     valid_spell.split(',').any(|option| {
         let parts: Vec<&str> = option.trim().split('.').collect();
@@ -645,6 +679,7 @@ fn check_valid_spell(valid_spell: &str, spell_card: &Card) -> bool {
                     .skip(1)
                     .all(|attr| match attr.to_lowercase().as_str() {
                         "bargain" => spell_card.has_keyword("Bargain"),
+                        "blitz" => alternative == Some(crate::spellability::AlternativeCost::Blitz),
                         _ => true, // unknown attributes pass
                     })
             }
@@ -785,12 +820,13 @@ pub fn adjust(
     let cast_zone = game.card(card_id).zone;
     let target_cards = sa.get_targets().all_target_cards();
 
-    let adjusted = compute_cost_adjustment_for_payment(
+    let adjusted = compute_cost_adjustment_for_alt(
         game,
         game.card(card_id),
         payer,
         cast_zone,
         &target_cards,
+        sa.alt_cost,
     )
     .apply(&cost.to_mana_cost());
     *cost = ManaCostBeingPaid::from_mana_cost(&adjusted);

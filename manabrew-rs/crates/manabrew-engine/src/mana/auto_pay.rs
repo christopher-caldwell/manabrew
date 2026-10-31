@@ -14,6 +14,7 @@ pub struct AutoPayResult {
     pub life_paid: i32,
     pub colors_spent: u16,
     pub paying_mana: Vec<u16>,
+    pub paying_mana_sources: Vec<Option<CardId>>,
     /// True when auto-tap produced taps but the resulting pool couldn't
     /// satisfy the full cost — i.e. the cast must cancel. Java's
     /// `AutoPay.payManaCostWithTrace` records the partial taps before
@@ -106,14 +107,17 @@ pub fn pay_mana_cost_auto_with_chooser(
         })
         .collect();
 
-    let payment = pool.try_pay_for_spell_converted_with_phyrexian_life_result(
+    let mut payment = pool.try_pay_for_spell_converted_with_phyrexian_life_result(
         mana_cost,
         payment_ctx,
         any_color_conversion,
         game.player(player).life,
     )?;
-    if commander_tax > 0 && !pool.try_pay_extra_generic(commander_tax) {
-        return None;
+    if commander_tax > 0 {
+        if !pool.try_pay_extra_generic(commander_tax) { return None; }
+        payment.colors_spent |= pool.last_payment_atoms().iter().fold(0, |a, b| a | b);
+        payment.paying_mana.extend_from_slice(pool.last_payment_atoms());
+        payment.paying_mana_sources.extend_from_slice(pool.last_payment_sources());
     }
     Some(AutoPayResult {
         tapped,
@@ -121,6 +125,7 @@ pub fn pay_mana_cost_auto_with_chooser(
         life_paid: payment.life_paid,
         colors_spent: payment.colors_spent,
         paying_mana: payment.paying_mana,
+        paying_mana_sources: payment.paying_mana_sources,
         cancelled: false,
     })
 }
@@ -205,6 +210,8 @@ pub fn pay_mana_cost_auto_with_callback_and_reserved_sacrifices(
             .payment
             .paying_mana
             .extend(tapped_tax.payment.paying_mana);
+        trace.payment.paying_mana_sources.extend(tapped_tax.payment.paying_mana_sources);
+        trace.payment.paying_mana_details.extend(tapped_tax.payment.paying_mana_details);
         trace.paid = trace.paid && tapped_tax.paid;
     }
     let choices = trace.choices;
@@ -212,6 +219,10 @@ pub fn pay_mana_cost_auto_with_callback_and_reserved_sacrifices(
     let life_paid = trace.payment.life_paid;
 
     if !trace.paid {
+        // Incremental payment consumed actual mana objects. Return the same
+        // objects on cancellation, retaining restrictions and source metadata.
+        for mana in trace.payment.paying_mana_details.drain(..) { pool.add_mana(mana); }
+        pool.take_last_payment_triggers_consumed();
         // Java parity: keep the partial taps in the returned trace so the
         // agent emits `[TapLand …, Cancel]` and consumes the same RNG.
         return Some(AutoPayResult {
@@ -220,6 +231,7 @@ pub fn pay_mana_cost_auto_with_callback_and_reserved_sacrifices(
             life_paid: 0,
             colors_spent: 0,
             paying_mana: Vec::new(),
+            paying_mana_sources: Vec::new(),
             cancelled: true,
         });
     }
@@ -229,6 +241,7 @@ pub fn pay_mana_cost_auto_with_callback_and_reserved_sacrifices(
         life_paid,
         colors_spent: trace.payment.colors_spent,
         paying_mana: trace.payment.paying_mana,
+        paying_mana_sources: trace.payment.paying_mana_sources,
         cancelled: false,
     })
 }

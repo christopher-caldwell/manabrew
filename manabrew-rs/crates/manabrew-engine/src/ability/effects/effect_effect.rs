@@ -190,7 +190,7 @@ fn resolve_impl(ctx: &mut EffectContext, sa: &SpellAbility) {
             effect.set_s_var_if_absent(k, v);
         }
 
-        apply_duration_flags(&mut effect, duration, source_id);
+        apply_duration_flags(&mut effect, duration, source_id, sa.activating_player);
         apply_forget_on_moved_flags(&mut effect, sa);
         effect.add_remembered_cards(remember_cards.iter().copied());
         effect.add_remembered_players(remember_players.iter().copied());
@@ -435,7 +435,11 @@ pub enum EffectDuration {
     UntilHostLeavesPlayOrEOT,
 }
 
-fn apply_duration_flags(effect: &mut Card, duration: Option<&AbilityDuration>, source_id: CardId) {
+fn apply_duration_flags(effect: &mut Card, duration: Option<&AbilityDuration>, source_id: CardId, duration_controller: PlayerId) {
+    if matches!(duration, Some(AbilityDuration::UntilYourNextTurn)) {
+        effect.temp_effect_until_next_turn_of = Some(duration_controller);
+        return;
+    }
     let d = match duration {
         Some(AbilityDuration::UntilHostLeavesPlay) => EffectDuration::UntilHostLeavesPlay,
         Some(AbilityDuration::UntilHostLeavesPlayOrEot) => EffectDuration::UntilHostLeavesPlayOrEOT,

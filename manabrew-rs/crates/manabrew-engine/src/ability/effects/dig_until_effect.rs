@@ -126,7 +126,7 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
         if found_dest == ZoneType::Battlefield {
             let _ = super::add_to_combat(ctx, sa, id, keys::ATTACKING);
         }
-        emit_zone_trigger(ctx.trigger_handler, id, ZoneType::Library, found_dest);
+        emit_zone_trigger(ctx.trigger_handler, ctx.game, id, ZoneType::Library, found_dest);
     }
 
     // Move rest to revealed destination
@@ -139,7 +139,7 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
             ctx.game.card_mut(id).set_zone(ZoneType::Library);
         } else {
             ctx.move_card(id, revealed_dest, owner);
-            emit_zone_trigger(ctx.trigger_handler, id, ZoneType::Library, revealed_dest);
+            emit_zone_trigger(ctx.trigger_handler, ctx.game, id, ZoneType::Library, revealed_dest);
         }
     }
 }

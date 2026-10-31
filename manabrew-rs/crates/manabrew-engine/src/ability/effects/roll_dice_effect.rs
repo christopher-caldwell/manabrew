@@ -1071,7 +1071,7 @@ fn pay_roll_cost(
                                 false,
                             );
                             crate::ability::effects::emit_zone_trigger_with_lki_counters(
-                                trigger_handler,
+                                trigger_handler, game,
                                 sacrificed_id,
                                 ZoneType::Battlefield,
                                 ZoneType::Graveyard,

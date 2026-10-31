@@ -76,7 +76,7 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
         }
         let old_zone = ctx.game.card(card_id).zone;
         ctx.move_card(card_id, ZoneType::Exile, controller);
-        emit_zone_trigger(ctx.trigger_handler, card_id, old_zone, ZoneType::Exile);
+        emit_zone_trigger(ctx.trigger_handler, ctx.game, card_id, old_zone, ZoneType::Exile);
         exiled.push(card_id);
     }
 
@@ -129,7 +129,7 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
     ctx.trigger_handler
         .register_active_trigger(ctx.game, primary);
     emit_zone_trigger(
-        ctx.trigger_handler,
+        ctx.trigger_handler, ctx.game,
         primary,
         old_zone,
         ZoneType::Battlefield,

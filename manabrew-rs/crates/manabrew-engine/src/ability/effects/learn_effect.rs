@@ -86,7 +86,7 @@ fn learn_lesson(ctx: &mut EffectContext, _sa: &SpellAbility, player: PlayerId) {
         // Lesson from sideboard → hand
         let old_zone = ctx.game.card(card_id).zone;
         ctx.move_card(card_id, ZoneType::Hand, player);
-        emit_zone_trigger(ctx.trigger_handler, card_id, old_zone, ZoneType::Hand);
+        emit_zone_trigger(ctx.trigger_handler, ctx.game, card_id, old_zone, ZoneType::Hand);
     } else if card_zone == ZoneType::Hand {
         // Discard from hand, then draw 1
         let old_zone = ctx.game.card(card_id).zone;
@@ -106,23 +106,24 @@ fn learn_lesson(ctx: &mut EffectContext, _sa: &SpellAbility, player: PlayerId) {
             },
             false,
         );
-        emit_zone_trigger(ctx.trigger_handler, card_id, old_zone, ZoneType::Graveyard);
+        emit_zone_trigger(ctx.trigger_handler, ctx.game, card_id, old_zone, ZoneType::Graveyard);
 
         // Draw 1 card
-        let lib = ctx.game.cards_in_zone(ZoneType::Library, player).to_vec();
-        if let Some(&top) = lib.last() {
-            let dz = ctx.game.card(top).zone;
-            ctx.move_card(top, ZoneType::Hand, player);
+        let first_in_step = ctx.game.turn.phase == forge_foundation::PhaseType::Draw
+            && ctx.game.active_player() == player && ctx.game.player(player).drawn_this_draw_step == 0;
+        if let Some(top) = ctx.game.draw_card_with_agents(player, ctx.agents) {
             ctx.trigger_handler.run_trigger(
                 TriggerType::Drawn,
                 RunParams {
                     card: Some(top),
                     player: Some(player),
+                    drawn_this_turn_snapshot: Some(ctx.game.player(player).drawn_this_turn),
+                    first_card_in_draw_step_snapshot: Some(first_in_step),
                     ..Default::default()
                 },
                 false,
             );
-            emit_zone_trigger(ctx.trigger_handler, top, dz, ZoneType::Hand);
+            emit_zone_trigger(ctx.trigger_handler, ctx.game, top, ZoneType::Library, ZoneType::Hand);
         }
     }
 }

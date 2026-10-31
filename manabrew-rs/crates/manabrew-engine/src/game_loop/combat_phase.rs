@@ -1,6 +1,71 @@
 use super::*;
 use crate::card::card_damage_history::TrackedEntity;
 
+// Maximum number of required attackers that can be assigned to individually
+// legal defenders without exceeding per-defender or global capacities. The
+// augmenting-path match is exact for these capacity constraints; other joint
+// restrictions remain the responsibility of declaration validation.
+fn maximum_required_assignments(
+    required: &[CardId], legal: &[(CardId, Vec<combat::DefenderId>)],
+    defenders: &[combat::DefenderId], limits: &[(combat::DefenderId, usize)], global: Option<usize>,
+) -> usize {
+    let mut slots = Vec::new();
+    for &defender in defenders {
+        let cap = limits.iter().find(|(id, _)| *id == defender).map_or(required.len(), |(_, cap)| *cap);
+        slots.extend(std::iter::repeat_n(defender, cap.min(required.len())));
+    }
+    fn augment(index: usize, required: &[CardId], legal: &[(CardId, Vec<combat::DefenderId>)],
+               slots: &[combat::DefenderId], seen: &mut [bool], assigned: &mut [Option<usize>]) -> bool {
+        let Some((_, choices)) = legal.iter().find(|(id, _)| *id == required[index]) else { return false; };
+        for (slot, target) in slots.iter().enumerate() {
+            if seen[slot] || !choices.contains(target) { continue; }
+            seen[slot] = true;
+            if assigned[slot].is_none() || augment(assigned[slot].unwrap(), required, legal, slots, seen, assigned) {
+                assigned[slot] = Some(index);
+                return true;
+            }
+        }
+        false
+    }
+    let mut assigned = vec![None; slots.len()];
+    let mut count = 0;
+    for index in 0..required.len() {
+        if augment(index, required, legal, &slots, &mut vec![false; slots.len()], &mut assigned) { count += 1; }
+    }
+    count.min(global.unwrap_or(required.len()))
+}
+
+// Search legal subsets with a bounded node budget. Never treat the capacity
+// upper bound as achievable when joint restrictions have not been solved.
+fn maximum_joint_required(
+    required: &[CardId], legal: &[(CardId, Vec<combat::DefenderId>)],
+    defenders: &[combat::DefenderId], limits: &[(combat::DefenderId, usize)],
+    global: Option<usize>, cards: &[crate::card::Card],
+) -> Result<Option<usize>, &'static str> {
+    if !legal.iter().any(|(id, _)| !combat::attack_restriction::get_restrictions(&cards[id.index()]).is_empty()) { return Ok(None); }
+    let upper = maximum_required_assignments(required, legal, defenders, limits, global);
+    let mut best=0usize; let mut nodes=0usize; let mut selected=Vec::new();
+    fn search(index: usize, selected: &mut Vec<CardId>, best: &mut usize, nodes: &mut usize,
+        upper: usize, required: &[CardId], legal: &[(CardId, Vec<combat::DefenderId>)],
+        defenders: &[combat::DefenderId], limits: &[(combat::DefenderId, usize)],
+        global: Option<usize>, cards: &[crate::card::Card]) -> Result<(), &'static str> {
+        if *best == upper { return Ok(()); }
+        *nodes += 1; if *nodes > 100_000 { return Err("joint attack requirement search exceeded safe budget"); }
+        if combat::attack_restriction::validate_attack_restrictions(selected, cards).is_empty()
+            && maximum_required_assignments(selected,legal,defenders,limits,global) == selected.len() {
+            *best=(*best).max(selected.iter().filter(|id| required.contains(id)).count());
+            if *best == upper { return Ok(()); }
+        }
+        if index == legal.len() || selected.len() >= global.unwrap_or(legal.len()) { return Ok(()); }
+        selected.push(legal[index].0);
+        search(index+1,selected,best,nodes,upper,required,legal,defenders,limits,global,cards)?;
+        selected.pop();
+        search(index+1,selected,best,nodes,upper,required,legal,defenders,limits,global,cards)
+    }
+    search(0,&mut selected,&mut best,&mut nodes,upper,required,legal,defenders,limits,global,cards)?;
+    Ok(Some(best))
+}
+
 impl GameLoop {
     pub fn step_combat(&mut self, game: &mut GameState, agents: &mut [Box<dyn PlayerAgent>]) {
         let _perf_scope =
@@ -44,7 +109,7 @@ impl GameLoop {
         let possible_defenders = combat::get_possible_defenders(game, active);
 
         // Compute attack requirements (must-attack from statics + goad)
-        let must_attackers = if available_attackers.is_empty() {
+        let mut must_attackers = if available_attackers.is_empty() {
             Vec::new()
         } else {
             let requirements = combat::attack_requirement::compute_attack_requirements(
@@ -54,6 +119,20 @@ impl GameLoop {
             );
             combat::attack_requirement::must_attack_ids(&requirements)
         };
+
+        let goaded: Vec<_> = available_attackers.iter().filter_map(|&id|
+            game.card(id).goaded_by.map(|player| (id, player))).collect();
+        let legal: Vec<(CardId, Vec<combat::DefenderId>)> = available_attackers.iter().map(|&id| (id, possible_defenders.iter().copied()
+            .filter(|&defender| combat::combat_util::can_attack_defender(game, id, defender)).collect())).collect();
+        must_attackers.retain(|id| legal.iter().any(|(card, targets)| card == id && !targets.is_empty()));
+        let prompt_max = crate::staticability::static_ability_attack_restrict::global_attack_restrict(&game.cards)
+            .map(|max| max.max(0) as usize);
+        let target_limits: Vec<(combat::DefenderId, usize)> = possible_defenders.iter().filter_map(|&target| {
+            let combat::DefenderId::Player(player) = target else { return None; };
+            crate::staticability::static_ability_attack_restrict::attack_restrict_num_for_defender(&game.cards, player)
+                .map(|max| (target, max.max(0) as usize))
+        }).collect();
+        agents[active.index()].set_attack_requirements(&must_attackers, &goaded, &legal, prompt_max, &target_limits);
 
         let pass_until_skip = must_attackers.is_empty()
             && agents[active.index()]
@@ -135,11 +214,15 @@ impl GameLoop {
                         .filter(|&&m| !picked.iter().any(|(a, _)| *a == m))
                         .count();
                     if current_violations > 0 {
-                        // Compute minimum possible violations: try the best attack
-                        // which includes as many must-attackers as possible within
-                        // the global max. If all must-attackers fit within the limit,
-                        // best_violations = 0. Otherwise, best_violations = must_count - max.
-                        let max_attackers = global_max.unwrap_or(i32::MAX) as usize;
+                        // Count the maximum requirements satisfiable under
+                        // individual target legality and capacity limits. Joint
+                        // attacker restrictions are checked separately and can
+                        // require further work beyond this capacity bound.
+                        let max_attackers = maximum_joint_required(&must_attackers, &legal,
+                            &possible_defenders, &target_limits, prompt_max, &game.cards)
+                            .unwrap_or_else(|error| panic!("unsupported combat declaration: {error}"))
+                            .unwrap_or_else(|| maximum_required_assignments(&must_attackers, &legal,
+                                &possible_defenders, &target_limits, prompt_max));
                         let best_violations = must_attackers.len().saturating_sub(max_attackers);
                         if current_violations > best_violations {
                             invalid = true;
@@ -147,22 +230,13 @@ impl GameLoop {
                     }
                 }
 
-                // Per-defender limit: only count attackers going to that defender.
-                // Crawlspace's "ValidDefender$ You" only restricts attacks against
-                // the Crawlspace controller, not attacks against planeswalkers.
+                // Per-player limits do not apply to a planeswalker merely
+                // because its controller is the protected player.
                 if !invalid {
-                    let defender_max =
-                        crate::staticability::static_ability_attack_restrict::attack_restrict_num_for_defender(
-                            &game.cards,
-                            defending,
-                        );
-                    if let Some(max) = defender_max {
-                        let attackers_to_defender = picked
-                            .iter()
-                            .filter(|(_, def)| def.controlling_player(game) == defending)
-                            .count();
-                        if attackers_to_defender > max as usize {
+                    for &(target, max) in &target_limits {
+                        if picked.iter().filter(|(_, defender)| *defender == target).count() > max {
                             invalid = true;
+                            break;
                         }
                     }
                 }
@@ -655,29 +729,28 @@ impl GameLoop {
 
         // Java parity: PhaseHandler still advances into COMBAT_DECLARE_BLOCKERS
         // even when it will be skipped due to no attackers.
-        self.combat.remove_absent_combatants(&game.cards);
+        self.combat.remove_absent_combatants(&mut game.cards);
         if !self.combat.has_attackers() {
             self.set_phase(game, agents, PhaseType::CombatDeclareBlockers);
         }
         if self.combat.has_attackers() {
-            // Run DeclareBlocker replacement effects before declaring blockers.
-            {
-                use crate::replacement::replacement_handler::{
-                    apply_replacements, ReplacementEvent,
-                };
-                use crate::replacement::ReplacementResult;
-                let mut event = ReplacementEvent::DeclareBlocker { player: defending };
-                let result = apply_replacements(game, &mut event);
-                if result == ReplacementResult::Skipped || result == ReplacementResult::Replaced {
-                    // Blockers phase was prevented — skip to damage
-                }
-            }
-
-            // Declare Blockers — freeze the stack during declarations.
+            // Each attacked player declares blockers for attackers aimed at
+            // that player or a permanent they defend, in turn order.
             game.stack.freeze_stack();
             self.set_phase(game, agents, PhaseType::CombatDeclareBlockers);
-            let attacker_card_ids: Vec<CardId> =
-                self.combat.attackers.iter().map(|(a, _)| *a).collect();
+            let order = &game.player_order;
+            let start = order.iter().position(|&player| player == active).unwrap_or(0);
+            let defenders: Vec<_> = (1..=order.len()).map(|offset| order[(start + offset) % order.len()])
+                .filter(|&player| self.combat.attackers.iter().any(|(_, defender)| defender.controlling_player(game) == player)).collect();
+            for defending in defenders {
+                {
+                    use crate::replacement::replacement_handler::{apply_replacements, ReplacementEvent};
+                    let mut event = ReplacementEvent::DeclareBlocker { player: defending };
+                    let _ = apply_replacements(game, &mut event);
+                }
+                let attacker_card_ids: Vec<CardId> = self.combat.attackers.iter()
+                    .filter(|(_, defender)| defender.controlling_player(game) == defending)
+                    .map(|(attacker, _)| *attacker).collect();
             let available_blockers = combat::get_available_blockers(game, defending);
             let legal_blockers =
                 combat::filter_legal_blockers(game, &attacker_card_ids, &available_blockers);
@@ -732,7 +805,8 @@ impl GameLoop {
 
                 for (blocker, attacker) in chosen_blockers.into_iter() {
                     // Validate: use comprehensive evasion check
-                    if !combat::can_creature_block(game, blocker, attacker) {
+                    if !available_blockers.contains(&blocker) || !attacker_card_ids.contains(&attacker)
+                        || !combat::can_creature_block(game, blocker, attacker) {
                         continue; // illegal block
                     }
                     self.combat.declare_blocker(
@@ -741,23 +815,13 @@ impl GameLoop {
                         game.card(blocker).zone_timestamp,
                     );
 
-                    // Fire Blocks trigger for each (blocker, attacker) pair
-                    self.trigger_handler.run_trigger(
-                        TriggerType::Blocks,
-                        RunParams {
-                            blocker: Some(blocker),
-                            blocked_attacker: Some(attacker),
-                            card: Some(blocker),
-                            ..Default::default()
-                        },
-                        false,
-                    );
                 }
 
                 // Block cost checking (War Cadence effects)
                 {
                     let mut block_cost_failures = Vec::new();
                     for &(blocker_id, attacker_id) in &self.combat.blockers {
+                        if game.card(blocker_id).controller != defending { continue; }
                         let cost = combat::block_cost::get_block_cost(
                             &game.cards,
                             game.card(blocker_id),
@@ -789,8 +853,8 @@ impl GameLoop {
                 // Must-block enforcement: auto-assign blockers to required targets
                 let all_legal_blockers: Vec<CardId> = available_blockers.clone();
                 for &blocker_id in &all_legal_blockers {
-                    let must_targets =
-                        combat::compute_must_block_targets(game, &self.combat, blocker_id);
+                    let must_targets: Vec<_> = combat::compute_must_block_targets(game, &self.combat, blocker_id)
+                        .into_iter().filter(|attacker| attacker_card_ids.contains(attacker)).collect();
                     if must_targets.is_empty() {
                         continue;
                     }
@@ -815,6 +879,10 @@ impl GameLoop {
 
                 // Record damage history for blockers
                 for &(blocker_id, attacker_id) in &self.combat.blockers {
+                    if game.card(blocker_id).controller != defending { continue; }
+                    self.trigger_handler.run_trigger(TriggerType::Blocks, RunParams {
+                        blocker: Some(blocker_id), blocked_attacker: Some(attacker_id), card: Some(blocker_id), ..Default::default()
+                    }, false);
                     game.card_mut(blocker_id).damage_history.record_block();
                     game.card_mut(attacker_id)
                         .damage_history
@@ -842,6 +910,8 @@ impl GameLoop {
                             .with_player(defending),
                     );
                 }
+            }
+
             }
 
             // Auto-order blockers by declaration order — Java's parity
@@ -933,6 +1003,7 @@ impl GameLoop {
                 }
             }
 
+            game.turn.combat_blockers_declared = true;
             self.step_with_priority(game, agents, false);
             if game.game_over {
                 self.combat.clear_with_cards(&mut game.cards);
@@ -943,7 +1014,7 @@ impl GameLoop {
 
         // Java parity: combatants may leave/re-enter during declare blockers
         // priority (e.g. sacrificing an attacker). Re-prune before damage.
-        self.combat.remove_absent_combatants(&game.cards);
+        self.combat.remove_absent_combatants(&mut game.cards);
 
         // Pre-populate LKI cache for all combat participants so that if a
         // creature dies during damage, its combat role is already recorded.
@@ -955,13 +1026,14 @@ impl GameLoop {
         }
 
         self.set_phase(game, agents, PhaseType::CombatFirstStrikeDamage);
-        self.combat.remove_absent_combatants(&game.cards);
+        self.combat.remove_absent_combatants(&mut game.cards);
         if self.combat.has_attackers() {
             // LKI: Snapshot battlefield state before first strike damage.
             // Mirrors Java's Game.copyLastState() called before damage resolution.
             game.copy_last_state();
 
             let fs_unblocked_choices = self.choose_assign_as_unblocked(game, agents, true);
+            let fs_life_lost_before: Vec<i32> = game.players.iter().map(|p| p.life_lost_this_turn).collect();
             let combat::CombatDamageResolution {
                 events: fs_events,
                 counter_table: fs_counter_table,
@@ -978,6 +1050,19 @@ impl GameLoop {
             }
             let fs_damage_assigned = !fs_events.is_empty();
             self.fire_combat_damage_triggers(&fs_events);
+            for (index, before) in fs_life_lost_before.iter().enumerate() {
+                let player = crate::ids::PlayerId(index as u32);
+                let lost = game.player(player).life_lost_this_turn - before;
+                if lost > 0 {
+                    let params = RunParams {
+                        player: Some(player), life_amount: Some(lost),
+                        first_time: Some(game.player(player).life_lost_this_turn == lost),
+                        ..Default::default()
+                    };
+                    self.trigger_handler.run_trigger(TriggerType::LifeLost, params.clone(), false);
+                    self.trigger_handler.run_trigger(TriggerType::LifeLostAll, params, false);
+                }
+            }
             fs_counter_table.replace_counter_effect(
                 game,
                 Some(&mut self.trigger_handler),
@@ -1001,7 +1086,7 @@ impl GameLoop {
         }
 
         self.set_phase(game, agents, PhaseType::CombatDamage);
-        self.combat.remove_absent_combatants(&game.cards);
+        self.combat.remove_absent_combatants(&mut game.cards);
         if self.combat.has_attackers() {
             // Run AssignDealDamage replacement effects for each attacker.
             {
@@ -1021,6 +1106,7 @@ impl GameLoop {
             game.copy_last_state();
 
             let unblocked_choices = self.choose_assign_as_unblocked(game, agents, false);
+            let dmg_life_lost_before: Vec<i32> = game.players.iter().map(|p| p.life_lost_this_turn).collect();
             let combat::CombatDamageResolution {
                 events: dmg_events,
                 counter_table: damage_counter_table,
@@ -1043,6 +1129,19 @@ impl GameLoop {
                 self.notify_state_changed(game, agents);
             }
             self.fire_combat_damage_triggers(&dmg_events);
+            for (index, before) in dmg_life_lost_before.iter().enumerate() {
+                let player = crate::ids::PlayerId(index as u32);
+                let lost = game.player(player).life_lost_this_turn - before;
+                if lost > 0 {
+                    let params = RunParams {
+                        player: Some(player), life_amount: Some(lost),
+                        first_time: Some(game.player(player).life_lost_this_turn == lost),
+                        ..Default::default()
+                    };
+                    self.trigger_handler.run_trigger(TriggerType::LifeLost, params.clone(), false);
+                    self.trigger_handler.run_trigger(TriggerType::LifeLostAll, params, false);
+                }
+            }
             damage_counter_table.replace_counter_effect(
                 game,
                 Some(&mut self.trigger_handler),
@@ -1136,5 +1235,42 @@ impl GameLoop {
             }
         }
         choices
+    }
+}
+
+#[cfg(test)]
+mod scoped_target_limit_regression {
+    use super::*;
+    #[test]
+    fn exact_matching_handles_competing_and_alternative_defenders() {
+        let a = CardId(0); let b = CardId(1);
+        let x = combat::DefenderId::Player(PlayerId(1));
+        let y = combat::DefenderId::Player(PlayerId(2));
+        let required = vec![a, b]; let limits = vec![(x, 1)];
+        let flexible = vec![(a, vec![x, y]), (b, vec![x])];
+        assert_eq!(maximum_required_assignments(&required, &flexible, &[x, y], &limits, None), 2);
+        assert_eq!(maximum_required_assignments(&required, &flexible, &[x, y], &limits, Some(1)), 1);
+        let one_target = vec![(a, vec![x]), (b, vec![x])];
+        assert_eq!(maximum_required_assignments(&required, &one_target, &[x], &limits, None), 1);
+    }
+}
+
+#[cfg(test)]
+mod large_joint_regression {
+    use super::*;
+    use forge_carddb::parse_card_script;
+    use forge_foundation::ZoneType;
+    #[test]
+    fn companion_requirement_respects_global_cap_at_and_above_old_threshold() {
+        for count in [12,13,32] {
+            let mut game=GameState::new(&["A","B"],40); let player=PlayerId(0); let defender=combat::DefenderId::Player(PlayerId(1));
+            let restricted=parse_card_script("Name:Must Have Friend\nTypes:Creature Human\nPT:2/2\nK:CARDNAME can't attack alone.").unwrap();
+            let ordinary=parse_card_script("Name:Friend\nTypes:Creature Human\nPT:2/2").unwrap();
+            let mut legal=Vec::new();
+            for i in 0..count { let rules=if i==0 {&restricted} else {&ordinary}; let id=game.create_card(crate::card::Card::from_rules(rules,player)); game.move_card(id,ZoneType::Battlefield,player); legal.push((id,vec![defender])); }
+            let required=vec![legal[0].0];
+            assert_eq!(maximum_joint_required(&required,&legal,&[defender],&[],Some(1),&game.cards),Ok(Some(0)),"count={count}");
+            assert_eq!(maximum_joint_required(&required,&legal,&[defender],&[],Some(2),&game.cards),Ok(Some(1)),"count={count}");
+        }
     }
 }

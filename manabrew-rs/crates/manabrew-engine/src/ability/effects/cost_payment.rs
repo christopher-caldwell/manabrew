@@ -489,7 +489,7 @@ fn try_pay_effect_cost(
                             false,
                         );
                         emit_zone_trigger(
-                            ctx.trigger_handler,
+                            ctx.trigger_handler, ctx.game,
                             top,
                             ZoneType::Library,
                             ZoneType::Graveyard,
@@ -597,7 +597,7 @@ fn try_pay_effect_cost(
                         );
                         ctx.move_card(chosen, ZoneType::Graveyard, owner);
                         emit_zone_trigger(
-                            ctx.trigger_handler,
+                            ctx.trigger_handler, ctx.game,
                             chosen,
                             ZoneType::Battlefield,
                             ZoneType::Graveyard,
@@ -708,6 +708,13 @@ pub(super) fn resolve_effect_with_unless_cost(
         let cost_display = crate::cost::to_prompt_string(&cost);
         let prompt = if cost_display.is_empty() {
             "Pay this cost?".to_string()
+        } else if cost_display == "{1}"
+            && payer != sa.activating_player
+            && sa.api == Some(crate::ability::api_type::ApiType::Draw)
+            && sa.ir.num_cards_text.as_deref().is_none_or(|n| n == "1")
+            && sa.ir.defined_text.as_deref().is_none_or(|d| d == "You")
+        {
+            "Pay {1} to prevent an opponent drawing a card?".to_string()
         } else {
             format!("Pay {cost_display}?")
         };
@@ -772,7 +779,9 @@ pub(super) fn resolve_effect_with_unless_cost(
 
     let is_switched = sa.ir.unless_switched;
     if already_paid == is_switched {
-        if sa.ir.optional_decider_text.is_some() {
+        if sa.ir.optional_decider_text.is_some()
+            && sa.api != Some(crate::ability::api_type::ApiType::Draw)
+        {
             let decider = sa
                 .ir
                 .optional_decider_text
@@ -789,11 +798,16 @@ pub(super) fn resolve_effect_with_unless_cost(
                 })
                 .unwrap_or(sa.activating_player);
             let _card_name = sa.source.map(|cid| ctx.game.card(cid).card_name.clone());
-            let prompt = sa
-                .ir
-                .spell_description_text
-                .as_deref()
-                .unwrap_or("Use this optional effect?");
+            let prompt = sa.ir.spell_description_text.as_deref().unwrap_or_else(|| {
+                if sa.api == Some(crate::ability::api_type::ApiType::Draw)
+                    && sa.ir.num_cards_text.as_deref().is_none_or(|n| n == "1")
+                    && sa.ir.defined_text.as_deref().is_none_or(|d| d == "You")
+                {
+                    "Do you want to draw a card?"
+                } else {
+                    "Use this optional effect?"
+                }
+            });
             ctx.agents[decider.index()].snapshot_state(ctx.game, ctx.mana_pools);
             if !ctx.agents[decider.index()].confirm_action(
                 decider,

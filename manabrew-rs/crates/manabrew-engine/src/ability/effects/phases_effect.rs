@@ -40,58 +40,53 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
                 _ => None,
             })
             .collect();
-        for cid in ids {
-            if ctx.game.card(cid).zone == ZoneType::Battlefield {
-                apply_phase(ctx, cid, phase_mode);
-            }
-        }
+        apply_phases(ctx, &ids, phase_mode);
         return;
     }
 
     // Targeted: use the chosen target card.
-    if let Some(target_card) = sa.target_chosen.target_card {
-        if ctx.game.card(target_card).zone == ZoneType::Battlefield {
-            apply_phase(ctx, target_card, phase_mode);
-        }
+    let targets = sa.target_chosen.all_target_cards();
+    if sa.uses_targeting() || !targets.is_empty() {
+        apply_phases(ctx, &targets, phase_mode);
         return;
     }
 
-    // Defined$ Self — phase the source card.
-    if let Some(source) = sa.source {
-        if ctx.game.card(source).zone == ZoneType::Battlefield {
-            apply_phase(ctx, source, phase_mode);
-        }
+    if let Some(defined) = sa.ir.defined_text.as_deref() {
+        let cards = crate::ability::spell_ability_effect::resolve_defined_cards_for_sa(ctx.game, sa, defined);
+        apply_phases(ctx, &cards, phase_mode);
+    } else if let Some(source) = sa.source {
+        if ctx.game.card(source).zone == ZoneType::Battlefield { apply_phases(ctx, &[source], phase_mode); }
     }
 }
 
-fn apply_phase(ctx: &mut EffectContext, card_id: crate::ids::CardId, mode: &str) {
-    match mode {
-        "In" => {
-            if ctx.game.card(card_id).phased_out {
-                ctx.game.card_mut(card_id).set_phased_out(false);
-                ctx.trigger_handler.run_trigger(
-                    TriggerType::PhasedIn,
-                    RunParams {
-                        card: Some(card_id),
-                        ..Default::default()
-                    },
-                    false,
-                );
+fn apply_phases(ctx: &mut EffectContext, cards: &[crate::ids::CardId], mode: &str) {
+    let changed = if mode == "In" {
+        let mut changed = Vec::new();
+        for &id in cards {
+            changed.extend(crate::phase::untap::phase_in(ctx.game, id));
+        }
+        changed
+    } else {
+        crate::phase::untap::phase_out_many(ctx.game, cards)
+    };
+    for id in changed {
+        if mode != "In" {
+            if let Some(combat) = ctx.combat.as_deref_mut() {
+                combat.remove_from_combat(id, ctx.game);
             }
         }
-        _ => {
-            if !ctx.game.card(card_id).phased_out {
-                ctx.game.card_mut(card_id).set_phased_out(true);
-                ctx.trigger_handler.run_trigger(
-                    TriggerType::PhasedOut,
-                    RunParams {
-                        card: Some(card_id),
-                        ..Default::default()
-                    },
-                    false,
-                );
-            }
-        }
+        ctx.trigger_handler.run_trigger(
+            if mode == "In" {
+                TriggerType::PhasedIn
+            } else {
+                TriggerType::PhasedOut
+            },
+            RunParams {
+                card: Some(id),
+                ..Default::default()
+            },
+            false,
+        );
     }
 }
 

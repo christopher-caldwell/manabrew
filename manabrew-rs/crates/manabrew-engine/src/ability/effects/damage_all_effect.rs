@@ -54,8 +54,16 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
         }
     }
 
-    // Check source card for Infect/Wither keywords
-    let source = sa.source;
+    // Some effects instruct a different object (such as the parent target)
+    // to deal the damage. Never substitute the spell host when that object
+    // is unavailable: source characteristics determine infect and protection.
+    let source = match sa.ir.damage_source_text.as_deref() {
+        Some("ParentTarget") => sa.target_chosen.target_card.or(ctx.parent_target_card),
+        Some(defined) => crate::ability::spell_ability_effect::resolve_defined_cards_for_sa(ctx.game, sa, defined).into_iter().next(),
+        None => sa.source,
+    };
+    if sa.ir.damage_source_text.is_some() && source.is_none() { return; }
+    // Check the actual damage source for Infect/Wither keywords.
     let (source_has_infect_keyword, source_has_wither) = if let Some(src_id) = source {
         let src = ctx.game.card(src_id);
         (
@@ -71,7 +79,6 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
     };
 
     // Pass 2 — apply damage to collected permanents
-    let source = sa.source;
     for card_id in to_damage {
         if ctx.game.card(card_id).zone == ZoneType::Battlefield {
             // Protection: prevents all damage from matching sources
@@ -120,7 +127,7 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
                         &crate::card::CounterType::M1M1,
                         num_dmg,
                         crate::event::RunParams {
-                            source_player: sa.source.map(|src_id| ctx.game.card(src_id).controller),
+                            source_player: source.map(|src_id| ctx.game.card(src_id).controller),
                             cause: Some(sa.clone()),
                             ..Default::default()
                         },
@@ -134,7 +141,7 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
                     }
                 }
             } else {
-                ctx.game.deal_damage_to_card(card_id, num_dmg);
+                ctx.game.deal_damage_to_card_from(card_id, num_dmg, source, false);
             }
 
             // Fire DamageDone trigger per card
@@ -160,6 +167,7 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
             if !valid_filter::matches_valid_player_selector(valid_players, pid, activating_player) {
                 continue;
             }
+            if crate::player::has_keyword(ctx.game, pid, "Protection from everything") { continue; }
             let source_has_infect = if let Some(src_id) = source {
                 let src = ctx.game.card(src_id);
                 source_has_infect_keyword
@@ -198,9 +206,10 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
                     }
                 }
             } else {
-                let dealt = ctx.game.deal_damage_to_player(pid, num_dmg);
+                let dealt = ctx.game.deal_damage_to_player_from(pid, num_dmg, source, false);
                 ctx.game
                     .record_player_damage_assignment(source, Some(pid), dealt, false);
+                super::life_lose_effect::fire_life_lost_all(ctx, pid, dealt, source);
             }
 
             // Fire DamageDone trigger per player

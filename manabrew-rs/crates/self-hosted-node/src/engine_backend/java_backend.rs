@@ -1974,6 +1974,7 @@ fn game_over_prompt() -> AgentPrompt {
         deciding_player_id: "player-0".to_string(),
         source_card: None,
         source_ability_text: None,
+        known_damage: None,
         input: PromptInput::GameOver(GameOverInput {}),
     }
 }

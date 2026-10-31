@@ -332,6 +332,8 @@ pub fn resolve_effect_chain_with_parent(
     initial_parent_target_card: Option<CardId>,
     initial_parent_target_player: Option<PlayerId>,
 ) {
+    let root_trigger_objects = initial.trigger_objects.clone();
+    let mut inherited_targets = initial.target_chosen.clone();
     let mut current = Some(initial);
     let mut parent_target_card = initial_parent_target_card;
     let mut parent_target_player = initial_parent_target_player;
@@ -340,15 +342,24 @@ pub fn resolve_effect_chain_with_parent(
     while let Some(sa) = current {
         let mut sa_with_ctx;
         let needs_ctx_clone = !is_first
-            && ((parent_target_card.is_some() && sa.target_chosen.target_card.is_none())
-                || (parent_target_player.is_some() && sa.target_chosen.target_player.is_none()));
+            && (!root_trigger_objects.is_empty() || (parent_target_card.is_some() && sa.target_chosen.target_card.is_none())
+                || (parent_target_player.is_some() && sa.target_chosen.target_player.is_none())
+                || (!inherited_targets.divided_map.is_empty() && sa.target_chosen.target_card.is_none())
+                || (!inherited_targets.additional_target_players.is_empty() && sa.target_chosen.target_player.is_none()));
         let sa_ref = if needs_ctx_clone {
             sa_with_ctx = sa.clone();
+            for (key, value) in &root_trigger_objects {
+                sa_with_ctx.trigger_objects.entry(*key).or_insert_with(|| value.clone());
+            }
             if sa_with_ctx.target_chosen.target_card.is_none() {
                 sa_with_ctx.target_chosen.target_card = parent_target_card;
+                sa_with_ctx.target_chosen.target_card_zone_timestamp = inherited_targets.target_card_zone_timestamp;
+                sa_with_ctx.target_chosen.divided_map = inherited_targets.divided_map.clone();
+                sa_with_ctx.target_chosen.additional_card_timestamps = inherited_targets.additional_card_timestamps.clone();
             }
             if sa_with_ctx.target_chosen.target_player.is_none() {
                 sa_with_ctx.target_chosen.target_player = parent_target_player;
+                sa_with_ctx.target_chosen.additional_target_players = inherited_targets.additional_target_players.clone();
             }
             &sa_with_ctx
         } else {
@@ -358,6 +369,7 @@ pub fn resolve_effect_chain_with_parent(
         resolve_effect(ctx, sa_ref);
         parent_target_card = sa_ref.target_chosen.target_card.or(parent_target_card);
         parent_target_player = sa_ref.target_chosen.target_player.or(parent_target_player);
+        inherited_targets = sa_ref.target_chosen.clone();
         current = if sub_ability_handled_internally(sa_ref) {
             None
         } else {

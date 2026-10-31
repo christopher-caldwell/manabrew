@@ -166,6 +166,10 @@ impl ProducedMana {
 pub struct Mana {
     pub color: u16,
     pub source_card: Option<CardId>,
+    /// A convoke/improvise contribution is not floating mana. It is only
+    /// spendable on the pending spell for which the permanent was tapped.
+    pub convoke_for: Option<CardId>,
+    pub convoke_source: Option<CardId>,
     pub is_snow: bool,
     /// Mana that persists across all phase transitions (Omnath, Kruphix).
     pub is_persistent: bool,
@@ -195,6 +199,8 @@ impl Mana {
         Self {
             color,
             source_card: None,
+            convoke_for: None,
+            convoke_source: None,
             is_snow: false,
             is_persistent: false,
             is_combat_mana: false,
@@ -251,6 +257,7 @@ impl Mana {
 pub struct ManaPaymentContext {
     /// True if paying for a spell (not an ability).
     pub is_spell: bool,
+    pub payment_card: Option<CardId>,
     /// True if paying for an activated ability's cost. Distinct from
     /// `is_spell` so triggered abilities and effect-driven costs (UnlessCost,
     /// cumulative upkeep, …) are neither spell nor activated.
@@ -291,6 +298,7 @@ pub fn payment_context_for_sa(game: &GameState, sa: &SpellAbility) -> ManaPaymen
 
     ManaPaymentContext {
         is_spell: sa.is_spell,
+        payment_card: sa.source,
         is_activated_ability: sa.is_activated,
         // `payment_context_for_sa` is used for activated-ability cost
         // calculations and AI lookahead — neither is the real cast-time
@@ -597,7 +605,7 @@ pub(crate) fn tap_land_for_mana(
     // fast-path `auto_pay` flow strips the metadata that the SP$ Mana
     // resolution would normally set in `mana_effect`.
     let triggers_when_spent = ability_index
-        .and_then(|idx| card.activated_abilities.get(idx))
+        .and_then(|idx| card.activated_abilities.iter().find(|ab| ab.ability_index == idx))
         .and_then(|ab| ab.triggers_when_spent.clone());
     if should_tap && !card.tapped {
         game.tap(land_id);
@@ -1235,6 +1243,21 @@ fn atoms_mask_to_letters(mask: u16) -> String {
     letters.join(" ")
 }
 
+// Identify the beneficiary of supported triggered mana definitions. An aura
+// controlled by an opponent can still give mana to the land's controller.
+// Unknown/multiple-recipient definitions must not inflate this player's pool.
+pub(crate) fn triggered_mana_goes_to_player(
+    game: &GameState, host: &crate::card::Card, tapped_card_id: CardId,
+    player: PlayerId, defined: Option<&str>,
+) -> bool {
+    match defined {
+        None | Some("You") | Some("Controller") => host.controller == player,
+        Some("TriggeredCardController") => game.card(tapped_card_id).controller == player,
+        Some("TriggeredActivator") | Some("TriggeredPlayer") => true,
+        _ => false,
+    }
+}
+
 fn add_taps_for_mana_trigger_mana_for_availability(
     available: &mut ManaPool,
     source_count: &mut i32,
@@ -1270,6 +1293,9 @@ fn add_taps_for_mana_trigger_mana_for_availability(
                 continue;
             };
             let trigger_params = crate::parsing::Params::from_raw(svar_text);
+            if !triggered_mana_goes_to_player(game, host, tapped_card_id, player, trigger_params.get("Defined")) {
+                continue;
+            }
             if !trigger_params
                 .get("DB")
                 .is_some_and(|api| api.eq_ignore_ascii_case("Mana"))
@@ -1321,6 +1347,10 @@ fn calculate_available_mana_excluding_with_reserved_impl(
     include_hand_sources: bool,
     payment_ctx: Option<&ManaPaymentContext>,
 ) -> ManaPool {
+    // Floating mana is subject to the same spending restrictions as sources.
+    // Filter before rebuilding optimistic source colors and total counts.
+    let eligible_pool = payment_ctx.map(|ctx| pool.filtered_for_context(ctx));
+    let pool = eligible_pool.as_ref().unwrap_or(pool);
     let mut available = pool.clone();
     let battlefield = game.cards_in_zone(ZoneType::Battlefield, player);
     let hand_cards = if include_hand_sources {
@@ -1732,52 +1762,8 @@ fn calculate_available_mana_excluding_with_reserved_impl(
         }
     }
 
-    // Count extra mana from aura enchantments with TapsForMana triggers
-    // (e.g. Utopia Sprawl, Wild Growth). When an untapped land has an attached
-    // aura that produces mana on tap, that extra mana should be counted in
-    // the playability check.
-    for &card_id in battlefield {
-        let card = game.card(card_id);
-        if card.tapped || card.attachments.is_empty() {
-            continue;
-        }
-        for &aura_id in &card.attachments {
-            if aura_id.index() >= game.cards.len() {
-                continue;
-            }
-            let aura = game.card(aura_id);
-            if aura.zone != ZoneType::Battlefield {
-                continue;
-            }
-            for trigger in &aura.triggers {
-                if trigger.kind == crate::trigger::TriggerType::TapsForMana {
-                    // This aura produces extra mana when the host is tapped.
-                    // Determine what color from the Execute$ SVar.
-                    if let Some(svar_text) = aura.svars.get(&trigger.execute) {
-                        let params = crate::parsing::Params::from_raw(svar_text);
-                        if let Some(produced) = params.get(crate::parsing::keys::PRODUCED) {
-                            let produced_ir = ProducedMana::from_raw_boundary(produced);
-                            let atoms = if matches!(produced_ir, ProducedMana::Chosen) {
-                                // Use aura's chosen color
-                                aura.chosen_colors
-                                    .first()
-                                    .and_then(|c| color_name_to_mana_atom(c))
-                                    .into_iter()
-                                    .collect::<Vec<_>>()
-                            } else {
-                                produced_ir.to_atoms(&aura.chosen_colors)
-                            };
-                            for atom in atoms {
-                                available.add(atom, 1);
-                                source_count += 1;
-                                source_colors.push(atom);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // Triggered mana, including attached auras, was counted once per source
+    // above; a second attachment-only pass would count those abilities twice.
 
     // Set total_sources so can_pay enforces the real total mana cap
     available.total_sources = Some(pool.total_mana() + source_count);
@@ -1861,6 +1847,15 @@ mod tests {
     use crate::ids::{CardId, PlayerId};
     use forge_foundation::ManaCost;
     use forge_foundation::{CardTypeLine, ColorSet, ZoneType};
+
+    #[test]
+    fn spent_mana_metadata_uses_ability_identifier() {
+        let mut game=GameState::new(&["A", "B"],40);let player=PlayerId(0);
+        let card=Card::new(CardId(0),"Provenance".into(),player,CardTypeLine::parse("Land"),ManaCost::no_cost(),ColorSet::COLORLESS,None,None,vec![],vec!["AB$ Mana | Cost$ T | Produced$ B | TriggersWhenSpent$ TrigScry".into()]);
+        let id=game.create_card(card);game.move_card(id,ZoneType::Battlefield,player);game.card_mut(id).activated_abilities[0].ability_index=130;
+        let mut pool=ManaPool::new();let mut tapped=vec![];tap_land_for_mana(&mut game,&mut pool,player,id,ManaAtom::BLACK,true,&mut tapped,Some(130));
+        assert_eq!(pool.collect_trigger_mana(),vec![("TrigScry".to_string(),id)]);
+    }
 
     #[test]
     fn basic_land_detection() {
@@ -2021,6 +2016,7 @@ mod tests {
 
         let ctx = ManaPaymentContext {
             is_spell: true,
+            payment_card: None,
             is_activated_ability: false,
             sa_on_stack: false,
             type_line: Some(CardTypeLine::parse("Creature Zombie Assassin")),
@@ -2033,4 +2029,59 @@ mod tests {
         assert!(pool.try_pay_for_spell(&ManaCost::parse("B"), &ctx));
         assert_eq!(pool.total_mana(), 0);
     }
+}
+
+#[cfg(test)]
+mod multi_mode_mana_availability_regression {
+    use super::*;
+    use crate::{card::Card, game::GameState, ids::PlayerId};
+    use forge_carddb::parse_card_script;
+    use forge_foundation::{ManaCost, ZoneType};
+
+    fn availability(script: &str) -> ManaPool {
+        let mut game=GameState::new(&["A", "B"],40); let player=PlayerId(0);
+        let card=game.create_card(Card::from_rules(&parse_card_script(script).unwrap(),player));
+        game.move_card(card,ZoneType::Battlefield,player);
+        calculate_available_mana(&ManaPool::new(),&game,player)
+    }
+    #[test]
+    fn alternative_tap_abilities_count_one_activation_not_two() {
+        let p=availability("Name:Two Modes\nTypes:Land\nA:AB$ Mana | Cost$ T | Produced$ Combo U B R\nA:AB$ Mana | Cost$ T | Produced$ B");
+        assert_eq!(p.total_sources,Some(1));
+        assert!(p.can_pay(&ManaCost::parse("U"))); assert!(p.can_pay(&ManaCost::parse("B")));
+        assert!(!p.can_pay(&ManaCost::parse("U B"))); assert!(!p.can_pay(&ManaCost::parse("2")));
+    }
+    #[test]
+    fn single_activation_producing_two_mana_still_counts_two() {
+        let p=availability("Name:Two Mana\nTypes:Artifact\nA:AB$ Mana | Cost$ T | Produced$ C | Amount$ 2");
+        assert_eq!(p.total_sources,Some(2)); assert!(p.can_pay(&ManaCost::parse("2"))); assert!(!p.can_pay(&ManaCost::parse("3")));
+    }
+    fn enchanted_land(recipient: &str, aura_owner: PlayerId) -> (GameState, CardId) {
+        let mut game=GameState::new(&["A", "B"],40); let player=PlayerId(0);
+        let land=parse_card_script("Name:Test Land\nTypes:Land\nA:AB$ Mana | Cost$ T | Produced$ B").unwrap();
+        let script=format!("Name:Test Aura\nTypes:Enchantment Aura\nT:Mode$ TapsForMana | ValidCard$ Card.AttachedBy | Execute$ TrigMana | Static$ True\nSVar:TrigMana:DB$ Mana | Produced$ G | Amount$ 1 | Defined$ {recipient}");
+        let aura=parse_card_script(&script).unwrap(); let land_id=game.create_card(Card::from_rules(&land,player)); let aura_id=game.create_card(Card::from_rules(&aura,aura_owner));
+        game.move_card(land_id,ZoneType::Battlefield,player); game.move_card(aura_id,ZoneType::Battlefield,aura_owner);
+        game.card_mut(aura_id).attach_to_entity(land_id); game.card_mut(land_id).attachments.push(aura_id);
+        (game,land_id)
+    }
+    #[test]
+    fn opponent_aura_mana_for_land_controller_counts_once_and_pays() {
+        for aura_owner in [PlayerId(0),PlayerId(1)] {
+            let (mut game,source)=enchanted_land("TriggeredCardController",aura_owner); let player=PlayerId(0); let cost=ManaCost::parse("B G"); let mut pool=ManaPool::new();
+            let available=calculate_available_mana(&pool,&game,player);
+            assert_eq!(available.total_sources,Some(2)); assert!(available.can_pay(&cost));
+            let ctx=ManaPaymentContext{is_spell:true,..Default::default()};
+            let result=pay_mana_cost_auto(&mut game,&mut pool,player,&cost,None,0,&ctx,false);
+            assert!(result.is_some(),"owner={:?}",aura_owner); assert!(game.card(source).tapped); assert_eq!(pool.total_mana(),0);
+        }
+    }
+    #[test]
+    fn opposing_aura_mana_for_its_controller_is_not_ours() {
+        let (mut game,_)=enchanted_land("You",PlayerId(1)); let player=PlayerId(0); let cost=ManaCost::parse("B G"); let mut pool=ManaPool::new();
+        let available=calculate_available_mana(&pool,&game,player);
+        assert_eq!(available.total_sources,Some(1)); assert!(!available.can_pay(&cost));
+        let ctx=ManaPaymentContext{is_spell:true,..Default::default()}; assert!(pay_mana_cost_auto(&mut game,&mut pool,player,&cost,None,0,&ctx,false).is_none());
+    }
+
 }

@@ -515,6 +515,9 @@ pub struct Card {
     pub lose_control_condition: Option<LoseControlCondition>,
     /// True if this temporary effect expires at end of turn cleanup.
     pub temp_effect_until_eot: bool,
+    /// Expire this command effect as the specified player's next turn begins.
+    #[serde(default)]
+    pub temp_effect_until_next_turn_of: Option<PlayerId>,
     /// Host card this temporary effect is linked to; when host leaves the
     /// battlefield, this effect expires.
     pub temp_effect_host: Option<CardId>,
@@ -533,6 +536,9 @@ pub struct Card {
     // Double-faced card (DFC) state
     /// True if this card is currently showing its back face.
     pub is_transformed: bool,
+    /// Successful physical transformations, used by delayed self-transform abilities.
+    #[serde(default)]
+    pub transform_timestamp: u64,
     /// Back-face characteristics for DFC cards. `None` for single-faced cards.
     pub other_part: Option<CardOtherPart>,
     #[serde(default)]
@@ -559,6 +565,12 @@ pub struct Card {
 
     // Phase-out state (issue #22, Phases effect).
     pub phased_out: bool,
+    /// Root permanent for indirect phasing of attached Auras/Equipment.
+    #[serde(default)]
+    pub phased_out_with: Option<CardId>,
+    /// Controller when directly phased out; determines the returning untap step.
+    #[serde(default)]
+    pub phased_out_controller: Option<PlayerId>,
 
     // Regeneration shields (issue #22, Regenerate effect).
     // Decremented instead of destroying; resets at end of turn.
@@ -646,6 +658,9 @@ pub struct Card {
     /// Last-known information: toughness when this card last left the battlefield.
     /// `None` means LKI was never captured; `Some(0)` means toughness was 0.
     pub lki_toughness: Option<i32>,
+    /// Object and zone identity this permanent was attached to when it left.
+    #[serde(default)]
+    pub lki_attached_to: Option<(CardId, u64)>,
     /// Last-known information: counters when this card last left the battlefield.
     /// Used by `TriggeredCard$CardCounters.TYPE` (e.g. Servant of the Scale death trigger).
     pub lki_counters: Option<std::collections::BTreeMap<CounterType, i32>>,
@@ -901,12 +916,14 @@ impl Card {
             remembered_lki_cards: Vec::new(),
             lose_control_condition: None,
             temp_effect_until_eot: false,
+            temp_effect_until_next_turn_of: None,
             temp_effect_host: None,
             forget_on_moved_origin: None,
             exile_when_no_remembered: false,
             exiled_by: None,
             original_controller_eot: None,
             is_transformed: false,
+            transform_timestamp: 0,
             other_part: None,
             secondary_part: None,
             adventure_spell: false,
@@ -917,6 +934,8 @@ impl Card {
             paper_foil: false,
             cosmetics: None,
             phased_out: false,
+            phased_out_with: None,
+            phased_out_controller: None,
             regeneration_shields: 0,
             kicked: false,
             monstrous: false,
@@ -954,6 +973,7 @@ impl Card {
             total_damage_done_this_turn: 0,
             lki_power: None,
             lki_toughness: None,
+            lki_attached_to: None,
             lki_counters: None,
             damage_history: damage_history::DamageHistory::default(),
             must_block_cards: Vec::new(),
@@ -1190,17 +1210,22 @@ impl Card {
         crate::card::card_state::add_trigger(self, trig)
     }
 
+    /// Keep temporary triggers ahead of layer-granted triggers, which are rebuilt.
+    pub fn add_pump_trigger(&mut self, mut trigger: Trigger) {
+        trigger.bind_host_card_id(self.id);
+        let index = (self.base_trigger_count + self.pump_trigger_count).min(self.triggers.len());
+        self.triggers.insert(index, trigger);
+        self.pump_trigger_count += 1;
+    }
+
     pub fn clear_pump_triggers(&mut self) {
         let count = self.pump_trigger_count;
         if count == 0 {
             return;
         }
-        let new_len = self
-            .triggers
-            .len()
-            .saturating_sub(count)
-            .max(self.base_trigger_count);
-        self.triggers.truncate(new_len);
+        let start = self.base_trigger_count.min(self.triggers.len());
+        let end = start.saturating_add(count).min(self.triggers.len());
+        self.triggers.drain(start..end);
         self.pump_trigger_count = 0;
     }
 
@@ -4045,6 +4070,13 @@ impl Card {
             self.parsed_svar_cache.clear();
             self.refresh_action_specs();
 
+            for trigger in &mut self.triggers {
+                trigger.bind_host_card_id(self.id);
+            }
+            for ability in &mut self.static_abilities {
+                ability.base.set_host_card_id(self.id);
+            }
+
             // Re-bind replacement hosts so SVar lookups hit the active face.
             let mut res = std::mem::take(&mut self.replacement_effects);
             for re in &mut res {
@@ -4053,6 +4085,7 @@ impl Card {
             self.replacement_effects = res;
 
             self.is_transformed = !self.is_transformed;
+            self.transform_timestamp = self.transform_timestamp.saturating_add(1);
 
             // Face characteristics changed; reset trait-change baseline and
             // re-apply active trait-change layers against the new face.

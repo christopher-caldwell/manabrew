@@ -62,7 +62,7 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
             for card_id in selected {
                 let old_zone = ctx.game.card(card_id).zone;
                 ctx.move_card(card_id, ZoneType::Hand, pid);
-                emit_zone_trigger(ctx.trigger_handler, card_id, old_zone, ZoneType::Hand);
+                emit_zone_trigger(ctx.trigger_handler, ctx.game, card_id, old_zone, ZoneType::Hand);
                 sought.push(card_id);
             }
         }

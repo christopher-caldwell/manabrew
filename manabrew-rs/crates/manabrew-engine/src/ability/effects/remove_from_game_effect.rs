@@ -13,6 +13,6 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
         let old = ctx.game.card(target).zone;
         let owner = ctx.game.card(target).owner;
         ctx.move_card(target, ZoneType::Exile, owner);
-        super::emit_zone_trigger(ctx.trigger_handler, target, old, ZoneType::Exile);
+        super::emit_zone_trigger(ctx.trigger_handler, ctx.game, target, old, ZoneType::Exile);
     }
 }

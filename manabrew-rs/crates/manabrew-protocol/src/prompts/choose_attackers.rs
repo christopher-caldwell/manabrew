@@ -10,6 +10,8 @@ pub struct AttackerOptionDto {
     pub attacker_id: String,
     pub valid_target_ids: Vec<String>,
     pub must_attack: bool,
+    #[serde(default)]
+    pub goaded_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -18,6 +20,10 @@ pub struct AttackerOptionDto {
 pub struct ChooseAttackersInput {
     pub attackers: Vec<AttackerOptionDto>,
     pub attack_targets: Vec<AttackTargetDto>,
+    #[serde(default)]
+    pub max_attackers: Option<usize>,
+    #[serde(default)]
+    pub target_limits: std::collections::HashMap<String, usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

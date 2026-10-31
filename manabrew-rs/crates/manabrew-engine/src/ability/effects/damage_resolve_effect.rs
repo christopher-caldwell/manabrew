@@ -70,7 +70,8 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
                             amount,
                         );
                     } else {
-                        ctx.game.deal_damage_to_card(cid, amount);
+                        let dealt = ctx.game.deal_damage_to_card_from(cid, amount, Some(source), false);
+                        super::damage_deal_effect::apply_noncombat_lifelink(ctx, sa, source, dealt);
                     }
                 }
             }
@@ -90,9 +91,11 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
                         amount,
                     );
                 } else {
-                    let dealt = ctx.game.deal_damage_to_player(pid, amount);
+                    let dealt = ctx.game.deal_damage_to_player_from(pid, amount, Some(source), false);
                     ctx.game
                         .record_player_damage_assignment(Some(source), Some(pid), dealt, false);
+                    super::life_lose_effect::fire_life_lost_all(ctx, pid, dealt, Some(source));
+                    super::damage_deal_effect::apply_noncombat_lifelink(ctx, sa, source, dealt);
                 }
             }
         }

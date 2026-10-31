@@ -145,6 +145,12 @@ pub fn get_defined_cards(
         return resolve_defined_card_token(token, game, host_card, activating_player);
     }
     // Prefix-based tokens.
+    if let Some(filter) = defined.strip_prefix("Valid ") {
+        let Some(source_id) = host_card else { return Vec::new(); };
+        return game.player_order.iter().flat_map(|&pid| game.cards_in_zone(ZoneType::Battlefield,pid).iter().copied())
+            .filter(|&cid| !game.card(cid).phased_out && matches_valid_cards_for_source(game, source_id, game.card(cid), None, filter.trim()))
+            .collect();
+    }
     if let Some(rest) = defined.strip_prefix("ValidGraveyard") {
         let filter = rest.trim();
         let player = activating_player.unwrap_or_else(|| {
@@ -362,10 +368,13 @@ pub fn resolve_defined_player_with_sa(
         });
     }
     match key {
+        "IsRemembered" => remembered_players_for_def("Remembered", sa, game).into_iter().next(),
         _ if key.starts_with("Remembered") => {
             remembered_players_for_def(key, sa, game).into_iter().next()
         }
-        "TriggeredPlayer" | "Targeted" | "TargetedPlayer" => sa
+        "TriggeredPlayer" => parse_player_object(sa, AbilityKey::TriggeredPlayer)
+            .or_else(|| parse_player_object(sa, AbilityKey::Player)),
+        "Targeted" | "TargetedPlayer" => sa
             .target_chosen
             .all_target_players()
             .into_iter()
@@ -504,8 +513,13 @@ pub fn resolve_defined_players_with_sa(
             }
             players
         }
+        "IsRemembered" => remembered_players_for_def("Remembered", sa, game),
         _ if key.starts_with("Remembered") => remembered_players_for_def(key, sa, game),
-        "TriggeredPlayer" | "Targeted" | "TargetedPlayer" => {
+        "TriggeredPlayer" => {
+            let players = sa.get_triggering_players(AbilityKey::TriggeredPlayer);
+            if players.is_empty() { sa.get_triggering_players(AbilityKey::Player) } else { players }
+        }
+        "Targeted" | "TargetedPlayer" => {
             let mut players = Vec::new();
             for player in sa.target_chosen.all_target_players() {
                 push_unique_player(&mut players, player);
@@ -657,7 +671,7 @@ pub fn resolve_defined_players_with_sa(
             players
         }
         "Each" | "All" => game.alive_players(),
-        "OpponentCtrl" => vec![game.opponent_of(controller)],
+        "Opponent" | "OpponentCtrl" => game.alive_players().into_iter().filter(|&pid| pid != controller).collect(),
         _ => resolve_defined_player(key, controller, game)
             .into_iter()
             .collect(),
@@ -831,7 +845,7 @@ pub fn resolve_defined_players(
     }
     match defined {
         "You" => vec![controller],
-        "Opponent" | "OpponentCtrl" => vec![game.opponent_of(controller)],
+        "Opponent" | "OpponentCtrl" => game.alive_players().into_iter().filter(|&pid| pid != controller).collect(),
         "DefendingPlayer" | "TriggeredDefendingPlayer" | "TriggeredDefender" => {
             vec![game.opponent_of(controller)]
         }
@@ -1010,6 +1024,10 @@ pub fn matches_valid_cards_for_sa(
     selector: Option<&CompiledSelector>,
     default_filter: &str,
 ) -> bool {
+    // Untargeted effects must ignore phased-out permanents too (CR 702.26b).
+    if card.phased_out {
+        return false;
+    }
     match (selector, sa.source) {
         (Some(selector), Some(source_id)) => valid_filter::matches_valid_card_selector_in_game(
             selector,

@@ -69,6 +69,7 @@ pub fn create_permanent_spell(
         optional_costs: Vec::new(),
         paid_hash: HashMap::new(),
         paying_mana: Vec::new(),
+        paying_mana_sources: Vec::new(),
         paid_abilities: Vec::new(),
         mana_part: None,
         express_mana_choice: None,

@@ -642,6 +642,10 @@ fn can_be_targeted_by_internal(
     source_sa: Option<&SpellAbility>,
 ) -> bool {
     let target = game.card(target_id);
+    // CR 702.26b applies at resolution as well as initial target selection.
+    if target.phased_out {
+        return false;
+    }
     let source_card_ref = source_card.map(|id| game.card(id));
     if crate::staticability::static_ability_cant_target::cant_target(
         &game.cards,

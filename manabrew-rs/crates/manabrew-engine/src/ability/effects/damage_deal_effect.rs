@@ -127,8 +127,8 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
                     }
                 }
             } else {
-                ctx.game
-                    .deal_damage_to_card_from(cid, damage, sa.source, false);
+                let dealt = ctx.game.deal_damage_to_card_from(cid, damage, sa.source, false);
+                if let Some(source) = sa.source { apply_noncombat_lifelink(ctx, sa, source, dealt); }
             }
             if !use_damage_map {
                 ctx.trigger_handler.run_trigger(
@@ -193,6 +193,8 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
                     .deal_damage_to_player_from(target_player, damage, sa.source, false);
             ctx.game
                 .record_player_damage_assignment(sa.source, Some(target_player), dealt, false);
+            super::life_lose_effect::fire_life_lost_all(ctx, target_player, dealt, sa.source);
+            if let Some(source) = sa.source { apply_noncombat_lifelink(ctx, sa, source, dealt); }
         }
 
         // Record damage dealt by source for TotalDamageDoneByThisTurn SVar
@@ -300,8 +302,8 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
                     }
                 }
             } else {
-                ctx.game
-                    .deal_damage_to_card_from(target_card, damage, sa.source, false);
+                let dealt = ctx.game.deal_damage_to_card_from(target_card, damage, sa.source, false);
+                if let Some(source) = sa.source { apply_noncombat_lifelink(ctx, sa, source, dealt); }
             }
 
             // Record damage dealt by source for TotalDamageDoneByThisTurn SVar
@@ -362,6 +364,24 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
     }
 
     let _ = crate::ability::spell_ability_effect::replace_dying(ctx.game, sa);
+}
+
+pub(super) fn apply_noncombat_lifelink(ctx: &mut EffectContext, sa: &SpellAbility, source: crate::ids::CardId, dealt: i32) {
+    let card = ctx.game.card(source);
+    if dealt <= 0 || !card.has_lifelink() { return; }
+    let controller = card.controller;
+    if crate::staticability::static_ability_cant_gain_lose_pay_life::cant_gain_life(ctx.game, controller) { return; }
+    let mut event = crate::replacement::replacement_handler::ReplacementEvent::GainLife { player: controller, amount: dealt };
+    let result = crate::replacement::replacement_handler::apply_replacements(ctx.game, &mut event);
+    if matches!(result, crate::replacement::ReplacementResult::Skipped | crate::replacement::ReplacementResult::Replaced) { return; }
+    let amount = if let crate::replacement::replacement_handler::ReplacementEvent::GainLife { amount, .. } = event { amount } else { dealt };
+    if amount <= 0 { return; }
+    let gained = ctx.game.player_gain_life(controller, amount);
+    if gained <= 0 { return; }
+    ctx.trigger_handler.run_trigger(crate::trigger::TriggerType::LifeGained, crate::event::RunParams {
+        player: Some(controller), life_amount: Some(gained), source_card: Some(source), source_sa: Some(sa.clone()),
+        first_time: Some(ctx.game.player(controller).life_gained_this_turn == gained), ..Default::default()
+    }, false);
 }
 
 /// Resolve the NumDmg$ parameter, supporting both integer literals and SVar

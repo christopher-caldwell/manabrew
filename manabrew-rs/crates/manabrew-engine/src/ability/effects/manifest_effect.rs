@@ -108,7 +108,7 @@ fn manifest_single_card(
     }
 
     emit_zone_trigger(
-        ctx.trigger_handler,
+        ctx.trigger_handler, ctx.game,
         card_id,
         old_zone,
         ZoneType::Battlefield,

@@ -94,6 +94,8 @@ pub(super) fn move_cards(
     }
 
     let mut moved = Vec::new();
+    let defer_entry_events = dest_zone == ZoneType::Battlefield && ordered.len() > 1;
+    let mut deferred_entries = Vec::new();
 
     for &card_id in &ordered {
         if origin_zone == ZoneType::Library {
@@ -132,7 +134,9 @@ pub(super) fn move_cards(
             dest_zone,
             dest_owner,
             lib_position,
+            defer_entry_events,
         );
+        if defer_entry_events { deferred_entries.push((card_id, old_zone, final_dest)); }
         if old_zone == ZoneType::Battlefield && final_dest != ZoneType::Battlefield {
             ctx.trigger_handler.unregister_active_triggers(card_id);
         }
@@ -148,7 +152,8 @@ pub(super) fn move_cards(
                     ctx.trigger_handler
                         .register_active_trigger(ctx.game, meld_id);
                 }
-                emit_zone_trigger(ctx.trigger_handler, meld_id, mz, dest_zone);
+                if defer_entry_events { deferred_entries.push((meld_id, mz, dest_zone)); }
+                else { emit_zone_trigger(ctx.trigger_handler, ctx.game, meld_id, mz, dest_zone); }
                 if mz == ZoneType::Battlefield && dest_zone != ZoneType::Battlefield {
                     ctx.trigger_handler.unregister_active_triggers(meld_id);
                 }
@@ -156,6 +161,11 @@ pub(super) fn move_cards(
             }
         }
     }
+
+    for (card_id, origin, destination) in deferred_entries {
+        emit_zone_trigger(ctx.trigger_handler, ctx.game, card_id, origin, destination);
+    }
+    if defer_entry_events { ctx.trigger_handler.flush_waiting_triggers(ctx.game); }
 
     // Searched$ — force trigger even without Library origin
     if sa.ir.searched && origin_zone != ZoneType::Library {

@@ -39,7 +39,7 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
         ctx.game
             .move_card(top_card, ZoneType::Graveyard, controller);
         super::emit_zone_trigger(
-            ctx.trigger_handler,
+            ctx.trigger_handler, ctx.game,
             top_card,
             ZoneType::Library,
             ZoneType::Graveyard,

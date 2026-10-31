@@ -88,7 +88,7 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
         let old_zone = ctx.game.card(card_id).zone;
         let owner = ctx.game.card(card_id).owner;
         ctx.move_card(card_id, ZoneType::Exile, owner);
-        super::emit_zone_trigger(ctx.trigger_handler, card_id, old_zone, ZoneType::Exile);
+        super::emit_zone_trigger(ctx.trigger_handler, ctx.game, card_id, old_zone, ZoneType::Exile);
 
         if ctx.game.card(card_id).is_token {
             continue;

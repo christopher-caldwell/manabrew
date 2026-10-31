@@ -31,6 +31,9 @@ pub struct Trigger {
     #[serde(skip, default)]
     pub ir: TriggerIr,
     pub execute: String,
+    /// Definition bound to a dynamically granted trigger before its grant can disappear.
+    #[serde(default)]
+    pub execute_definition: Option<String>,
     pub optional: bool,
     pub description: String,
     pub static_trigger: bool,
@@ -991,7 +994,8 @@ impl Trigger {
         } else {
             let door = self.base.card_trait_base.get_card_state_name();
             let room_face = door.and_then(|door| host.room_face(door));
-            let svar_text = room_face.and_then(|face| face.svars.get(&self.execute).map(String::as_str))
+            let svar_text = self.execute_definition.as_deref()
+                .or_else(|| room_face.and_then(|face| face.svars.get(&self.execute).map(String::as_str)))
                 .or_else(|| host.get_s_var(&self.execute)).map(str::to_string).unwrap_or_else(|| {
                 panic!(
                     "Trigger::build_triggered_spell_ability missing/empty Execute SVar: host={} execute={} trigger_index={} description={}",
@@ -1394,6 +1398,7 @@ pub fn parse_trigger(raw: &str, next_id: &mut u32) -> Option<Trigger> {
         mode,
         ir,
         execute,
+        execute_definition: None,
         optional,
         description,
         static_trigger,

@@ -16,7 +16,15 @@ pub(super) fn resolve_stack_removal(
     lib_position: &str,
     _controller: PlayerId,
 ) {
-    let target_card = if sa.uses_targeting() {
+    // A sub-ability may inherit its parent's stack target without acquiring
+    // target restrictions of its own (e.g. Narset's Reversal).
+    let stack_target = if sa.uses_targeting() || sa.defined().is_some_and(|d| d.eq_ignore_ascii_case("Targeted")) {
+        sa.target_chosen.target_stack_entry
+    } else { None };
+    let target_card = if let Some(id) = stack_target {
+        ctx.game.stack.iter().find(|entry| entry.id == id)
+            .and_then(|entry| entry.spell_ability.source)
+    } else if sa.uses_targeting() || sa.defined().is_some_and(|d| d.eq_ignore_ascii_case("Targeted")) {
         sa.target_chosen.target_card
     } else if let Some(src) = sa
         .trigger_source
@@ -46,6 +54,13 @@ pub(super) fn resolve_stack_removal(
     let old_zone = ctx.game.card(card_id).zone;
     let dest_owner = ctx.game.card(card_id).owner;
     ctx.move_card(card_id, dest_zone, dest_owner);
+    if ctx.game.card(card_id).zone != ZoneType::Stack {
+        if let Some(id) = stack_target {
+            ctx.game.stack.remove_by_id(id);
+        } else if let Some(id) = ctx.game.stack.find_by_source_card(card_id).map(|entry| entry.id) {
+            ctx.game.stack.remove_by_id(id);
+        }
+    }
 
     // ExiledWith for exile
     if dest_zone == ZoneType::Exile {
@@ -94,5 +109,81 @@ pub(super) fn resolve_stack_removal(
         }
     }
 
-    emit_zone_trigger(ctx.trigger_handler, card_id, old_zone, dest_zone);
+    emit_zone_trigger(ctx.trigger_handler, ctx.game, card_id, old_zone, dest_zone);
+}
+
+#[cfg(test)]
+mod targeted_stack_bounce_regression {
+    use crate::{agent::{PassAgent, PlayerAgent}, card::Card, game::GameState,
+        game_loop::GameLoop, ids::{CardId, PlayerId}, spellability::build_spell_ability,
+        zone::magic_stack::StackEntry};
+    use forge_foundation::{CardTypeLine, ColorSet, ManaCost, ZoneType};
+
+    fn push(game: &mut GameState, sa: crate::spellability::SpellAbility) -> u32 {
+        game.stack.push(StackEntry { id: 0, spell_ability: sa, is_creature_spell: false,
+            is_permanent_spell: false, is_pending_cast: false, cast_from_zone: None,
+            optional_trigger_decider: None, optional_trigger_description: None, optional_trigger_source_name: None })
+    }
+    #[test]
+    fn inherited_stack_target_is_returned_and_decoy_remains() {
+        let mut game = GameState::new(&["A", "B"], 40);
+        let player = PlayerId(0);
+        let mut ids = Vec::new();
+        for name in ["Target", "Decoy", "Reversal"] {
+            let id = game.create_card(Card::new(CardId(0), name.into(), player,
+                CardTypeLine::parse("Instant"), ManaCost::parse(""), ColorSet::COLORLESS, None, None, vec![], vec![]));
+            game.move_card(id, ZoneType::Stack, player); ids.push(id);
+        }
+        let target = build_spell_ability(&game, ids[0], "SP$ GainLife | Defined$ You | LifeAmount$ 1", player);
+        let target_id = push(&mut game, target);
+        let decoy = build_spell_ability(&game, ids[1], "SP$ Draw | Defined$ You | NumCards$ 1", player);
+        let decoy_id = push(&mut game, decoy);
+        let mut bounce = build_spell_ability(&game, ids[2], "DB$ ChangeZone | Origin$ Stack | Destination$ Hand | Defined$ Targeted", player);
+        bounce.is_trigger = true; bounce.target_chosen.target_stack_entry = Some(target_id); push(&mut game,bounce);
+        let mut agents: Vec<Box<dyn PlayerAgent>> = (0..2).map(|_| Box::new(PassAgent) as Box<dyn PlayerAgent>).collect();
+        GameLoop::new(2).resolve_stack(&mut game, &mut agents);
+        assert_eq!(game.card(ids[0]).zone, ZoneType::Hand);
+        assert!(game.stack.iter().all(|e| e.id != target_id));
+        assert!(game.stack.iter().any(|e| e.id == decoy_id));
+    }
+    #[test]
+    fn missing_target_does_not_bounce_the_source_or_a_decoy() {
+        let mut game = GameState::new(&["A", "B"], 40);
+        let player = PlayerId(0);
+        let mut ids = Vec::new();
+        for name in ["Decoy", "Reversal"] {
+            let id = game.create_card(Card::new(CardId(0), name.into(), player,
+                CardTypeLine::parse("Instant"), ManaCost::parse(""), ColorSet::COLORLESS, None, None, vec![], vec![]));
+            game.move_card(id, ZoneType::Stack, player); ids.push(id);
+        }
+        let decoy = build_spell_ability(&game, ids[0], "SP$ Draw | Defined$ You | NumCards$ 1", player);
+        let decoy_id = push(&mut game, decoy);
+        let mut bounce = build_spell_ability(&game, ids[1], "DB$ ChangeZone | Origin$ Stack | Destination$ Hand | Defined$ Targeted", player);
+        bounce.is_trigger = true; bounce.target_chosen.target_stack_entry = Some(999); push(&mut game,bounce);
+        let mut agents: Vec<Box<dyn PlayerAgent>> = (0..2).map(|_| Box::new(PassAgent) as Box<dyn PlayerAgent>).collect();
+        GameLoop::new(2).resolve_stack(&mut game, &mut agents);
+        assert_eq!(game.card(ids[0]).zone, ZoneType::Stack);
+        assert!(game.stack.iter().any(|e| e.id == decoy_id));
+    }
+
+    #[test]
+    fn copy_then_inherited_bounce_removes_original_and_keeps_copy() {
+        let mut game = GameState::new(&["A", "B"], 40);
+        let player = PlayerId(0);
+        let target_rules = forge_carddb::parse_card_script("Name:Original\nTypes:Instant\nA:SP$ GainLife | Defined$ You | LifeAmount$ 1").unwrap();
+        let reversal_rules = forge_carddb::parse_card_script("Name:Reversal\nTypes:Instant\nA:SP$ CopySpellAbility | ValidTgts$ Instant,Sorcery | SubAbility$ DBBounce\nSVar:DBBounce:DB$ ChangeZone | Origin$ Stack | Destination$ Hand | Defined$ Targeted").unwrap();
+        let target = game.create_card(Card::from_rules(&target_rules, player));
+        let reversal = game.create_card(Card::from_rules(&reversal_rules, player));
+        game.move_card(target, ZoneType::Stack, player); game.move_card(reversal, ZoneType::Stack, player);
+        let original = build_spell_ability(&game, target, "SP$ GainLife | Defined$ You | LifeAmount$ 1", player);
+        let original_id = push(&mut game, original);
+        let mut copy = build_spell_ability(&game, reversal, "SP$ CopySpellAbility | ValidTgts$ Instant,Sorcery | SubAbility$ DBBounce", player);
+        copy.target_chosen.target_stack_entry = Some(original_id); push(&mut game, copy);
+        let mut agents: Vec<Box<dyn PlayerAgent>> = (0..2).map(|_| Box::new(PassAgent) as Box<dyn PlayerAgent>).collect();
+        GameLoop::new(2).resolve_stack(&mut game, &mut agents);
+        assert_eq!(game.card(target).zone, ZoneType::Hand);
+        assert!(game.stack.iter().all(|e| e.id != original_id));
+        assert!(game.stack.iter().any(|e| e.spell_ability.is_copy));
+    }
+
 }

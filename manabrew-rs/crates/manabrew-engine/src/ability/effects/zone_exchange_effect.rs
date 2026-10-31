@@ -82,6 +82,6 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
     ctx.move_card(obj1, zone2, controller);
     ctx.move_card(obj2, zone1, controller);
 
-    super::emit_zone_trigger(ctx.trigger_handler, obj1, old1, zone2);
-    super::emit_zone_trigger(ctx.trigger_handler, obj2, old2, zone1);
+    super::emit_zone_trigger(ctx.trigger_handler, ctx.game, obj1, old1, zone2);
+    super::emit_zone_trigger(ctx.trigger_handler, ctx.game, obj2, old2, zone1);
 }

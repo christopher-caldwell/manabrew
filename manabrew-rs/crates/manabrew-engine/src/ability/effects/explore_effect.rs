@@ -85,7 +85,7 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
             let owner = ctx.game.card(top_card).owner;
             ctx.move_card(top_card, ZoneType::Hand, owner);
             emit_zone_trigger(
-                ctx.trigger_handler,
+                ctx.trigger_handler, ctx.game,
                 top_card,
                 ZoneType::Library,
                 ZoneType::Hand,
@@ -120,7 +120,7 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
                 let owner = ctx.game.card(top_card).owner;
                 ctx.move_card(top_card, ZoneType::Graveyard, owner);
                 emit_zone_trigger(
-                    ctx.trigger_handler,
+                    ctx.trigger_handler, ctx.game,
                     top_card,
                     ZoneType::Library,
                     ZoneType::Graveyard,

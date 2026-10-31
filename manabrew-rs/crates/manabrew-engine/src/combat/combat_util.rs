@@ -60,10 +60,13 @@ pub fn can_attack_defender(game: &GameState, attacker_id: CardId, defender: Defe
 
     // Check per-defender CantAttack static abilities
     if let DefenderId::Player(pid) = defender {
-        if !crate::staticability::static_ability_can_attack_defender::can_attack_defender(
-            &game.cards,
-            card,
-            pid,
+        if static_ability_cant_attack_block::cant_attack(game, &game.cards, card, pid) {
+            return false;
+        }
+        // CanAttackDefender is an exception for creatures with defender,
+        // not a prerequisite imposed on every ordinary creature.
+        if card.has_defender() && !crate::staticability::static_ability_can_attack_defender::can_attack_defender(
+            &game.cards, card, pid,
         ) {
             return false;
         }
@@ -397,10 +400,13 @@ pub fn can_attack_next_turn(game: &GameState, attacker_id: CardId, defender: Def
         return false;
     }
     if let DefenderId::Player(pid) = defender {
-        if !crate::staticability::static_ability_can_attack_defender::can_attack_defender(
-            &game.cards,
-            card,
-            pid,
+        if static_ability_cant_attack_block::cant_attack(game, &game.cards, card, pid) {
+            return false;
+        }
+        // CanAttackDefender is an exception for creatures with defender,
+        // not a prerequisite imposed on every ordinary creature.
+        if card.has_defender() && !crate::staticability::static_ability_can_attack_defender::can_attack_defender(
+            &game.cards, card, pid,
         ) {
             return false;
         }

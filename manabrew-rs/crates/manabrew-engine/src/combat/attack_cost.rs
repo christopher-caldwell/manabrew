@@ -69,3 +69,24 @@ pub fn get_attack_cost(cards: &[Card], attacker: &Card, defender: DefenderId) ->
 
     total_cost
 }
+
+#[cfg(test)]
+mod scoped_tax_regression {
+    use super::*;
+    use crate::game::GameState;
+    use crate::ids::PlayerId;
+    use forge_carddb::parse_card_script;
+
+    #[test]
+    fn tax_is_charged_only_for_its_controller_as_defender() {
+        let mut game = GameState::new(&["A", "B", "C"], 40);
+        let creature = parse_card_script("Name:Attacker\nTypes:Creature Human\nPT:2/2").unwrap();
+        let tax = parse_card_script("Name:Tax\nTypes:Enchantment\nS:Mode$ CantAttackUnless | ValidCard$ Creature | Target$ You | Cost$ 2").unwrap();
+        let a = game.create_card(Card::from_rules(&creature, PlayerId(0)));
+        let t = game.create_card(Card::from_rules(&tax, PlayerId(1)));
+        game.move_card(a, ZoneType::Battlefield, PlayerId(0));
+        game.move_card(t, ZoneType::Battlefield, PlayerId(1));
+        assert_eq!(get_attack_cost(&game.cards, game.card(a), DefenderId::Player(PlayerId(1))), 2);
+        assert_eq!(get_attack_cost(&game.cards, game.card(a), DefenderId::Player(PlayerId(2))), 0);
+    }
+}

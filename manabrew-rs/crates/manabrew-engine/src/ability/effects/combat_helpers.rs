@@ -140,6 +140,7 @@ pub(crate) fn add_to_combat(
     let Some(attacking) = attacking else {
         return false;
     };
+    let attacking = if attacking_param == crate::parsing::keys::NINJUTSU { "TriggeredDefender" } else { attacking };
     let defenders = resolve_attack_defenders(ctx, sa, card_id, attacking);
     let Some(defender) = choose_defender(ctx, sa, controller, &defenders) else {
         return false;

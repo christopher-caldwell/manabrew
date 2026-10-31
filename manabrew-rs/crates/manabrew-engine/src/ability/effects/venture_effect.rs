@@ -218,7 +218,7 @@ fn complete_dungeon(ctx: &mut EffectContext, player: PlayerId, dungeon_id: CardI
     // Move completed dungeon out of command zone
     let old_zone = ctx.game.card(dungeon_id).zone;
     ctx.move_card(dungeon_id, ZoneType::Exile, player);
-    super::emit_zone_trigger(ctx.trigger_handler, dungeon_id, old_zone, ZoneType::Exile);
+    super::emit_zone_trigger(ctx.trigger_handler, ctx.game, dungeon_id, old_zone, ZoneType::Exile);
 
     // Fire dungeon completed trigger
     ctx.trigger_handler.run_trigger(

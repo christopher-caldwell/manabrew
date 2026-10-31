@@ -173,6 +173,11 @@ impl From<PhaseType> for AbilityValue {
 pub struct RunParams {
     pub card: Option<CardId>,
     pub card_lki: Option<CardId>,
+    /// Attachment target and zone identity captured at this zone event.
+    #[serde(default)]
+    pub lki_attached_to: Option<(CardId, u64)>,
+    #[serde(default)]
+    pub lki_attachment_captured: bool,
     /// Additional card collection payload used by many Java triggers (AbilityKey.Cards).
     pub cards: Option<Vec<CardId>>,
     /// Batched zone-change payload used by Java's CardZoneTable triggers.
@@ -319,6 +324,7 @@ pub struct RunParams {
     /// Used by `Number$ N` triggers to compare against the exact draw count
     /// at fire time (not at deferred match time).
     pub drawn_this_turn_snapshot: Option<i32>,
+    pub first_card_in_draw_step_snapshot: Option<bool>,
     /// Players for whom this was the first relevant event this turn.
     pub first_time_players: Option<Vec<PlayerId>>,
     /// Java AbilityKey.AllVotes.

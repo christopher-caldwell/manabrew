@@ -228,18 +228,21 @@ impl CombatState {
     /// if any combatant was removed.
     ///
     /// Mirrors Java Forge's `Combat.removeAbsentCombatants()`.
-    pub fn remove_absent_combatants(&mut self, cards: &[crate::card::Card]) -> bool {
+    pub fn remove_absent_combatants(&mut self, cards: &mut [crate::card::Card]) -> bool {
         let before_attackers = self.attackers.len();
         let before_blockers = self.blockers.len();
 
         self.attackers.retain(|&(id, _)| {
-            let card = &cards[id.index()];
+            let card = &mut cards[id.index()];
             let timestamp_ok = self
                 .attacker_zone_timestamps
                 .get(&id)
                 .map(|&ts| ts == card.zone_timestamp)
                 .unwrap_or(true);
-            card.zone == ZoneType::Battlefield && card.is_creature() && timestamp_ok
+            let still_attacking = card.zone == ZoneType::Battlefield
+                && !card.phased_out && card.is_creature() && timestamp_ok;
+            if !still_attacking { card.clear_attacking_player(); }
+            still_attacking
         });
         self.blockers.retain(|&(id, _)| {
             let card = &cards[id.index()];
@@ -248,7 +251,7 @@ impl CombatState {
                 .get(&id)
                 .map(|&ts| ts == card.zone_timestamp)
                 .unwrap_or(true);
-            card.zone == ZoneType::Battlefield && card.is_creature() && timestamp_ok
+            card.zone == ZoneType::Battlefield && !card.phased_out && card.is_creature() && timestamp_ok
         });
 
         let attacker_ids: HashSet<CardId> = self.attackers.iter().map(|(a, _)| *a).collect();

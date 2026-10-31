@@ -64,8 +64,9 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
 
     // Determine the player whose library we dig through.
     let dig_player = sa
-        .target_chosen
-        .target_player
+        .uses_targeting()
+        .then_some(sa.target_chosen.target_player)
+        .flatten()
         .or_else(|| {
             sa.defined()
                 .and_then(|d| resolve_defined_player(d, sa.activating_player, ctx.game))
@@ -244,7 +245,7 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
             ctx.trigger_handler.register_active_trigger(ctx.game, id);
             let _ = super::add_to_combat(ctx, sa, id, keys::ATTACKING);
         }
-        emit_zone_trigger(ctx.trigger_handler, id, ZoneType::Library, dest_zone1);
+        emit_zone_trigger(ctx.trigger_handler, ctx.game, id, ZoneType::Library, dest_zone1);
     }
 
     // Move rest to dest_zone2.
@@ -275,7 +276,7 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
             if dest_zone2 == ZoneType::Battlefield {
                 ctx.trigger_handler.register_active_trigger(ctx.game, id);
             }
-            emit_zone_trigger(ctx.trigger_handler, id, ZoneType::Library, dest_zone2);
+            emit_zone_trigger(ctx.trigger_handler, ctx.game, id, ZoneType::Library, dest_zone2);
         }
     }
 

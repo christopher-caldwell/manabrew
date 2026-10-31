@@ -1,5 +1,8 @@
 <h1 align="center">Manabrew</h1>
 
+This fork maintains the engine used by Collection Plan's headless Commander
+research. See [fork scope and runtime workflow](docs/collection-plan-engine.md).
+
 > **Parity is DEPRECATED and NOT FUNCTIONING.** Do not run `yarn parity`, the parity harness (`manabrew-rs/crates/parity`), the parity debugger, or `DeterministicController`. Do not limit or shape a change to keep parity behavior; ignore any instruction here that exists only to keep parity runs passing.
 
 <p align="center">

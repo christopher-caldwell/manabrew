@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use forge_foundation::ZoneType;
 
@@ -104,6 +104,7 @@ impl DelayedTrigger {
             mode: dyn_clone::clone_box(&*self.trigger_mode),
             ir: crate::trigger::trigger_ir::TriggerIr::from_params(delayed_params),
             execute: self.execute_svar.clone(),
+            execute_definition: None,
             optional: false,
             description: String::new(),
             static_trigger: false,
@@ -141,6 +142,13 @@ pub struct TriggerPushLog {
 
 type MatchedTrigger = (PendingTrigger, PlayerId, u64, u8, u32);
 
+#[derive(Debug, Clone)]
+struct DeferredDepartureBatch {
+    lki: Box<GameState>,
+    active: Vec<ActiveTrigger>,
+    waiting: Vec<TriggerWaiting>,
+}
+
 /// Mirrors Java's TriggerHandler — central trigger dispatcher.
 /// In Java, lives on Game. In Rust, lives on GameLoop because
 /// active_triggers and waiting_triggers are transient processing state.
@@ -160,6 +168,10 @@ pub struct TriggerHandler {
     /// SBA (e.g. Raptor Hatchling's enrage) are not lost.
     /// Tuple: (PendingTrigger, controller, zone timestamp, trigger bucket, trigger order).
     pre_matched_triggers: Vec<MatchedTrigger>,
+    deferred_departures: Vec<DeferredDepartureBatch>,
+    // Trigger-event limits are distinct from activated-ability counters. The
+    // zone timestamp identifies a new object after a zone change.
+    trigger_counts: HashMap<(CardId, u64, u32), (u32, u32, u32)>,
 }
 
 impl TriggerHandler {
@@ -174,6 +186,8 @@ impl TriggerHandler {
             all_suppressed: false,
             next_trigger_id: 0,
             pre_matched_triggers: Vec::new(),
+            deferred_departures: Vec::new(),
+            trigger_counts: HashMap::new(),
         }
     }
 
@@ -294,10 +308,44 @@ impl TriggerHandler {
         self.pre_matched_triggers.extend(matched);
     }
 
+    /// Retain the pre-departure object context and actual destinations until
+    /// the effect resolution unwinds; matching deep inside nested effects can
+    /// exhaust the engine's stack, and must not run any ability early.
+    pub fn match_departure_batch(&mut self, before: &GameState, after: &GameState, events: Vec<(TriggerType, RunParams)>) {
+        if events.is_empty() { return; }
+        let saved_active = std::mem::take(&mut self.active_triggers);
+        let mut lki = after.boxed_snapshot();
+        lki.pre_sba_battlefield = before.cards.iter().filter(|card| card.zone == forge_foundation::ZoneType::Battlefield).map(|card|card.id).collect();
+        for old in before.cards.iter().filter(|card| card.zone == forge_foundation::ZoneType::Battlefield) {
+            let actual_zone = lki.card(old.id).zone;
+            let mut snapshot = old.clone();
+            snapshot.lki_counters = Some(old.counters.clone());
+            snapshot.zone = actual_zone;
+            lki.cards[old.id.index()] = snapshot;
+        }
+        self.reset_active_triggers(before);
+        let waiting = events.into_iter().map(|(mode,params)|self.build_waiting_trigger(mode,params)).collect();
+        let active = std::mem::replace(&mut self.active_triggers,saved_active);
+        self.deferred_departures.push(DeferredDepartureBatch {lki,active,waiting});
+    }
+
+    fn match_deferred_departures(&mut self) {
+        let batches = std::mem::take(&mut self.deferred_departures);
+        for batch in batches {
+            let waiting = std::mem::replace(&mut self.waiting_triggers,batch.waiting);
+            let active = std::mem::replace(&mut self.active_triggers,batch.active);
+            let matched = self.match_waiting_triggers(&batch.lki);
+            self.pre_matched_triggers.extend(matched);
+            self.waiting_triggers = waiting;
+            self.active_triggers = active;
+        }
+    }
+
     /// Mirrors Java's runWaitingTriggers().
     /// Drains waiting queue, matches triggers, returns PendingTriggers.
     /// The caller (game_loop) handles OptionalDecider$ prompting.
     pub fn run_waiting_triggers(&mut self, game: &GameState) -> Vec<PendingTrigger> {
+        self.match_deferred_departures();
         // Start with any triggers that were pre-matched (flushed before SBA).
         let mut entries: Vec<MatchedTrigger> = std::mem::take(&mut self.pre_matched_triggers);
 
@@ -575,6 +623,21 @@ impl TriggerHandler {
                     &event.params,
                 );
                 if can_run {
+                    let max_extra = if trigger.ir.activation_limit.is_some() || trigger.ir.game_activation_limit.is_some() {
+                        let counts = self.trigger_counts.entry((card_id, card.zone_timestamp, trigger.id))
+                            .or_insert((game.turn.turn_number, 0, 0));
+                        if counts.0 != game.turn.turn_number {
+                            counts.0 = game.turn.turn_number;
+                            counts.1 = 0;
+                        }
+                        let per_turn = trigger.ir.activation_limit.unwrap_or(u32::MAX).saturating_sub(counts.1);
+                        let per_game = trigger.ir.game_activation_limit.unwrap_or(u32::MAX).saturating_sub(counts.2);
+                        let remaining = per_turn.min(per_game);
+                        if remaining == 0 { continue; }
+                        counts.1 += 1;
+                        counts.2 += 1;
+                        Some(remaining - 1)
+                    } else { None };
                     let sa = trigger.build_triggered_spell_ability(
                         game,
                         card_id,
@@ -634,6 +697,13 @@ impl TriggerHandler {
                         trigger,
                         &event.params,
                     );
+                    let extra = max_extra.map_or(extra, |limit| extra.min(limit.min(i32::MAX as u32) as i32));
+                    if max_extra.is_some() {
+                        if let Some(counts) = self.trigger_counts.get_mut(&(card_id, card.zone_timestamp, trigger.id)) {
+                            counts.1 += extra as u32;
+                            counts.2 += extra as u32;
+                        }
+                    }
                     for _ in 0..extra {
                         let sa2 = trigger.build_triggered_spell_ability(
                             game,
@@ -736,8 +806,8 @@ impl TriggerHandler {
                 );
                 sa.is_trigger = true;
                 sa.trigger_source = Some(delayed.source_card);
-                sa.trigger_source_zone_timestamp =
-                    Some(game.card(delayed.source_card).zone_timestamp);
+                sa.trigger_source_zone_timestamp = delayed.source_zone_timestamp
+                    .or(Some(game.card(delayed.source_card).zone_timestamp));
                 sa.trigger_remembered_amount = delayed.remembered_amount;
                 // Propagate remembered cards (e.g. `RememberObjects$ Remembered`
                 // captured at registration) so the executed ability can target
@@ -1287,6 +1357,7 @@ impl TriggerHandler {
     pub fn clear_waiting_triggers(&mut self) {
         self.waiting_triggers.clear();
         self.pre_matched_triggers.clear();
+        self.deferred_departures.clear();
     }
 
     pub fn on_player_lost(&mut self, player: PlayerId) {
@@ -1522,9 +1593,6 @@ impl TriggerHandler {
         if !trigger.requirements_check(game, host_card) {
             return false;
         }
-        if !trigger.check_activation_limit(game, host_card) {
-            return false;
-        }
 
         // DisableTriggers static ability check (e.g. Hushbringer).
         // Mirrors Java's StaticAbilityDisableTriggers.disabled().
@@ -1745,4 +1813,23 @@ mod tests {
             Some(PlayerId(0))
         );
     }
+    #[test]
+    fn spell_cast_trigger_records_typed_activator() {
+        let rules = parse_card_script(
+            "Name:Fixture\nManaCost:2 U\nTypes:Enchantment\nT:Mode$ SpellCast | ValidCard$ Card | ValidActivatingPlayer$ Opponent | TriggerZones$ Battlefield | Execute$ Draw\nSVar:Draw:DB$ Draw | Defined$ You | UnlessCost$ 1 | UnlessPayer$ TriggeredActivator | NumCards$ 1 | OptionalDecider$ You",
+        ).unwrap();
+        let mut game = GameState::new(&["A", "B", "C", "D"], 40);
+        let mut card = Card::from_rules(&rules, PlayerId(0));
+        card.id = crate::ids::CardId(0);
+        card.zone = forge_foundation::ZoneType::Battlefield;
+        game.cards.push(card);
+        game.add_card_to_zone(forge_foundation::ZoneType::Battlefield, PlayerId(0), crate::ids::CardId(0));
+        let mut handler = TriggerHandler::new();
+        handler.register_active_trigger(&game, crate::ids::CardId(0));
+        let pending = handler.run_trigger_with_game(&game, TriggerType::SpellCast,
+            RunParams { spell_card: Some(crate::ids::CardId(0)), spell_controller: Some(PlayerId(2)), ..Default::default() }, false);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].entry.spell_ability.get_triggering_player(crate::ability::AbilityKey::Activator), Some(PlayerId(2)));
+    }
+
 }

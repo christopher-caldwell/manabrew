@@ -118,6 +118,10 @@ pub fn get_proto_type(sa: &SpellAbility, original: &Card, new_owner: crate::ids:
     // Copies are tokens for zone-change purposes (cease to exist off battlefield).
     copy.set_is_token(true);
 
+    if sa.ir.non_legendary {
+        copy.remove_type("Legendary");
+    }
+
     // Apply SetColor$ (e.g. Embalm sets color to White).
     if let Some(set_color) = sa.ir.set_color.as_deref() {
         copy.set_color(ColorSet::from_names(set_color));

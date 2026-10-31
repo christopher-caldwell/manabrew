@@ -395,3 +395,56 @@ impl AttackConstraints {
         result
     }
 }
+
+#[cfg(test)]
+mod scoped_combat_regression {
+    use super::*;
+    use crate::card::Card;
+    use forge_carddb::parse_card_script;
+    use std::collections::{HashMap, HashSet};
+
+    fn fixture_cards() -> Vec<Card> {
+        let rules = parse_card_script("Name:Attacker\nTypes:Creature Human\nPT:2/2").unwrap();
+        vec![Card::from_rules(&rules, PlayerId(0)), Card::from_rules(&rules, PlayerId(0))]
+    }
+    fn required(id: CardId, defender: DefenderId) -> AttackRequirement {
+        AttackRequirement { attacker: id, must_attack_any: true, must_attack_defender: None,
+            goaded_by: None, defender_specific: HashMap::from([(defender, 1)]) }
+    }
+    fn constraints() -> AttackConstraints {
+        let defender = DefenderId::Player(PlayerId(1));
+        AttackConstraints { possible_attackers: vec![CardId(0), CardId(1)],
+            possible_defenders: vec![defender],
+            global_restrictions: GlobalAttackRestrictions { max: Some(1), defender_max: HashMap::new() },
+            restrictions: HashMap::new(),
+            requirements: HashMap::from([(CardId(0), required(CardId(0), defender)),
+                                         (CardId(1), required(CardId(1), defender))]) }
+    }
+    #[test]
+    fn global_one_attacker_limit_selects_one_of_two_requirements() {
+        let cards = fixture_cards();
+        let c = constraints();
+        let defender = DefenderId::Player(PlayerId(1));
+        assert_eq!(c.count_violations(&[], &cards), 2);
+        assert_eq!(c.count_violations(&[(CardId(0), defender), (CardId(1), defender)], &cards), -1);
+        let (declaration, violations) = c.get_legal_attackers(&cards);
+        assert_eq!(declaration.len(), 1);
+        assert_eq!(violations, 1);
+        assert_eq!(c.count_violations(&declaration, &cards), 1);
+    }
+    #[test]
+    fn only_alone_and_per_defender_limits_reject_joint_declarations() {
+        let cards = fixture_cards();
+        let mut c = constraints();
+        c.global_restrictions.max = None;
+        let defender = DefenderId::Player(PlayerId(1));
+        c.global_restrictions.defender_max.insert(defender, 1);
+        c.restrictions.insert(CardId(0), AttackRestriction { attacker: CardId(0),
+            types: HashSet::from([AttackRestrictionType::OnlyAlone]), cant_attack: false,
+            cant_attack_defenders: vec![] });
+        assert_eq!(c.count_violations(&[(CardId(0), defender)], &cards), 1);
+        assert_eq!(c.count_violations(&[(CardId(0), defender), (CardId(1), defender)], &cards), -1);
+        c.global_restrictions.defender_max.clear();
+        assert_eq!(c.count_violations(&[(CardId(0), defender), (CardId(1), defender)], &cards), -1);
+    }
+}

@@ -1412,6 +1412,7 @@ fn lower_non_predicate(value: &str) -> Option<SelectorPredicate> {
         "basic" => SelectorPredicate::CardSupertype(CardSupertypeSelector::Basic),
         "snow" => SelectorPredicate::CardSupertype(CardSupertypeSelector::Snow),
         "token" => SelectorPredicate::Token(true),
+        "chosencard" => SelectorPredicate::CardState(CardStateSelector::ChosenCard),
         _ => SelectorPredicate::CardType(CardSelectorType::Subtype(value[3..].to_string())),
     };
     Some(SelectorPredicate::Not(Box::new(positive)))

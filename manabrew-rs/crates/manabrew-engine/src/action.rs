@@ -71,6 +71,14 @@ impl GameState {
         );
     }
 
+    /// Return the replacement-adjusted destination, even if a token ceases to exist.
+    pub fn move_card_with_agents_and_destination(
+        &mut self, card_id: CardId, dest_zone: ZoneType, dest_owner: PlayerId,
+        agents: &mut [Box<dyn PlayerAgent>], runtime: &mut ReplacementRuntime<'_>,
+    ) -> ZoneType {
+        self.move_card_internal(card_id, dest_zone, dest_owner, Some(agents), Some(runtime.trigger_handler), true, false)
+    }
+
     fn move_card_without_replacement(
         &mut self,
         card_id: CardId,
@@ -124,7 +132,7 @@ impl GameState {
         // Emit zone-change trigger for Hand → actual destination.
         let dest_zone = self.card(card_id).zone;
         crate::ability::effects::zone_triggers::emit_zone_trigger(
-            trigger_handler,
+            trigger_handler, self,
             card_id,
             ZoneType::Hand,
             dest_zone,
@@ -161,7 +169,7 @@ impl GameState {
         mut trigger_handler: Option<&mut TriggerHandler>,
         apply_move_replacement: bool,
         is_discard: bool,
-    ) {
+    ) -> ZoneType {
         let (src_zone, src_owner, was_permanent, was_land, is_token) = {
             let card = &self.cards[card_id.index()];
             (
@@ -340,9 +348,13 @@ impl GameState {
             if self.card(card_id).is_room() {
                 self.update_lki_snapshot(card_id);
             }
+            let attached = self.card(card_id).attached_to.map(|id| (id, self.card(id).zone_timestamp));
+            self.card_mut(card_id).lki_attached_to = attached;
             // `ControlGain$ LoseControl$ LeavesPlay` — drop the scheduled
             // revert since the card is no longer on the battlefield.
             crate::ability::effects::control_gain_effect::leaves_play_hook(self, card_id);
+            // A zone change creates a new object; it is no longer attacking.
+            self.card_mut(card_id).clear_attacking_player();
         }
         if src_zone != dest_zone
             && (host_left_battlefield
@@ -397,7 +409,7 @@ impl GameState {
             }
             apply_continuous_effects(self);
             debug_assert!(self.card_zone_location_matches_card(card_id));
-            return;
+            return dest_zone;
         }
 
         // Remove from source zone
@@ -524,7 +536,7 @@ impl GameState {
                 self.update_lki_snapshot(card_id);
                 apply_continuous_effects(self);
                 debug_assert!(self.card_zone_location_matches_card(card_id));
-                return;
+                return dest_zone;
             }
             ZoneType::Graveyard | ZoneType::Hand | ZoneType::Exile | ZoneType::Library => {
                 // Detach any attachments before resetting state.
@@ -726,7 +738,7 @@ impl GameState {
                     let returned_zone = self.card(exiled_id).zone;
                     handler.register_active_trigger(self, exiled_id);
                     crate::ability::effects::zone_triggers::emit_zone_trigger(
-                        handler,
+                        handler, self,
                         exiled_id,
                         ZoneType::Exile,
                         returned_zone,
@@ -737,6 +749,7 @@ impl GameState {
 
         apply_continuous_effects(self);
         debug_assert!(self.card_zone_location_matches_card(card_id));
+        dest_zone
     }
 
     /// Deal damage to a card (creature).
@@ -754,8 +767,8 @@ impl GameState {
         amount: i32,
         source: Option<CardId>,
         is_combat: bool,
-    ) {
-        self.deal_damage_to_card_from_with_agents(target, amount, source, is_combat, None);
+    ) -> i32 {
+        self.deal_damage_to_card_from_with_agents(target, amount, source, is_combat, None)
     }
 
     /// Deal damage to a card with source tracking and optional agents for RNG parity.
@@ -766,12 +779,12 @@ impl GameState {
         source: Option<CardId>,
         is_combat: bool,
         agents: Option<&mut [Box<dyn crate::agent::PlayerAgent>]>,
-    ) {
+    ) -> i32 {
         if amount <= 0 {
-            return;
+            return 0;
         }
         if !self.card(target).can_be_dealt_damage() {
-            return;
+            return 0;
         }
         let mut event = ReplacementEvent::DamageToCard {
             target,
@@ -810,8 +823,10 @@ impl GameState {
                 if dealt > 0 {
                     apply_replacements(self, &mut dealt_event);
                 }
+                return dealt;
             }
         }
+        0
     }
 
     /// Deal damage to a player.
@@ -1008,7 +1023,7 @@ impl GameState {
                 }
             }
             if let Some(handler) = trigger_handler.as_deref_mut() {
-                crate::ability::effects::emit_zone_trigger(handler, cid, zone, ZoneType::None);
+                crate::ability::effects::emit_zone_trigger(handler, self, cid, zone, ZoneType::None);
             }
             self.remove_card_from_zone(zone, controller, cid);
             self.cards[cid.index()].zone = ZoneType::None;
@@ -1025,7 +1040,7 @@ impl GameState {
             if zone == ZoneType::Battlefield && controller == player && owner != player {
                 if let Some(handler) = trigger_handler.as_deref_mut() {
                     crate::ability::effects::emit_zone_trigger(
-                        handler,
+                        handler, self,
                         cid,
                         ZoneType::Battlefield,
                         ZoneType::Exile,
@@ -1079,7 +1094,7 @@ impl GameState {
             self.card_mut(cid)
                 .set_lki_power_toughness(Some(lki_power), Some(lki_toughness));
             crate::ability::effects::emit_zone_trigger_with_lki_counters(
-                handler,
+                handler, self,
                 cid,
                 old_zone,
                 final_dest,
@@ -1105,7 +1120,7 @@ impl GameState {
         self.pre_sba_battlefield = self
             .cards
             .iter()
-            .filter(|c| c.zone == ZoneType::Battlefield)
+            .filter(|c| c.zone == ZoneType::Battlefield && !c.phased_out)
             .map(|c| c.id)
             .collect();
 
@@ -1221,6 +1236,7 @@ impl GameState {
             .clone()
             .iter()
             .flat_map(|&pid| self.cards_in_zone(ZoneType::Battlefield, pid).to_vec())
+            .filter(|&cid| !self.card(cid).phased_out)
             .collect();
 
         for cid in battlefield_cards {
@@ -1276,7 +1292,7 @@ impl GameState {
                         self.move_card(umbra_id, ZoneType::Graveyard, umbra_owner);
                         if let Some(handler) = trigger_handler.as_deref_mut() {
                             crate::ability::effects::emit_zone_trigger(
-                                handler,
+                                handler, self,
                                 umbra_id,
                                 old_zone,
                                 ZoneType::Graveyard,
@@ -1323,6 +1339,7 @@ impl GameState {
             .clone()
             .iter()
             .flat_map(|&pid| self.cards_in_zone(ZoneType::Battlefield, pid).to_vec())
+            .filter(|&cid| !self.card(cid).phased_out)
             .collect();
 
         for cid in battlefield_cards {
@@ -1343,6 +1360,7 @@ impl GameState {
             .clone()
             .iter()
             .flat_map(|&pid| self.cards_in_zone(ZoneType::Battlefield, pid).to_vec())
+            .filter(|&cid| !self.card(cid).phased_out)
             .collect();
         for cid in saga_cards {
             any_changes |=
@@ -1371,6 +1389,9 @@ impl GameState {
         for &pid in &self.player_order.clone() {
             let battlefield = self.cards_in_zone(ZoneType::Battlefield, pid).to_vec();
             for cid in battlefield {
+                if self.card(cid).phased_out {
+                    continue;
+                }
                 let p1 = self.card(cid).counter_count(&CounterType::P1P1);
                 let m1 = self.card(cid).counter_count(&CounterType::M1M1);
                 if p1 > 0 && m1 > 0 {
@@ -1424,6 +1445,9 @@ impl GameState {
             let mut by_name: std::collections::BTreeMap<String, Vec<CardId>> =
                 std::collections::BTreeMap::new();
             for cid in battlefield {
+                if self.card(cid).phased_out {
+                    continue;
+                }
                 let c = self.card(cid);
                 if !c.type_line.is_legendary() {
                     continue;
@@ -1462,7 +1486,7 @@ impl GameState {
                     }
                     if let Some(handler) = trigger_handler.as_deref_mut() {
                         crate::ability::effects::emit_zone_trigger(
-                            handler,
+                            handler, self,
                             cid,
                             old_zone,
                             ZoneType::Graveyard,
@@ -1482,6 +1506,7 @@ impl GameState {
                 .iter()
                 .filter(|c| {
                     c.zone == ZoneType::Battlefield
+                        && !c.phased_out
                         && c.type_line.has_subtype("Aura")
                         && !c.type_line.is_creature() // Bestowed auras that became creatures stay
                 })
@@ -1532,7 +1557,7 @@ impl GameState {
                 self.move_card(aura_id, ZoneType::Graveyard, owner);
                 if let Some(handler) = trigger_handler.as_deref_mut() {
                     crate::ability::effects::emit_zone_trigger(
-                        handler,
+                        handler, self,
                         aura_id,
                         old_zone,
                         ZoneType::Graveyard,
@@ -1605,6 +1630,7 @@ impl GameState {
             if *pid != player {
                 self.player_reset_drawn_this_turn(*pid);
                 let p = self.player_mut(*pid);
+                p.cast_lki_this_turn.clear();
                 p.life_started_this_turn_with = p.life;
                 p.life_gained_this_turn = 0;
                 p.life_gained_by_team_this_turn = 0;

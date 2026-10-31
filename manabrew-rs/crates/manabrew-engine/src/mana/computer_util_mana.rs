@@ -20,7 +20,10 @@ use super::{
 #[derive(Debug, Clone)]
 struct ManaAbilityRef {
     card_id: CardId,
+    source_zone_timestamp: u64,
+    source_zone: ZoneType,
     ability_index: Option<usize>,
+    ability_snapshot: Option<crate::ability::activated::ActivatedAbility>,
     atoms: Vec<u16>,
     amount: i32,
     mana_text: String,
@@ -29,6 +32,21 @@ struct ManaAbilityRef {
 }
 
 impl ManaAbilityRef {
+    // Ability indices are identities, not necessarily positions in the current vector.
+    // Reject a candidate if its source has changed objects/controllers or lost the
+    // specific ability since collection; retain the snapshot for its exact costs.
+    fn is_current(&self, game: &GameState, player: PlayerId) -> bool {
+        let card = game.card(self.card_id);
+        if card.zone != self.source_zone || card.zone_timestamp != self.source_zone_timestamp || card.controller != player {
+            return false;
+        }
+        match (&self.ability_snapshot, self.ability_index) {
+            (Some(snapshot), Some(index)) => card.activated_abilities.iter().any(|current| current.ability_index == index && current.ability_text == snapshot.ability_text),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
     fn can_pay_shard(&self, shard: ManaCostShard) -> bool {
         // Java's deterministic AutoPay treats empty `Combo ColorIdentity`
         // abilities as generic-pay candidates, then resolution produces no
@@ -629,6 +647,8 @@ fn auto_tap_lands_internal_with_ctx(
         );
         payment.colors_spent |= spent.colors_spent;
         payment.paying_mana.extend(spent.paying_mana);
+        payment.paying_mana_sources.extend(spent.paying_mana_sources);
+        payment.paying_mana_details.extend(spent.paying_mana_details);
     } else {
         pay_cost_from_pool(&mut unpaid, pool);
     }
@@ -645,6 +665,7 @@ fn auto_tap_lands_internal_with_ctx(
 
     // Guard counter mirrors Java's AutoPay.payManaCost() `guard++ < 128`.
     let mut guard = 0u32;
+    let mut rejected = std::collections::HashSet::new();
     while !unpaid.is_paid() && guard < 128 {
         guard += 1;
 
@@ -656,6 +677,8 @@ fn auto_tap_lands_internal_with_ctx(
             break;
         }
         let mut candidates = collect_sorted_candidates(game, player, &mana_ability_map);
+        candidates
+            .retain(|candidate| !rejected.contains(&(candidate.card_id, candidate.ability_index)));
         if candidates.is_empty() {
             break;
         }
@@ -677,6 +700,11 @@ fn auto_tap_lands_internal_with_ctx(
         let Some(chosen_atom) = choose_atom_for_shard(&sa_payment, to_pay) else {
             break;
         };
+        // Pay the tap before a self-sacrifice can remove the selected ability.
+        // No tap trigger is emitted until payment succeeds; undo a declined
+        // non-tap cost while the source remains on the battlefield.
+        let tapped_for_attempt = source_requires_tap(game, &sa_payment) && !game.card(sa_payment.card_id).tapped;
+        if tapped_for_attempt { game.tap(sa_payment.card_id); }
         // Pay non-tap ability costs (sacrifice, counter removal) through callback.
         // If payment fails (e.g. sacrifice declined), remove the candidate and retry.
         if !pay_non_tap_mana_ability_costs(
@@ -688,8 +716,9 @@ fn auto_tap_lands_internal_with_ctx(
             reserved_sacrifices,
             callback,
         ) {
+            if tapped_for_attempt && game.card(sa_payment.card_id).zone == ZoneType::Battlefield { game.untap(sa_payment.card_id); }
             // Java: candidate became unpayable; remove and continue.
-            candidates.retain(|c| c.card_id != sa_payment.card_id);
+            rejected.insert((sa_payment.card_id, sa_payment.ability_index));
             continue;
         }
 
@@ -712,6 +741,8 @@ fn auto_tap_lands_internal_with_ctx(
                 );
                 payment.colors_spent |= spent.colors_spent;
                 payment.paying_mana.extend(spent.paying_mana);
+                payment.paying_mana_sources.extend(spent.paying_mana_sources);
+        payment.paying_mana_details.extend(spent.paying_mana_details);
             } else {
                 for &atom in &trigger_atoms {
                     let _ = unpaid.try_pay_mana(atom, atom as u8);
@@ -774,6 +805,8 @@ fn auto_tap_lands_internal_with_ctx(
                     );
                     payment.colors_spent |= spent.colors_spent;
                     payment.paying_mana.extend(spent.paying_mana);
+                    payment.paying_mana_sources.extend(spent.paying_mana_sources);
+        payment.paying_mana_details.extend(spent.paying_mana_details);
                 }
             } else if !is_empty_combo_color_identity {
                 let _ = unpaid.try_pay_mana(chosen_atom, chosen_atom as u8);
@@ -837,9 +870,7 @@ fn produce_mana_for_auto_pay(
     }
 
     let source = game.card(ma.card_id);
-    let ab = ma
-        .ability_index
-        .and_then(|idx| source.activated_abilities.get(idx));
+    let ab = ma.ability_snapshot.as_ref();
     let params = ManaProductionParams {
         source_card: ma.card_id,
         is_snow: source.type_line.is_snow(),
@@ -886,19 +917,7 @@ fn add_taps_for_mana_trigger_mana_impl(
     // (`AbilityManaPart.tapsForMana`). Implicit basic-land taps have no parsed
     let mut produced_atoms: Vec<u16> = Vec::new();
     let tapped_source = sa_payment.card_id;
-    let pays_with_tap = match sa_payment.ability_index {
-        Some(idx) => game
-            .card(tapped_source)
-            .activated_abilities
-            .get(idx)
-            .is_some_and(|ab| {
-                ab.cost
-                    .parts
-                    .iter()
-                    .any(|part| matches!(part, CostPart::Tap))
-            }),
-        None => true,
-    };
+    let pays_with_tap = source_requires_tap(game, sa_payment);
     if require_tap && !pays_with_tap {
         return produced_atoms;
     }
@@ -909,18 +928,24 @@ fn add_taps_for_mana_trigger_mana_impl(
         produced: Some(produced.to_string()),
         ..Default::default()
     };
-    for &host_id in game.cards_in_zone(ZoneType::Battlefield, player) {
-        let host = game.card(host_id);
+    for host in &game.cards {
+        if host.zone != ZoneType::Battlefield || host.phased_out { continue; }
+        let host_id = host.id;
         for trigger in &host.triggers {
-            if trigger.kind != crate::trigger::TriggerType::TapsForMana {
+            if trigger.kind != crate::trigger::TriggerType::TapsForMana
+                || !trigger.get_active_zone().contains(&host.zone)
+                || !trigger.requirements_check(game, host_id)
+                || !trigger.check_activation_limit(game, host_id)
+                || !trigger.get_mode().perform_test(trigger, &params, game)
+                || !trigger.meets_requirements_on_triggered_objects(game, &params, host_id) {
                 continue;
             }
-            if !trigger.get_mode().perform_test(trigger, &params, game) {
-                continue;
-            }
-            let Some(sa) = trigger.ensure_ability(game, host_id, player) else {
+            let Some(sa) = trigger.ensure_ability(game, host_id, host.controller) else {
                 continue;
             };
+            if !super::triggered_mana_goes_to_player(game, host, tapped_source, player, sa.defined()) {
+                continue;
+            }
             let Some(produced_ir) = sa.produced_ir() else {
                 continue;
             };
@@ -1015,11 +1040,8 @@ fn auto_pay_base_mana_string(
 }
 
 fn auto_pay_base_amount(game: &GameState, player: PlayerId, ma: &ManaAbilityRef) -> i32 {
-    ma.ability_index
-        .and_then(|idx| game.card(ma.card_id).activated_abilities.get(idx))
-        .map(|ab| {
-            parse_mana_ability_amount_with_game(ab, Some(game), Some(ma.card_id), Some(player))
-        })
+    ma.ability_snapshot.as_ref()
+        .map(|ab| parse_mana_ability_amount_with_game(ab, Some(game), Some(ma.card_id), Some(player)))
         .unwrap_or(1)
 }
 
@@ -1130,7 +1152,21 @@ fn choose_candidate(
             allow_reserved_source_reuse,
             reserved_sacrifices,
         ) {
-            return Some((ma, shard));
+            // If the same source has equivalent-color abilities with the
+            // same cost, use the one producing more mana. This keeps the
+            // feasibility probe and actual payment consistent (e.g. a
+            // Goldspan-granted Treasure ability) without spending an extra cost.
+            let cost_key = ma.ability_snapshot.as_ref().filter(|_| ma.is_current(game, player))
+                .map(|ab| format!("{:?}", ab.cost.parts));
+            let best = candidates.iter().filter(|other| {
+                other.card_id == ma.card_id && other.amount > ma.amount && other.atoms == ma.atoms
+                    && other.mana_text == ma.mana_text && other.can_pay_shard(shard)
+                    && cost_key.is_some()
+                    && other.ability_snapshot.as_ref().filter(|_| other.is_current(game, player))
+                        .is_some_and(|ab| Some(format!("{:?}", ab.cost.parts)) == cost_key)
+                    && can_pay_non_tap_mana_ability_costs(game, player, other, current_spell, allow_reserved_source_reuse, reserved_sacrifices)
+            }).max_by_key(|other| other.amount).cloned().unwrap_or(ma);
+            return Some((best, shard));
         }
     }
     None
@@ -1419,13 +1455,11 @@ fn can_pay_non_tap_mana_ability_costs(
     allow_reserved_source_reuse: bool,
     reserved_sacrifices: &[CardId],
 ) -> bool {
-    let Some(ab_idx) = ma.ability_index else {
-        return true;
+    if !ma.is_current(game, player) { return false; }
+    let Some(ab) = ma.ability_snapshot.as_ref() else {
+        return ma.ability_index.is_none();
     };
-    let cost_parts: Vec<_> = game.card(ma.card_id).activated_abilities[ab_idx]
-        .cost
-        .parts
-        .clone();
+    let cost_parts = ab.cost.parts.clone();
     for part in &cost_parts {
         if !can_pay_source_paid_mana_cost_part(
             game,
@@ -1449,7 +1483,7 @@ pub(crate) fn reapply_non_undoable_payment_ability(
     card_id: CardId,
     ability_index: usize,
 ) {
-    let Some(ab) = game.card(card_id).activated_abilities.get(ability_index) else {
+    let Some(ab) = game.card(card_id).activated_abilities.iter().find(|ab| ab.ability_index == ability_index) else {
         return;
     };
     let atoms = ab
@@ -1464,7 +1498,10 @@ pub(crate) fn reapply_non_undoable_payment_ability(
     let has_tap_cost = ab.cost.parts.iter().any(|p| matches!(p, CostPart::Tap));
     let ma = ManaAbilityRef {
         card_id,
+        source_zone_timestamp: game.card(card_id).zone_timestamp,
+        source_zone: game.card(card_id).zone,
         ability_index: Some(ability_index),
+        ability_snapshot: Some(ab.clone()),
         atoms: atoms.clone(),
         amount,
         mana_text: String::new(),
@@ -1490,13 +1527,11 @@ fn pay_non_tap_mana_ability_costs(
     reserved_sacrifices: &[CardId],
     callback: &mut Option<ManaPayCallbackFn<'_>>,
 ) -> bool {
-    let Some(ab_idx) = ma.ability_index else {
-        return true;
+    if !ma.is_current(game, player) { return false; }
+    let Some(ab) = ma.ability_snapshot.as_ref() else {
+        return ma.ability_index.is_none();
     };
-    let cost_parts: Vec<_> = game.card(ma.card_id).activated_abilities[ab_idx]
-        .cost
-        .parts
-        .clone();
+    let cost_parts = ab.cost.parts.clone();
     for part in &cost_parts {
         match part {
             CostPart::Tap | CostPart::Mana { .. } => {}
@@ -2131,7 +2166,10 @@ fn group_sources_by_mana_color_inner(
                     explicit_mana_added = true;
                     let ma = ManaAbilityRef {
                         card_id,
+                        source_zone_timestamp: card.zone_timestamp,
+                        source_zone: card.zone,
                         ability_index: Some(ab.ability_index),
+                        ability_snapshot: Some(ab.clone()),
                         atoms: reflected_atoms,
                         amount: parse_mana_ability_amount_with_game(
                             ab,
@@ -2220,7 +2258,10 @@ fn group_sources_by_mana_color_inner(
                 .max(1);
             let ma = ManaAbilityRef {
                 card_id,
+                source_zone_timestamp: card.zone_timestamp,
+                source_zone: card.zone,
                 ability_index: Some(ab.ability_index),
+                ability_snapshot: Some(ab.clone()),
                 atoms: atoms.clone(),
                 amount: parse_mana_ability_amount_with_game(
                     ab,
@@ -2254,7 +2295,10 @@ fn group_sources_by_mana_color_inner(
                         .len() as i32;
                 let ma = ManaAbilityRef {
                     card_id,
+                    source_zone_timestamp: card.zone_timestamp,
+                    source_zone: card.zone,
                     ability_index: None,
+                    ability_snapshot: None,
                     atoms: vec![atom],
                     amount: replacement_multiplier.max(1),
                     mana_text: atom_short(atom).to_string(),
@@ -2704,7 +2748,7 @@ fn is_payable_mana_ability_with_self_check(
     ab: &crate::ability::activated::ActivatedAbility,
     reserved_sacrifices: &[CardId],
     payment_ctx: Option<&crate::mana::ManaPaymentContext>,
-    apply_self_check: bool,
+    _apply_self_check: bool,
 ) -> bool {
     if !ab.is_mana_ability {
         return false;
@@ -2749,22 +2793,9 @@ fn is_payable_mana_ability_with_self_check(
             if !crate::mana::mana_meets_restriction(&resolved, ctx) {
                 return false;
             }
-            // ActionSpace.java:277 (permissive) vs AutoPay.canPayShard:273
-            // (strict self-check). Action-space probes use the permissive form.
-            if apply_self_check {
-                let self_ctx = crate::mana::ManaPaymentContext {
-                    is_spell: false,
-                    is_activated_ability: true,
-                    sa_on_stack: false,
-                    type_line: Some(card.type_line.clone()),
-                    card_name: Some(card.card_name.clone()),
-                    card_color: Some(card.color),
-                    chosen_types_by_source: ctx.chosen_types_by_source.clone(),
-                };
-                if !crate::mana::mana_meets_restriction(&resolved, &self_ctx) {
-                    return false;
-                }
-            }
+            // RestrictValid governs spending the produced mana. Checking it
+            // again against the mana ability itself rejects every Spell.*
+            // restriction even when the pending spell is a valid recipient.
         }
     }
     can_pay_mana_ability_costs_with_reserved(
@@ -2972,10 +3003,8 @@ fn autopay_source_score(game: &GameState, _player: PlayerId, ma: &ManaAbilityRef
         score
     };
 
-    if let Some(ab_idx) = ma.ability_index {
-        if let Some(ab) = card.activated_abilities.get(ab_idx) {
-            score += ab.cost.parts.len() as i32;
-        }
+    if let Some(ab) = &ma.ability_snapshot {
+        score += ab.cost.parts.len() as i32;
     } else {
         score = score_implicit_land_mana_ability(
             ma.atoms.first().copied().unwrap_or(ManaAtom::COLORLESS),
@@ -3095,15 +3124,11 @@ pub fn auto_tap_lands_generic(
     tapped_lands
 }
 
-fn source_requires_tap(game: &GameState, ma: &ManaAbilityRef) -> bool {
-    match ma.ability_index {
+fn source_requires_tap(_game: &GameState, ma: &ManaAbilityRef) -> bool {
+    match ma.ability_snapshot.as_ref() {
         // Implicit mana abilities (basic/subtype lands) always require tapping.
         None => true,
-        Some(ab_idx) => game.card(ma.card_id).activated_abilities[ab_idx]
-            .cost
-            .parts
-            .iter()
-            .any(|p| matches!(p, CostPart::Tap)),
+        Some(ab) => ab.cost.parts.iter().any(|p| matches!(p, CostPart::Tap)),
     }
 }
 
@@ -3159,6 +3184,51 @@ mod tests {
             vec![],
             abilities.into_iter().map(|s| s.to_string()).collect(),
         )
+    }
+
+    #[test]
+    fn candidate_identifier_is_not_a_vector_index() {
+        let mut game = GameState::new(&["P1", "P2"], 20);
+        let player = PlayerId(0);
+        let card = game.create_card(make_card(1, player, "Test source", "Land", vec!["AB$ Mana | Cost$ T PayLife<1> | Produced$ B"]));
+        game.add_card_to_zone(ZoneType::Battlefield, player, card);
+        game.card_mut(card).zone = ZoneType::Battlefield;
+        game.card_mut(card).activated_abilities[0].ability_index = 130;
+        let ab = game.card(card).activated_abilities[0].clone();
+        let ma = ManaAbilityRef { card_id: card, source_zone_timestamp: game.card(card).zone_timestamp, source_zone: game.card(card).zone, ability_index: Some(130), ability_snapshot: Some(ab), atoms: vec![ManaAtom::BLACK], amount: 1, mana_text: "B".into(), produced_ir: None, source_order: 0 };
+        assert!(can_pay_non_tap_mana_ability_costs(&game, player, &ma, None, false, &[]));
+        game.card_mut(card).activated_abilities.clear();
+        assert!(!can_pay_non_tap_mana_ability_costs(&game, player, &ma, None, false, &[]));
+        assert!(!pay_non_tap_mana_ability_costs(&mut game, player, &ma, None, false, &[], &mut None));
+        assert_eq!(game.player(player).life, 20);
+        game.card_mut(card).activated_abilities.push(ma.ability_snapshot.clone().unwrap());
+        game.card_mut(card).activated_abilities[0].ability_text.push_str(" | Changed$ True");
+        assert!(!can_pay_non_tap_mana_ability_costs(&game, player, &ma, None, false, &[]));
+        game.card_mut(card).activated_abilities[0] = ma.ability_snapshot.clone().unwrap();
+        game.card_mut(card).zone_timestamp += 1;
+        assert!(!can_pay_non_tap_mana_ability_costs(&game, player, &ma, None, false, &[]));
+        game.card_mut(card).zone_timestamp -= 1;
+        game.card_mut(card).controller = PlayerId(1);
+        assert!(!can_pay_non_tap_mana_ability_costs(&game, player, &ma, None, false, &[]));
+        game.card_mut(card).controller = player;
+        assert!(pay_non_tap_mana_ability_costs(&mut game, player, &ma, None, false, &[], &mut None));
+        assert_eq!(game.player(player).life, 19);
+    }
+
+    #[test]
+    fn auto_tap_preserves_virtual_identifier_and_pays_exactly_once() {
+        let mut game = GameState::new(&["P1", "P2"], 20);
+        let player = PlayerId(0);
+        let card = game.create_card(make_card(1, player, "Mana Confluence", "Land", vec!["AB$ Mana | Cost$ T PayLife<1> | Produced$ Any"]));
+        game.add_card_to_zone(ZoneType::Battlefield, player, card);
+        game.card_mut(card).zone = ZoneType::Battlefield;
+        game.card_mut(card).activated_abilities[0].ability_index = 130;
+        let mut pool = ManaPool::new();
+        let tapped = auto_tap_lands(&mut game, &mut pool, player, &ManaCost::parse("B"), None);
+        assert_eq!(tapped, vec![card]);
+        assert!(game.card(card).tapped);
+        assert_eq!(game.player(player).life, 19);
+        assert_eq!(pool.black(), 1);
     }
 
     #[test]

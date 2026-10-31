@@ -53,7 +53,7 @@ fn discover_for_player(ctx: &mut EffectContext, sa: &SpellAbility, player: Playe
         // Exile one at a time (Java: exileSeq = true)
         let old_zone = ctx.game.card(top).zone;
         ctx.move_card(top, ZoneType::Exile, player);
-        emit_zone_trigger(ctx.trigger_handler, top, old_zone, ZoneType::Exile);
+        emit_zone_trigger(ctx.trigger_handler, ctx.game, top, old_zone, ZoneType::Exile);
 
         if !is_land && cmc <= max_cmc {
             found = Some(top);
@@ -88,17 +88,17 @@ fn discover_for_player(ctx: &mut EffectContext, sa: &SpellAbility, player: Playe
                     // Failed to cast — put in hand instead
                     let old = ctx.game.card(card_id).zone;
                     ctx.move_card(card_id, ZoneType::Hand, player);
-                    emit_zone_trigger(ctx.trigger_handler, card_id, old, ZoneType::Hand);
+                    emit_zone_trigger(ctx.trigger_handler, ctx.game, card_id, old, ZoneType::Hand);
                 }
             } else {
                 let old = ctx.game.card(card_id).zone;
                 ctx.move_card(card_id, ZoneType::Hand, player);
-                emit_zone_trigger(ctx.trigger_handler, card_id, old, ZoneType::Hand);
+                emit_zone_trigger(ctx.trigger_handler, ctx.game, card_id, old, ZoneType::Hand);
             }
         } else {
             let old = ctx.game.card(card_id).zone;
             ctx.move_card(card_id, ZoneType::Hand, player);
-            emit_zone_trigger(ctx.trigger_handler, card_id, old, ZoneType::Hand);
+            emit_zone_trigger(ctx.trigger_handler, ctx.game, card_id, old, ZoneType::Hand);
         }
     }
 
@@ -109,6 +109,6 @@ fn discover_for_player(ctx: &mut EffectContext, sa: &SpellAbility, player: Playe
         ctx.move_card(card_id, ZoneType::Library, player);
         ctx.game
             .reorder_card_in_zone(ZoneType::Library, player, card_id, 0);
-        emit_zone_trigger(ctx.trigger_handler, card_id, old, ZoneType::Library);
+        emit_zone_trigger(ctx.trigger_handler, ctx.game, card_id, old, ZoneType::Library);
     }
 }

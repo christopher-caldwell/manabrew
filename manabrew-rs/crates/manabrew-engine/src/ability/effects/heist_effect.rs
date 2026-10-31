@@ -38,6 +38,6 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
             ctx.game.card_mut(top).set_exiled_by(Some(sid));
         }
 
-        emit_zone_trigger(ctx.trigger_handler, top, old_zone, ZoneType::Exile);
+        emit_zone_trigger(ctx.trigger_handler, ctx.game, top, old_zone, ZoneType::Exile);
     }
 }

@@ -521,7 +521,7 @@ impl GameLoop {
 
                 // Emit ChangesZone trigger (ETB)
                 crate::ability::effects::emit_zone_trigger(
-                    &mut self.trigger_handler,
+                    &mut self.trigger_handler, game,
                     card_id,
                     origin,
                     ZoneType::Battlefield,
@@ -647,13 +647,14 @@ impl GameLoop {
                         mode: Box::new(crate::trigger::trigger_changes_zone::TriggerChangesZone),
                         ir: crate::trigger::TriggerIr::from_params(&params),
                         execute: "BlitzDiesDraw".to_string(),
+                        execute_definition: None,
                         optional: false,
                         description: "When this creature dies, draw a card.".to_string(),
                         static_trigger: false,
                         trigger_remembered: Vec::new(),
                         spawning_ability: None,
                     };
-                    game.card_mut(card_id).add_trigger(dies_trigger);
+                    game.card_mut(card_id).add_pump_trigger(dies_trigger);
                     game.card_mut(card_id)
                         .set_s_var("BlitzDiesDraw", "DB$ Draw | NumCards$ 1 | Defined$ You");
                     self.trigger_handler.unregister_active_triggers(card_id);
@@ -671,7 +672,7 @@ impl GameLoop {
                             execute_svar: format!("DB$ Sacrifice | Defined$ CardUID_{}", card_id.0),
                             controller: player,
                             source_card: card_id,
-                            source_zone_timestamp: None,
+                            source_zone_timestamp: Some(game.card(card_id).zone_timestamp),
                             created_turn: game.turn.turn_number,
                             created_phase: game.turn.phase,
                             target_card: Some(card_id),
@@ -768,6 +769,9 @@ impl GameLoop {
 
         // Continuous effects might change after resolution
         apply_continuous_effects(game);
+        // Layer-granted triggers (for example undying) must be registered
+        // before a player can pay a sacrifice cost in the next priority window.
+        self.trigger_handler.reset_active_triggers(game);
 
         // LKI: Second snapshot after resolution and SBAs, before processing triggers.
         // Mirrors Java MagicStack line 676: game.copyLastState() in finishResolving().
@@ -806,8 +810,10 @@ impl GameLoop {
         let mut parent_target_card: Option<CardId> = None;
         let mut parent_target_player = None;
         let mut parent_target_stack_entry: Option<u32> = None;
+        let mut inherited_targets = entry.spell_ability.target_chosen.clone();
         let mut inherited_trigger_index = entry.spell_ability.trigger_index;
         let root_kicked = entry.spell_ability.kicked;
+        let root_trigger_objects = entry.spell_ability.trigger_objects.clone();
         let mut current = Some(&entry.spell_ability);
         let mut is_first = true;
         while let Some(sa) = current {
@@ -823,22 +829,32 @@ impl GameLoop {
 
             // Propagate kicked flag from root SA to sub-abilities for condition checks
             let mut sa_with_ctx;
-            let needs_ctx_clone = (root_kicked && !sa.kicked)
+            let needs_ctx_clone = (!is_first && !root_trigger_objects.is_empty())
+                || (root_kicked && !sa.kicked)
                 || (parent_target_card.is_some() && sa.target_chosen.target_card.is_none())
                 || (parent_target_player.is_some() && sa.target_chosen.target_player.is_none())
                 || (parent_target_stack_entry.is_some()
                     && sa.target_chosen.target_stack_entry.is_none())
+                || (!inherited_targets.divided_map.is_empty() && sa.target_chosen.target_card.is_none())
+                || (!inherited_targets.additional_target_players.is_empty() && sa.target_chosen.target_player.is_none())
                 || (inherited_trigger_index.is_some() && sa.trigger_index.is_none());
             let sa_ref = if needs_ctx_clone {
                 sa_with_ctx = sa.clone();
+                for (key, value) in &root_trigger_objects {
+                    sa_with_ctx.trigger_objects.entry(*key).or_insert_with(|| value.clone());
+                }
                 if root_kicked && !sa_with_ctx.kicked {
                     sa_with_ctx.kicked = true;
                 }
                 if sa_with_ctx.target_chosen.target_card.is_none() {
                     sa_with_ctx.target_chosen.target_card = parent_target_card;
+                    sa_with_ctx.target_chosen.target_card_zone_timestamp = inherited_targets.target_card_zone_timestamp;
+                    sa_with_ctx.target_chosen.divided_map = inherited_targets.divided_map.clone();
+                    sa_with_ctx.target_chosen.additional_card_timestamps = inherited_targets.additional_card_timestamps.clone();
                 }
                 if sa_with_ctx.target_chosen.target_player.is_none() {
                     sa_with_ctx.target_chosen.target_player = parent_target_player;
+                    sa_with_ctx.target_chosen.additional_target_players = inherited_targets.additional_target_players.clone();
                 }
                 if sa_with_ctx.target_chosen.target_stack_entry.is_none() {
                     sa_with_ctx.target_chosen.target_stack_entry = parent_target_stack_entry;
@@ -854,6 +870,7 @@ impl GameLoop {
             parent_target_card = sa_ref.target_chosen.target_card;
             parent_target_player = sa_ref.target_chosen.target_player;
             parent_target_stack_entry = sa_ref.target_chosen.target_stack_entry;
+            inherited_targets = sa_ref.target_chosen.clone();
             inherited_trigger_index = sa_ref.trigger_index;
             current = sa.get_sub_ability();
         }
@@ -920,7 +937,7 @@ impl GameLoop {
                         if sa.target_chosen.target_card == Some(target_card_id) {
                             sa.target_chosen.target_card_zone_timestamp
                         } else {
-                            None
+                            sa.target_chosen.additional_card_timestamps.get(&target_card_id).copied()
                         },
                         game,
                     ) {
@@ -931,16 +948,15 @@ impl GameLoop {
                             sa.target_chosen.target_card_zone_timestamp = None;
                         }
                         sa.target_chosen.divided_map.remove(&target_card_id);
+                        sa.target_chosen.additional_card_timestamps.remove(&target_card_id);
                     }
                 }
 
-                if let Some(target_player_id) = sa.target_chosen.target_player {
-                    if Self::is_player_target_valid(target_player_id, game) {
-                        fizzle = Some(false);
-                    } else {
-                        sa.target_chosen.target_player = None;
-                    }
-                }
+                let legal_players: Vec<_> = sa.target_chosen.all_target_players().into_iter()
+                    .filter(|&player| Self::is_player_target_valid(player, game)).collect();
+                if !legal_players.is_empty() { fizzle = Some(false); }
+                sa.target_chosen.target_player = legal_players.first().copied();
+                sa.target_chosen.additional_target_players = legal_players.into_iter().skip(1).collect();
 
                 if let Some(target_stack_id) = sa.target_chosen.target_stack_entry {
                     if game.stack.find_by_id(target_stack_id).is_some() {

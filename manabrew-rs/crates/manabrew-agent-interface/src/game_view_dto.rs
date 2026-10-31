@@ -47,6 +47,7 @@ pub fn targeting_intent_of(sa: &SpellAbility) -> TargetingIntent {
         ApiType::GainLife => TargetingIntent::Heal,
         ApiType::LoseLife => TargetingIntent::LoseLife,
         ApiType::Draw => TargetingIntent::Draw,
+        ApiType::AddTurn => TargetingIntent::Friendly,
         ApiType::Reveal | ApiType::RevealHand | ApiType::LookAt | ApiType::PeekAndReveal => {
             TargetingIntent::Reveal
         }
@@ -131,6 +132,45 @@ pub fn is_hostile_api(sa: &SpellAbility) -> bool {
     intent_is_hostile(targeting_intent_of(sa))
 }
 
+// This is prospective pre-replacement damage, not a promise that it resolves.
+// Only expose values for simple, known expressions; unsupported is None.
+pub(crate) fn known_direct_damage(game: &GameState, sa: &SpellAbility) -> Option<i32> {
+    use manabrew_engine::ability::{ability_ir::EffectIr, api_type::ApiType, AbilityKey};
+    use manabrew_engine::parsing::amount::AmountExpr;
+    if sa.api != Some(ApiType::DealDamage) || sa.sub_ability.is_some() { return None; }
+    let Some(EffectIr::DealDamage(effect)) = &sa.ir.effect else { return None; };
+    if effect.damage_map { return None; }
+    let n = match effect.amount.as_ref()? {
+        AmountExpr::Literal(n) => *n,
+        AmountExpr::SVar(name) => {
+            let source=sa.source?;
+            if game.card(source).get_s_var(name)? != "TriggeredCard$CardPower" { return None; }
+            if let Some(n)=sa.get_triggering_value(AbilityKey::TriggeredCardPower).and_then(|v|v.trim().parse::<i32>().ok()) { n }
+            else {
+                let triggered=sa.get_triggering_card(AbilityKey::Card)?;
+                let card=game.cards.get(triggered.index())?;
+                card.lki_power.or_else(||game.get_lki_snapshot(triggered).map(|snapshot|snapshot.power))?
+            }
+        },
+        _ => return None,
+    };
+    Some(n.max(0))
+}
+
+// Pending damage is an estimate only when the current board has no visible
+// prevention shield or damage replacement that could change its amount/target.
+fn known_pending_damage(game: &GameState, sa: &SpellAbility) -> Option<i32> {
+    use manabrew_engine::replacement::ReplacementType;
+    if sa.target_chosen.target_player.is_some_and(|p| game.player(p).damage_prevention > 0)
+        || sa.target_chosen.target_card.is_some_and(|c| game.card(c).damage_prevention > 0)
+        || game.cards.iter().any(|card| card.zone == ZoneType::Battlefield && !card.phased_out
+            && card.replacement_effects.iter().any(|r| !r.suppressed && r.event == ReplacementType::DamageDone
+                && (r.active_zones.is_empty() || r.active_zones.contains(&card.zone)))) {
+        return None;
+    }
+    known_direct_damage(game, sa)
+}
+
 fn collect_stack_targets(root: &SpellAbility) -> Vec<TargetRef> {
     let mut out = Vec::new();
     let mut current = Some(root);
@@ -170,7 +210,7 @@ fn collect_stack_targets(root: &SpellAbility) -> Vec<TargetRef> {
     out
 }
 
-fn stack_source_ability_text(game: &GameState, sa: &SpellAbility) -> Option<String> {
+pub(crate) fn stack_source_ability_text(game: &GameState, sa: &SpellAbility) -> Option<String> {
     let source_id = sa.trigger_source.or(sa.source)?;
     let source = game.card(source_id);
     if !sa.is_trigger && sa.is_spell && source.is_permanent() {
@@ -1113,6 +1153,7 @@ impl GameViewDtoExt for GameViewDto {
                         .and_then(|_| stack_source_ability_text(game, &entry.spell_ability)),
                     is_permanent_spell: entry.is_creature_spell || entry.is_permanent_spell,
                     is_casting: entry.is_pending_cast,
+                    known_damage: if entry.optional_trigger_decider.is_none() { known_pending_damage(game, &entry.spell_ability) } else { None },
                     targets: collect_stack_targets(&entry.spell_ability),
                 }
             })

@@ -1,4 +1,5 @@
-use super::{resolve_defined_player_with_sa, resolve_numeric_svar, EffectContext};
+use super::{resolve_numeric_svar, EffectContext};
+use crate::ability::spell_ability_effect::get_target_players;
 use crate::ability::ability_ir::EffectIr;
 use crate::event::RunParams;
 use crate::replacement::replacement_handler::{apply_replacements, ReplacementEvent};
@@ -12,20 +13,18 @@ use crate::trigger::TriggerType;
 #[manabrew_engine_macros::spell_effect(LifeLoseEffect)]
 fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
     let amount = resolve_life_amount(ctx, sa);
-    // Mirror Java getTargetPlayers(): targeted player first, then Defined, then activator.
-    let target = sa
-        .target_chosen
-        .target_player
-        .or_else(|| {
-            sa.defined().and_then(|defined| {
-                resolve_defined_player_with_sa(defined, sa, sa.activating_player, ctx.game)
-            })
-        })
-        .unwrap_or(sa.activating_player);
+    let targets = get_target_players(ctx.game, sa);
+    let total: i32 = targets.into_iter().map(|target| resolve_for_player(ctx, sa, target, amount)).sum();
+    if let Some(source) = sa.source {
+        ctx.game.card_mut(source).svars.insert("AFLifeLost".to_string(), format!("Number${total}"));
+    }
+}
+
+fn resolve_for_player(ctx: &mut EffectContext, sa: &SpellAbility, target: crate::ids::PlayerId, amount: i32) -> i32 {
     if crate::staticability::static_ability_cant_gain_lose_pay_life::cant_lose_life(
         ctx.game, target,
     ) {
-        return;
+        return 0;
     }
 
     // Run LifeReduced replacement effects before losing life.
@@ -36,7 +35,7 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
     };
     let result = apply_replacements(ctx.game, &mut event);
     if result == ReplacementResult::Skipped || result == ReplacementResult::Replaced {
-        return;
+        return 0;
     }
     let amount = if let ReplacementEvent::LifeReduced {
         amount: final_amount,
@@ -48,19 +47,10 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
         amount
     };
     if amount <= 0 {
-        return;
+        return 0;
     }
 
     ctx.game.player_lose_life(target, amount);
-
-    // Set AFLifeLost SVar on source card so chained sub-abilities (e.g. GainLife) can read it.
-    // Mirrors Java's `sa.setSVar("AFLifeLost", "Number$" + lifeLost)`.
-    if let Some(source_id) = sa.source {
-        ctx.game
-            .card_mut(source_id)
-            .svars
-            .insert("AFLifeLost".to_string(), format!("Number${amount}"));
-    }
 
     // Per-player `LifeLost` trigger.
     ctx.trigger_handler.run_trigger(
@@ -91,6 +81,21 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
         },
         false,
     );
+    amount
+}
+
+/// Queue a life-loss event only when life was actually lost. The engine currently
+/// exposes individual affected players rather than Forge's full simultaneous map.
+pub(super) fn fire_life_lost_all(ctx: &mut EffectContext, player: crate::ids::PlayerId, amount: i32, source: Option<crate::ids::CardId>) {
+    if amount > 0 {
+        let params = RunParams {
+            player: Some(player), life_amount: Some(amount), source_card: source,
+            first_time: Some(ctx.game.player(player).life_lost_this_turn == amount),
+            ..Default::default()
+        };
+        ctx.trigger_handler.run_trigger(TriggerType::LifeLost, params.clone(), false);
+        ctx.trigger_handler.run_trigger(TriggerType::LifeLostAll, params, false);
+    }
 }
 
 fn resolve_life_amount(ctx: &EffectContext, sa: &SpellAbility) -> i32 {

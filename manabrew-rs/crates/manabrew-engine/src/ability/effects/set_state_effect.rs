@@ -27,6 +27,20 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
 
     match mode {
         Some(SpellAbilityMode::Transform) => {
+            let stored = crate::parsing::Params::from_raw(&sa.ability_text);
+            if let Some(timestamp) = stored.get("StoredTransform") {
+                let host = ctx.game.card(source_id);
+                if timestamp.parse::<u64>().ok() != Some(host.transform_timestamp)
+                    || stored
+                        .get("StoredTransformZone")
+                        .and_then(|value| value.parse::<u64>().ok())
+                        != Some(host.zone_timestamp)
+                    || host.zone != forge_foundation::ZoneType::Battlefield
+                    || host.phased_out
+                {
+                    return;
+                }
+            }
             // Evaluate optional condition.
             if let Some(cond_defined) = sa.ir.condition_defined.as_ref() {
                 if cond_defined.refs.first().is_some_and(|defined| {

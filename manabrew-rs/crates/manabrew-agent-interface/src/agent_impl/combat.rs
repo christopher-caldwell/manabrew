@@ -3,7 +3,7 @@ use manabrew_engine::combat::DefenderId;
 use manabrew_engine::ids::{CardId, PlayerId};
 
 use crate::game_view_dto::{CardDto, GameViewDtoExt, TargetingIntent};
-use crate::ids_codec::{card_id_str, parse_card_id};
+use crate::ids_codec::{card_id_str, parse_card_id, player_id_str};
 use crate::mana_action_id::parse_tap_action_id;
 use crate::prompt::*;
 
@@ -38,12 +38,17 @@ pub(super) fn choose_attackers<T: Responder>(
     // The Rust engine doesn't restrict which target each attacker may hit, so
     // every attacker is offered every target.
     let all_target_ids: Vec<String> = attack_targets.iter().map(|t| t.id.clone()).collect();
-    let attackers = PromptAgent::<T>::card_ids(available)
-        .into_iter()
-        .map(|attacker_id| AttackerOptionDto {
-            attacker_id,
-            valid_target_ids: all_target_ids.clone(),
-            must_attack: false,
+    let attackers = available.iter()
+        .map(|&attacker| {
+            let legal = agent.legal_attack_targets.iter().find(|(id, _)| *id == attacker)
+                .map(|(_, targets)| targets.as_slice()).unwrap_or(possible_defenders);
+            let targets = legal;
+            let goaded_by = agent.goaded_attackers.iter().find(|(id, _)| *id == attacker)
+                .map(|(_, player)| player_id_str(*player));
+            let valid_target_ids = possible_defenders.iter().zip(&all_target_ids)
+                .filter_map(|(target, id)| targets.contains(target).then_some(id.clone())).collect();
+            AttackerOptionDto { attacker_id: card_id_str(attacker), valid_target_ids,
+                must_attack: agent.required_attackers.contains(&attacker), goaded_by }
         })
         .collect();
     agent.send_prompt(
@@ -51,6 +56,10 @@ pub(super) fn choose_attackers<T: Responder>(
             manabrew_protocol::prompts::choose_attackers::ChooseAttackersInput {
                 attackers,
                 attack_targets,
+                max_attackers: agent.max_attackers,
+                target_limits: possible_defenders.iter().zip(&all_target_ids).filter_map(|(target, id)|
+                    agent.attack_target_limits.iter().find(|(defender, _)| defender == target)
+                        .map(|(_, max)| (id.clone(), *max))).collect(),
             },
         ),
         None,
@@ -318,4 +327,43 @@ pub(super) fn enlist_attackers<T: Responder>(
         "Enlist",
         None,
     )
+}
+
+#[cfg(test)]
+mod required_attack_regression {
+    use super::*;
+    use manabrew_engine::agent::PlayerAgent;
+    use manabrew_protocol::transport::{AgentPrompt, ClientToServerMessage};
+
+    #[derive(Default)]
+    struct Capture { prompt: Option<AgentPrompt> }
+    impl Responder for Capture {
+        fn respond(&mut self, prompt: AgentPrompt) -> ClientToServerMessage {
+            let id = prompt.prompt_id;
+            self.prompt = Some(prompt);
+            serde_json::from_value(serde_json::json!({
+                "kind":"response", "promptId":id,
+                "action":{"type":"chooseAttackers", "output":{"type":"declareAttackers", "assignments":[]}}
+            })).unwrap()
+        }
+    }
+
+    #[test]
+    fn prompt_marks_required_and_optional_attackers() {
+        let mut agent = PromptAgent::new(PlayerId(0), "fixture".into(), Capture::default());
+        agent.set_attack_requirements(&[CardId(1)], &[(CardId(1), PlayerId(3))], &[(CardId(1), vec![DefenderId::Player(PlayerId(1)), DefenderId::Player(PlayerId(3))])], Some(1), &[(DefenderId::Player(PlayerId(1)), 1)]);
+        agent.choose_attackers(PlayerId(0), &[CardId(1), CardId(2)], &[DefenderId::Player(PlayerId(1)), DefenderId::Player(PlayerId(3))]);
+        let value = serde_json::to_value(agent.responder.prompt.as_ref().unwrap()).unwrap();
+        assert_eq!(value["input"]["maxAttackers"], 1);
+        assert_eq!(value["input"]["targetLimits"]["player-1"], 1);
+        assert_eq!(value["input"]["attackers"][0]["mustAttack"], true);
+        assert_eq!(value["input"]["attackers"][1]["mustAttack"], false);
+        assert_eq!(value["input"]["attackers"][0]["validTargetIds"], serde_json::json!(["player-1", "player-3"]));
+        assert_eq!(value["input"]["attackers"][0]["goadedBy"], "player-3");
+        assert_eq!(value["input"]["attackers"][1]["validTargetIds"], serde_json::json!(["player-1", "player-3"]));
+        agent.set_attack_requirements(&[CardId(1)], &[(CardId(1), PlayerId(3))], &[(CardId(1), vec![DefenderId::Player(PlayerId(3))])], None, &[]);
+        agent.choose_attackers(PlayerId(0), &[CardId(1)], &[DefenderId::Player(PlayerId(3))]);
+        let fallback = serde_json::to_value(agent.responder.prompt.as_ref().unwrap()).unwrap();
+        assert_eq!(fallback["input"]["attackers"][0]["validTargetIds"], serde_json::json!(["player-3"]));
+    }
 }

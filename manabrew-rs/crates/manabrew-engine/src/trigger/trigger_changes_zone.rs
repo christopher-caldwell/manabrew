@@ -158,8 +158,26 @@ impl TriggerBehavior for TriggerChangesZone {
         trigger: &super::trigger::Trigger,
         sa: &mut SpellAbility,
         params: &RunParams,
-        _game: &GameState,
+        game: &GameState,
     ) {
+        if params.origin == Some(forge_foundation::ZoneType::Battlefield) {
+            if let Some(card_id) = params.card_lki.or(params.card) {
+                let card = game.card(card_id);
+                let counters = if card.zone == forge_foundation::ZoneType::Battlefield { &card.counters } else { card.lki_counters.as_ref().unwrap_or(&card.counters) };
+                let counter_map = counters.iter().filter(|(_, n)| **n > 0).map(|(kind, n)| {
+                    let name = match kind { crate::card::CounterType::Named(name) => name.clone(), _ => kind.to_string() };
+                    (name, *n)
+                }).collect::<std::collections::BTreeMap<_, _>>();
+                sa.set_triggering_value(crate::ability::AbilityKey::TriggeredCardCounters, counter_map);
+            }
+            if params.lki_attachment_captured {
+                sa.set_triggering_object(crate::ability::AbilityKey::AttachmentCaptureKnown, "true".to_string());
+            }
+            if let Some((attached, timestamp)) = params.lki_attached_to {
+                sa.set_triggering_object(crate::ability::AbilityKey::AttachedAtDeparture, attached);
+                sa.set_triggering_object(crate::ability::AbilityKey::AttachedAtDepartureTimestamp, timestamp.to_string());
+            }
+        }
         // Java: if origin == Battlefield, Card = CardLKI, NewCard = Card
         //        else: copy both Card and CardLKI from runParams
         if trigger.ir.origin_zone == Some(forge_foundation::ZoneType::Battlefield) {

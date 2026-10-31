@@ -78,7 +78,7 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
         for &card_id in &milled_cards {
             ctx.move_card(card_id, ZoneType::Graveyard, target);
             emit_zone_trigger(
-                ctx.trigger_handler,
+                ctx.trigger_handler, ctx.game,
                 card_id,
                 ZoneType::Library,
                 ZoneType::Graveyard,

@@ -402,6 +402,8 @@ impl GameLoop {
         // previously applied parts are undone. Mirror that via full snapshot.
         let payment_snapshot = self.make_snapshot(game, true);
         let mut payment_ok = true;
+        let paid_ability_mana = std::cell::RefCell::new(Vec::new());
+        let paid_ability_sources = std::cell::RefCell::new(Vec::new());
 
         // Java's CostPayment.payComputerCosts uses a two-phase approach:
         // Phase 1 (accept/visit): iterate all cost parts, gather decisions
@@ -668,6 +670,10 @@ impl GameLoop {
                                     game.player(session.player).life,
                                 )
                             {
+                                paid_ability_mana.borrow_mut().extend(
+                                    slf.mana_pools[session.player.index()].last_payment_atoms().iter().copied());
+                                paid_ability_sources.borrow_mut().extend(
+                                    slf.mana_pools[session.player.index()].last_payment_sources().iter().copied());
                                 let trace: Vec<ManaCostAction> = trace
                                     .iter()
                                     .map(|choice| ManaCostAction::TapForMana {
@@ -712,6 +718,10 @@ impl GameLoop {
                                 if life_to_pay != test_life_to_pay {
                                     return false;
                                 }
+                                paid_ability_mana.borrow_mut().extend(
+                                    slf.mana_pools[player.index()].last_payment_atoms().iter().copied());
+                                paid_ability_sources.borrow_mut().extend(
+                                    slf.mana_pools[player.index()].last_payment_sources().iter().copied());
                                 if life_to_pay > 0 {
                                     slf.pay_life_cost(game, player, card_id, life_to_pay);
                                 }
@@ -930,23 +940,14 @@ impl GameLoop {
                         );
                     }
                 }
-                CostPart::Return {
-                    amount,
-                    type_filter,
-                } => {
+                CostPart::Return { amount, type_filter } => {
                     if type_filter == "CARDNAME" {
                         let owner = game.card(card_id).owner;
                         self.move_card_with_runtime(game, card_id, ZoneType::Hand, owner, agents);
-                    } else {
-                        self.pay_return_cost(
-                            game,
-                            agents,
-                            player,
-                            card_id,
-                            type_filter,
-                            amount.resolve(game, card_id, player),
-                            sa.as_deref(),
-                        );
+                    } else if !self.pay_return_cost_internal(game, agents, player, card_id, type_filter,
+                        amount.resolve(game, card_id, player), sa.as_deref_mut(), None, &mut 0) {
+                        payment_ok = false;
+                        break;
                     }
                 }
                 CostPart::TapType {
@@ -1029,7 +1030,7 @@ impl GameLoop {
                                 false,
                             );
                             crate::ability::effects::emit_zone_trigger(
-                                &mut self.trigger_handler,
+                                &mut self.trigger_handler, game,
                                 top,
                                 ZoneType::Library,
                                 ZoneType::Graveyard,
@@ -1349,6 +1350,10 @@ impl GameLoop {
             self.restore_snapshot(game, &payment_snapshot);
             return false;
         }
+        if let Some(ability) = sa.as_deref_mut() {
+            ability.paying_mana.extend(paid_ability_mana.into_inner());
+            ability.paying_mana_sources.extend(paid_ability_sources.into_inner());
+        }
         true
     }
 
@@ -1615,7 +1620,7 @@ impl GameLoop {
                             card_id,
                             type_filter,
                             amount.resolve(game, card_id, player),
-                            sa.as_deref(),
+                            sa.as_deref_mut(),
                             prechosen_sacrifices,
                             &mut pre_sac_idx,
                         )
@@ -1741,7 +1746,7 @@ impl GameLoop {
                                 false,
                             );
                             crate::ability::effects::emit_zone_trigger(
-                                &mut self.trigger_handler,
+                                &mut self.trigger_handler, game,
                                 top,
                                 ZoneType::Library,
                                 ZoneType::Graveyard,
@@ -2086,6 +2091,7 @@ impl GameLoop {
                         .max(0);
                     let mut valid =
                         cost::get_sacrifice_targets_for_cost(game, player, &type_filter, sa);
+                    valid.retain(|cid| !picked.contains(cid));
                     if valid.len() < amount_n as usize {
                         return None;
                     }
@@ -2107,6 +2113,9 @@ impl GameLoop {
                             &valid,
                             sa.and_then(|s| s.source),
                         )?;
+                        if !valid.contains(&chosen) {
+                            return None;
+                        }
                         picked.push(chosen);
                         valid.retain(|&cid| cid != chosen);
                     }
@@ -2124,7 +2133,8 @@ impl GameLoop {
                         .unwrap_or_else(|| amount.as_literal().unwrap_or(0))
                         .max(0);
                     let mut valid =
-                        cost::get_sacrifice_targets_for_cost(game, player, &type_filter, sa);
+                        cost::cost_return::eligible_returns(game, player, &type_filter);
+                    valid.retain(|cid| !picked.contains(cid));
                     if valid.len() < amount_n as usize {
                         return None;
                     }
@@ -2133,6 +2143,9 @@ impl GameLoop {
                             .choose_cards_for_effect(player, &valid, 1, 1)
                             .into_iter()
                             .next()?;
+                        if !valid.contains(&chosen) {
+                            return None;
+                        }
                         picked.push(chosen);
                         valid.retain(|&cid| cid != chosen);
                     }
@@ -2299,7 +2312,7 @@ impl GameLoop {
                 self.move_card_with_runtime(game, chosen, ZoneType::Exile, owner, agents);
                 self.record_paid_cost_exile(game, source, chosen);
                 crate::ability::effects::emit_zone_trigger(
-                    &mut self.trigger_handler,
+                    &mut self.trigger_handler, game,
                     chosen,
                     ZoneType::Graveyard,
                     ZoneType::Exile,
@@ -2339,7 +2352,7 @@ impl GameLoop {
                 self.move_card_with_runtime(game, chosen, ZoneType::Exile, owner, agents);
                 self.record_paid_cost_exile(game, source, chosen);
                 crate::ability::effects::emit_zone_trigger(
-                    &mut self.trigger_handler,
+                    &mut self.trigger_handler, game,
                     chosen,
                     ZoneType::Graveyard,
                     ZoneType::Exile,
@@ -2399,7 +2412,7 @@ impl GameLoop {
                 self.move_card_with_runtime(game, chosen, ZoneType::Exile, owner, agents);
                 self.record_paid_cost_exile(game, source, chosen);
                 crate::ability::effects::emit_zone_trigger(
-                    &mut self.trigger_handler,
+                    &mut self.trigger_handler, game,
                     chosen,
                     ZoneType::Graveyard,
                     ZoneType::Exile,
@@ -2440,7 +2453,7 @@ impl GameLoop {
                 self.move_card_with_runtime(game, chosen, ZoneType::Exile, owner, agents);
                 self.record_paid_cost_exile(game, source, chosen);
                 crate::ability::effects::emit_zone_trigger(
-                    &mut self.trigger_handler,
+                    &mut self.trigger_handler, game,
                     chosen,
                     from,
                     ZoneType::Exile,
@@ -2491,7 +2504,7 @@ impl GameLoop {
                     let owner = game.card(chosen_card).owner;
                     self.move_card_with_runtime(game, chosen_card, ZoneType::Exile, owner, agents);
                     crate::ability::effects::emit_zone_trigger(
-                        &mut self.trigger_handler,
+                        &mut self.trigger_handler, game,
                         chosen_card,
                         ZoneType::Stack,
                         ZoneType::Exile,
@@ -2543,7 +2556,7 @@ impl GameLoop {
             let owner = game.card(cid).owner;
             self.move_card_with_runtime(game, cid, ZoneType::Exile, owner, agents);
             crate::ability::effects::emit_zone_trigger(
-                &mut self.trigger_handler,
+                &mut self.trigger_handler, game,
                 cid,
                 ZoneType::Graveyard,
                 ZoneType::Exile,
@@ -2639,7 +2652,7 @@ impl GameLoop {
                         let owner = game.card(cid).owner;
                         self.move_card_with_runtime(game, cid, ZoneType::Exile, owner, agents);
                         crate::ability::effects::emit_zone_trigger(
-                            &mut self.trigger_handler,
+                            &mut self.trigger_handler, game,
                             cid,
                             ZoneType::Graveyard,
                             ZoneType::Exile,
@@ -2671,7 +2684,7 @@ impl GameLoop {
                 let owner = game.card(chosen).owner;
                 self.move_card_with_runtime(game, chosen, ZoneType::Exile, owner, agents);
                 crate::ability::effects::emit_zone_trigger(
-                    &mut self.trigger_handler,
+                    &mut self.trigger_handler, game,
                     chosen,
                     ZoneType::Graveyard,
                     ZoneType::Exile,
@@ -2883,7 +2896,7 @@ impl GameLoop {
                 game.put_on_bottom_of_library(chosen, owner);
             }
             crate::ability::effects::emit_zone_trigger(
-                &mut self.trigger_handler,
+                &mut self.trigger_handler, game,
                 chosen,
                 origin,
                 ZoneType::Library,
@@ -3117,7 +3130,7 @@ impl GameLoop {
                 // have their own dedicated leave-trigger to handle the return.
                 game.card_mut(source).add_remembered_card(chosen);
                 crate::ability::effects::emit_zone_trigger(
-                    &mut self.trigger_handler,
+                    &mut self.trigger_handler, game,
                     chosen,
                     origin,
                     ZoneType::Exile,
@@ -3203,7 +3216,7 @@ impl GameLoop {
                 let owner = game.card(chosen).owner;
                 self.move_card_with_runtime(game, chosen, ZoneType::Exile, owner, agents);
                 crate::ability::effects::emit_zone_trigger(
-                    &mut self.trigger_handler,
+                    &mut self.trigger_handler, game,
                     chosen,
                     origin,
                     ZoneType::Exile,
@@ -3238,7 +3251,7 @@ impl GameLoop {
                 let from_zone = game.card(chosen).zone;
                 self.move_card_with_runtime(game, chosen, ZoneType::Hand, owner, agents);
                 crate::ability::effects::emit_zone_trigger(
-                    &mut self.trigger_handler,
+                    &mut self.trigger_handler, game,
                     chosen,
                     from_zone,
                     ZoneType::Hand,
@@ -3255,12 +3268,12 @@ impl GameLoop {
         _source: CardId,
         type_filter: &str,
         amount: i32,
-        sa: Option<&SpellAbility>,
+        mut sa: Option<&mut SpellAbility>,
         prechosen_returns: Option<&[CardId]>,
         pre_return_idx: &mut usize,
     ) -> bool {
         for _ in 0..amount {
-            let valid = cost::get_sacrifice_targets_for_cost(game, player, type_filter, sa);
+            let valid = cost::cost_return::eligible_returns(game, player, type_filter);
             if valid.is_empty() {
                 return false;
             }
@@ -3284,11 +3297,19 @@ impl GameLoop {
             let Some(chosen) = chosen else {
                 return false;
             };
+            if type_filter.eq_ignore_ascii_case("Creature.attacking+unblocked") {
+                let Some((_, defender)) = self.combat.attackers.iter().find(|(id, _)| *id == chosen).copied() else { return false; };
+                let Some(ability) = sa.as_deref_mut() else { return false; };
+                match defender {
+                    crate::combat::DefenderId::Player(pid) => ability.set_triggering_object(crate::ability::AbilityKey::Defender, pid),
+                    crate::combat::DefenderId::Permanent(cid) => ability.set_triggering_object(crate::ability::AbilityKey::Defender, cid),
+                }
+            }
             let owner = game.card(chosen).owner;
             let from_zone = game.card(chosen).zone;
             self.move_card_with_runtime(game, chosen, ZoneType::Hand, owner, agents);
             crate::ability::effects::emit_zone_trigger(
-                &mut self.trigger_handler,
+                &mut self.trigger_handler, game,
                 chosen,
                 from_zone,
                 ZoneType::Hand,
@@ -3621,7 +3642,7 @@ impl GameLoop {
                 let owner = game.card(chosen).owner;
                 self.move_card_with_runtime(game, chosen, ZoneType::Graveyard, owner, agents);
                 crate::ability::effects::emit_zone_trigger(
-                    &mut self.trigger_handler,
+                    &mut self.trigger_handler, game,
                     chosen,
                     ZoneType::Exile,
                     ZoneType::Graveyard,
@@ -3646,7 +3667,8 @@ impl GameLoop {
         // Java fires once per controller per call, not once per card.
         let mut to_sacrifice: Vec<CardId> = Vec::with_capacity(amount.max(0) as usize);
         for _ in 0..amount {
-            let valid = cost::get_sacrifice_targets(game, player, type_filter);
+            let mut valid = cost::get_sacrifice_targets_for_cost(game, player, type_filter, sa.as_deref());
+            valid.retain(|cid| !to_sacrifice.contains(cid));
             if valid.is_empty() {
                 return false;
             }
@@ -3658,13 +3680,6 @@ impl GameLoop {
                 *pre_sac_idx += 1;
                 if valid.contains(&cid) {
                     Some(cid)
-                } else if game.card(cid).zone != ZoneType::Battlefield {
-                    // Java's activated-cost autopay can reserve a permanent for a
-                    // sacrifice cost, then use that same permanent's CARDNAME
-                    // mana ability to pay the mana part. At payAsDecided time the
-                    // reserved permanent is already gone; treat that prechosen
-                    // sacrifice as consumed instead of failing or choosing another.
-                    continue;
                 } else {
                     return false;
                 }
@@ -3675,7 +3690,7 @@ impl GameLoop {
                     sa.as_deref().and_then(|s| s.source),
                 )
             };
-            if let Some(chosen) = chosen {
+            if let Some(chosen) = chosen.filter(|cid| valid.contains(cid)) {
                 to_sacrifice.push(chosen);
             } else {
                 return false;
@@ -3730,7 +3745,8 @@ impl GameLoop {
         let Some(sub_svar_name) = game
             .card(card_id)
             .activated_abilities
-            .get(ability_index)
+            .iter()
+            .find(|ab| ab.ability_index == ability_index)
             .and_then(|ab| ab.sub_ability.as_deref())
             .map(str::to_string)
         else {
@@ -3762,4 +3778,56 @@ fn can_exile_for_cost(game: &GameState, card_id: CardId) -> bool {
         None,
         true,
     )
+}
+
+#[cfg(test)]
+mod distinct_sacrifice_regression {
+    use super::*;
+    use crate::agent::{PassAgent, PlayerAgent};
+    use crate::card::Card;
+    use forge_foundation::{CardTypeLine, ColorSet, ManaCost, ZoneType};
+
+    #[test]
+    fn multiple_sacrifices_consume_distinct_permanents() {
+        let mut game = GameState::new(&["A", "B"], 40);
+        let player = PlayerId(0);
+        let mut cards = Vec::new();
+        for _ in 0..3 {
+            let id = game.create_card(Card::new(CardId(0), "Creature".into(), player,
+                CardTypeLine::parse("Creature Rat"), ManaCost::parse(""),
+                ColorSet::COLORLESS, Some(1), Some(1), vec![], vec![]));
+            game.move_card(id, ZoneType::Battlefield, player);
+            cards.push(id);
+        }
+        let mut agents: Vec<Box<dyn PlayerAgent>> = (0..2)
+            .map(|_| Box::new(PassAgent) as Box<dyn PlayerAgent>).collect();
+        let mut game_loop = GameLoop::new(2);
+        assert!(game_loop.pay_sacrifice_cost_internal(&mut game, &mut agents, player,
+            "Creature", 3, None, None, &mut 0));
+        assert!(cards.iter().all(|&id| game.card(id).zone == ZoneType::Graveyard));
+    }
+    #[test]
+    fn duplicate_preselection_and_insufficient_candidates_do_not_pay_partially() {
+        for duplicate in [true, false] {
+            let mut game = GameState::new(&["A", "B"], 40);
+            let player = PlayerId(0);
+            let mut cards = Vec::new();
+            for _ in 0..if duplicate { 3 } else { 2 } {
+                let id = game.create_card(Card::new(CardId(0), "Creature".into(), player,
+                    CardTypeLine::parse("Creature Rat"), ManaCost::parse(""),
+                    ColorSet::COLORLESS, Some(1), Some(1), vec![], vec![]));
+                game.move_card(id, ZoneType::Battlefield, player);
+                cards.push(id);
+            }
+            let mut agents: Vec<Box<dyn PlayerAgent>> = (0..2)
+                .map(|_| Box::new(PassAgent) as Box<dyn PlayerAgent>).collect();
+            let mut game_loop = GameLoop::new(2);
+            let picks = [cards[0], cards[0], cards[1]];
+            let prechosen = if duplicate { Some(picks.as_slice()) } else { None };
+            assert!(!game_loop.pay_sacrifice_cost_internal(&mut game, &mut agents, player,
+                "Creature", 3, None, prechosen, &mut 0));
+            assert!(cards.iter().all(|&id| game.card(id).zone == ZoneType::Battlefield));
+        }
+    }
+
 }

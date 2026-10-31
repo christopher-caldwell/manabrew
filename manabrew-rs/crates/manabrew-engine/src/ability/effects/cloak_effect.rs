@@ -61,7 +61,7 @@ fn cloak_for_player(ctx: &mut EffectContext, sa: &SpellAbility, player: PlayerId
         }
 
         emit_zone_trigger(
-            ctx.trigger_handler,
+            ctx.trigger_handler, ctx.game,
             card_id,
             old_zone,
             ZoneType::Battlefield,

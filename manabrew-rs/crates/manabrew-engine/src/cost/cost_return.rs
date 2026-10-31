@@ -26,6 +26,20 @@ pub fn payment_order(part: &super::CostPart) -> i32 {
     part.payment_order()
 }
 
+pub fn eligible_returns(game: &GameState, player: crate::ids::PlayerId, filter: &str) -> Vec<CardId> {
+    if filter.eq_ignore_ascii_case("Creature.attacking+unblocked") {
+        use forge_foundation::PhaseType;
+        if game.turn.active_player != player || !matches!(game.turn.phase, PhaseType::CombatDeclareBlockers | PhaseType::CombatFirstStrikeDamage | PhaseType::CombatDamage | PhaseType::CombatEnd) || !game.turn.combat_blockers_declared {
+            return Vec::new();
+        }
+        return game.cards_in_zone(ZoneType::Battlefield, player).iter().copied().filter(|&cid| {
+            let c = game.card(cid);
+            c.controller == player && c.is_creature() && !c.phased_out && c.attacking_player.is_some() && !c.damage_history.creature_got_blocked_this_combat
+        }).collect();
+    }
+    super::get_sacrifice_targets(game, player, filter)
+}
+
 pub fn can_pay(
     game: &crate::game::GameState,
     _available_mana: &crate::mana::ManaPool,
@@ -44,7 +58,7 @@ pub fn can_pay(
     if type_filter == "CARDNAME" {
         return game.card(source).zone == ZoneType::Battlefield;
     }
-    let targets = super::get_sacrifice_targets(game, player, type_filter);
+    let targets = eligible_returns(game, player, type_filter);
     (targets.len() as i32) >= amount.resolve(game, source, player)
 }
 

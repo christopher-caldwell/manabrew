@@ -260,6 +260,13 @@ pub trait TokenEffectBase {
             }
         }
 
+        // Tokens created by this one effect enter simultaneously. Register all
+        // their triggers before emitting any of the individual entry events so
+        // each entering object can observe its peers entering the battlefield.
+        for &token_id in &result.created {
+            emit_zone_trigger(ctx.trigger_handler, ctx.game, token_id, ZoneType::None, ZoneType::Battlefield);
+        }
+
         if let Some(action) = sa.ir.at_eot.as_deref() {
             crate::ability::spell_ability_effect::register_at_eot(
                 ctx.trigger_handler,
@@ -433,13 +440,6 @@ pub trait TokenEffectBase {
             },
             false,
         );
-        emit_zone_trigger(
-            ctx.trigger_handler,
-            token_id,
-            ZoneType::None,
-            ZoneType::Battlefield,
-        );
-
         let token_lki = crate::card::card_copy_service::get_lki_copy(ctx.game.card(token_id));
         trigger_list.put(Some(ZoneType::None), Some(ZoneType::Battlefield), token_id);
         let first_time = ctx.game.player(creator).tokens_created_this_turn == 0;

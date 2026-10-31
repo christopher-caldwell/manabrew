@@ -613,6 +613,21 @@ pub fn apply_continuous_effects(game: &mut GameState) {
             } => {
                 let card = &mut game.cards[effect.target.index()];
                 card.add_changed_card_keyword_at(&kw, timestamp, static_id);
+                if kw.eq_ignore_ascii_case("Undying") || kw.eq_ignore_ascii_case("Persist") {
+                    let is_undying=kw.eq_ignore_ascii_case("Undying");
+                    let counter=if is_undying { "P1P1" } else { "M1M1" };
+                    let next_id=card.triggers.iter().map(|t|t.id).max().unwrap_or(0).saturating_add(1);
+                    let mut next=next_id;
+                    let execute=format!("Granted{}{}", if is_undying {"Undying"}else{"Persist"}, next_id);
+                    let raw=format!("Mode$ ChangesZone | Origin$ Battlefield | Destination$ Graveyard | ValidCard$ Card.Self+counters_EQ0_{counter} | TriggerZones$ Battlefield | Execute$ {execute} | TriggerDescription$ {kw}");
+                    if let Some(mut trigger)=crate::trigger::parse_trigger(&raw,&mut next) {
+                        let definition = format!("DB$ ChangeZone | Defined$ TriggeredNewCardLKICopy | Origin$ Graveyard | Destination$ Battlefield | WithCountersType$ {counter}");
+                        trigger.execute=execute.clone();
+                        trigger.execute_definition=Some(definition.clone());
+                        card.add_trigger(trigger);
+                        card.granted_svars.insert(execute, definition);
+                    }
+                }
                 if let Some(cost_str) = crate::keyword::extract_keyword_cost_str(&kw, "Ward") {
                     let next_id = card
                         .triggers

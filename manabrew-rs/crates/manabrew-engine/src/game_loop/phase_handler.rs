@@ -23,6 +23,7 @@ impl GameLoop {
         // Fire TurnBegin trigger at the start of each turn.
         let active = game.active_player();
         crate::player::expire_until_your_next_turn_keywords(game, active);
+        self.expire_next_turn_effects(game, active);
         self.trigger_handler
             .handle_player_defined_del_triggers(active);
         self.trigger_handler.run_trigger(
@@ -345,6 +346,15 @@ impl GameLoop {
         }
     }
 
+    pub fn expire_next_turn_effects(&mut self, game: &mut GameState, player: PlayerId) {
+        let expired: Vec<_> = game.cards.iter().filter(|card| card.zone == ZoneType::Command && card.temp_effect_until_next_turn_of == Some(player)).map(|card|card.id).collect();
+        for id in expired {
+            let controller = game.card(id).controller;
+            game.remove_card_from_zone(ZoneType::Command, controller, id);
+            game.card_mut(id).set_zone(ZoneType::None);
+        }
+    }
+
     pub fn step_untap(&mut self, game: &mut GameState, agents: &mut [Box<dyn PlayerAgent>]) {
         let active = game.active_player();
         let cards_snapshot = game.cards.clone();
@@ -414,6 +424,7 @@ impl GameLoop {
 
     pub fn step_draw(&mut self, game: &mut GameState, agents: &mut [Box<dyn PlayerAgent>]) {
         let active = game.active_player();
+        game.player_mut(active).drawn_this_draw_step = 0;
         // Skip draw on turn 1
         if game.turn.turn_number > 1 {
             use crate::replacement::replacement_handler::{
@@ -441,9 +452,10 @@ impl GameLoop {
                 draw_count = count;
             }
 
-            for draw_index in 0..draw_count {
+            for _ in 0..draw_count {
+                let first_in_step = game.player(active).drawn_this_draw_step == 0;
                 if let Some(card_id) =
-                    game.player_draw_one_internal(active, draw_index == 0, Some(agents))
+                    game.player_draw_one_internal(active, first_in_step, Some(agents))
                 {
                     let drawn_snapshot = game.player(active).drawn_this_turn;
                     // Fire Drawn trigger for turn draw
@@ -453,6 +465,7 @@ impl GameLoop {
                             card: Some(card_id),
                             player: Some(active),
                             drawn_this_turn_snapshot: Some(drawn_snapshot),
+                            first_card_in_draw_step_snapshot: Some(first_in_step),
                             ..Default::default()
                         },
                         false,

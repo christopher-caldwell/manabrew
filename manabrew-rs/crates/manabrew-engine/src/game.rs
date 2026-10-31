@@ -233,6 +233,9 @@ pub struct GameState {
 }
 
 impl GameState {
+    #[inline(never)]
+    pub fn boxed_snapshot(&self) -> Box<Self> { Box::new(self.clone()) }
+
     pub fn new(player_names: &[&str], starting_life: i32) -> Self {
         let mut players = Vec::new();
         let mut player_order = Vec::new();

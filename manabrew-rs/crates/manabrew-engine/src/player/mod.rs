@@ -724,16 +724,25 @@ pub fn can_receive_counters(game: &GameState, player: PlayerId, amount: i32) -> 
     amount > 0 && game.player(player).is_alive()
 }
 
+pub fn counter_count(game: &GameState, player: PlayerId, counter: &str) -> i32 {
+    match counter.to_ascii_uppercase().as_str() {
+        "POISON" => game.player(player).poison_counters,
+        "ENERGY" => game.player(player).energy_counters,
+        "RAD" | "RADIATION" => game.player(player).radiation_counters,
+        name => game
+            .player(player)
+            .other_counters
+            .get(name)
+            .copied()
+            .unwrap_or(0),
+    }
+}
+
 pub fn can_remove_counters(game: &GameState, player: PlayerId, counter: &str, amount: i32) -> bool {
     if !game.player(player).is_alive() {
         return false;
     }
-    let current = match counter {
-        "Poison" => game.player(player).poison_counters,
-        "Energy" => game.player(player).energy_counters,
-        "Rad" | "Radiation" => game.player(player).radiation_counters,
-        _ => 0,
-    };
+    let current = counter_count(game, player, counter);
     current >= amount.max(0)
 }
 
@@ -742,7 +751,13 @@ pub fn add_counter_internal(game: &mut GameState, player: PlayerId, counter: &st
         "Poison" => add_poison_counters(game, player, amount),
         "Energy" => game.player_add_energy(player, amount),
         "Rad" | "Radiation" => add_rad_counters(game, player, amount),
-        _ => {}
+        name => {
+            *game
+                .player_mut(player)
+                .other_counters
+                .entry(name.to_ascii_uppercase())
+                .or_default() += amount.max(0);
+        }
     }
 }
 
@@ -753,13 +768,21 @@ pub fn subtract_counter(game: &mut GameState, player: PlayerId, counter: &str, a
             game.player_lose_energy(player, amount);
         }
         "Rad" | "Radiation" => remove_rad_counters(game, player, amount),
-        _ => {}
+        name => {
+            let value = game
+                .player_mut(player)
+                .other_counters
+                .entry(name.to_ascii_uppercase())
+                .or_default();
+            *value = (*value - amount.max(0)).max(0);
+        }
     }
 }
 
 pub fn clear_counters(game: &mut GameState, player: PlayerId) {
     game.player_mut(player).poison_counters = 0;
     game.player_mut(player).energy_counters = 0;
+    game.player_mut(player).other_counters.clear();
     game.player_set_radiation(player, 0);
 }
 

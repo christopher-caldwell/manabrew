@@ -1,6 +1,6 @@
 use forge_foundation::ZoneType;
 
-use super::{emit_zone_trigger_with_lki_counters, matches_change_type, EffectContext};
+use super::{matches_change_type, EffectContext};
 use crate::ability::ability_ir::DefinedRef;
 use crate::card::valid_filter;
 use crate::event::{AbilityValue, RunParams};
@@ -19,7 +19,18 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
     // `DelayTriggerRememberedLKI` targets the token created by the parent
     // trigger), sacrifice only those cards instead of every matching
     // permanent on the battlefield.
-    let defined_cards: Option<Vec<CardId>> = match sa.defined_ref() {
+    let defined_cards: Option<Vec<CardId>> = if sa.ir.defined_text.as_deref() == Some("AttachedBy TriggeredCardLKICopy") {
+        if sa.get_triggering_object(crate::ability::AbilityKey::AttachmentCaptureKnown).is_none() {
+            eprintln!("WARNING: SacrificeAll cannot determine attachment at departure; no object selected");
+        }
+        let target = sa.get_triggering_cards(crate::ability::AbilityKey::AttachedAtDeparture).into_iter().next();
+        let timestamp = sa.get_triggering_object(crate::ability::AbilityKey::AttachedAtDepartureTimestamp)
+            .and_then(|value| value.parse::<u64>().ok());
+        Some(target.filter(|&id| timestamp == Some(ctx.game.card(id).zone_timestamp)).into_iter().collect())
+    } else { match sa.defined_ref() {
+        Some(DefinedRef::Targeted | DefinedRef::TargetedCard | DefinedRef::ThisTargetedCard) => {
+            Some(sa.target_chosen.all_target_cards())
+        }
         Some(
             DefinedRef::DelayTriggerRememberedLki
             | DefinedRef::DelayTriggerRemembered
@@ -34,7 +45,7 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
             Some(ids)
         }
         _ => None,
-    };
+    }};
 
     // UnlessCost$ X | UnlessPayer$ You — offer the payer a chance to pay a
     // cost to prevent the sacrifice entirely. Java's deterministic AI pays
@@ -124,64 +135,47 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
         }
     }
 
+    let controllers = sa.ir.controller_text.as_deref().map(|defined| {
+        crate::ability::ability_utils::resolve_defined_players_with_sa(
+            defined, sa, sa.activating_player, ctx.game,
+        )
+    });
+    to_sacrifice.retain(|&cid| {
+        let card = ctx.game.card(cid);
+        controllers.as_ref().is_none_or(|players| players.contains(&card.controller))
+            && !crate::staticability::static_ability_cant_sacrifice::cant_sacrifice(
+                &ctx.game.cards, card, Some(sa), false,
+            )
+    });
+
     // Track per-controller batches to fire SacrificedOnce once per controller after
     // the whole sweep (mirrors Java GameAction.sacrifice line 2133-2138).
     let mut by_controller: std::collections::BTreeMap<crate::ids::PlayerId, Vec<CardId>> =
         std::collections::BTreeMap::new();
 
+    if to_sacrifice.is_empty() { return; }
+    let before = ctx.game.boxed_snapshot();
+    let mut events = Vec::new();
     for card_id in to_sacrifice {
-        if ctx.game.card(card_id).zone != ZoneType::Battlefield {
-            continue;
-        }
-        let controller = ctx.game.card(card_id).controller;
-        let owner = ctx.game.card(card_id).owner;
-        // Capture +1/+1 counter count before move (for Modular death triggers)
-        let lki_p1p1 = *ctx
-            .game
-            .card(card_id)
-            .counters
-            .get(&crate::card::CounterType::P1P1)
-            .unwrap_or(&0);
-        let lki_power = ctx.game.card(card_id).power();
-        let lki_toughness = ctx.game.card(card_id).toughness();
-        // Capture LKI counters for death triggers
-        {
-            let lki_counters = ctx.game.card(card_id).counters.clone();
-            ctx.game.card_mut(card_id).lki_counters = Some(lki_counters);
-            ctx.game
-                .card_mut(card_id)
-                .set_lki_power_toughness(Some(lki_power), Some(lki_toughness));
-        }
-        // Clear temporary Animate triggers before firing events (CR 400.7).
-        {
-            let card = ctx.game.card_mut(card_id);
-            card.clear_pump_triggers();
-        }
-        // Fire Sacrificed trigger
-        ctx.trigger_handler.run_trigger(
-            TriggerType::Sacrificed,
-            RunParams {
-                card: Some(card_id),
-                player: Some(controller),
-                ..Default::default()
-            },
-            false,
-        );
-        emit_zone_trigger_with_lki_counters(
-            ctx.trigger_handler,
-            card_id,
-            ZoneType::Battlefield,
-            ZoneType::Graveyard,
-            lki_p1p1,
-            lki_power,
-            lki_toughness,
-        );
-        ctx.move_card(card_id, ZoneType::Graveyard, owner);
-        ctx.trigger_handler.flush_waiting_triggers(ctx.game);
+        if ctx.game.card(card_id).zone != ZoneType::Battlefield { continue; }
+        let card=before.card(card_id);
+        let controller=card.controller;let owner=card.owner;
+        let p1p1=card.counter_count(&crate::card::CounterType::P1P1);
+        let power=card.power();let toughness=card.toughness();let counters=card.counters.clone();
+        let attached=card.attached_to.map(|id|(id,before.card(id).zone_timestamp));
+        ctx.game.card_mut(card_id).lki_counters=Some(counters);
+        ctx.game.card_mut(card_id).set_lki_power_toughness(Some(power),Some(toughness));
+        let destination=ctx.move_card_destination(card_id,ZoneType::Graveyard,owner);
+        if destination == ZoneType::Battlefield {continue;}
+        events.push((TriggerType::Sacrificed,RunParams{card:Some(card_id),player:Some(controller),..Default::default()}));
+        events.push((TriggerType::ChangesZone,RunParams{card:Some(card_id),card_lki:Some(card_id),origin:Some(ZoneType::Battlefield),destination:Some(destination),lki_p1p1_counters:Some(p1p1),lki_power:Some(power),lki_toughness:Some(toughness),lki_attachment_captured:true,lki_attached_to:attached,..Default::default()}));
         by_controller.entry(controller).or_default().push(card_id);
     }
+    ctx.trigger_handler.match_departure_batch(&before,ctx.game,events);
 
-    crate::game_loop::fire_sacrificed_once_for_batch(ctx.game, ctx.trigger_handler, &by_controller);
+    for (controller, cards) in by_controller {
+        ctx.trigger_handler.run_trigger(TriggerType::SacrificedOnce, RunParams {player:Some(controller),cards:Some(cards),..Default::default()}, false);
+    }
 }
 
 fn can_pay_unless_cost(
@@ -219,4 +213,52 @@ fn can_pay_unless_cost(
         payer,
         Some(sa),
     )
+}
+
+#[cfg(test)]
+mod controller_scope_regression {
+    use crate::{ability::AbilityKey, agent::{PassAgent, PlayerAgent}, card::Card,
+        game::GameState, game_loop::GameLoop, ids::{CardId, PlayerId},
+        spellability::build_spell_ability, zone::magic_stack::StackEntry};
+    use forge_foundation::{CardTypeLine, ColorSet, ManaCost, ZoneType};
+
+    #[test]
+    fn sacrifice_all_obeys_triggered_controller_and_chosen_cards() {
+        for active in 1..4 {
+            let mut game = GameState::new(&["A", "B", "C", "D"], 40);
+            let mut cards = Vec::new();
+            for owner in 0..4 {
+                let mut group = Vec::new();
+                for _ in 0..3 {
+                    let player = PlayerId(owner);
+                    let id = game.create_card(Card::new(CardId(0), "Rat".into(), player,
+                        CardTypeLine::parse("Creature Rat"), ManaCost::parse(""),
+                        ColorSet::COLORLESS, Some(1), Some(1), vec![], vec![]));
+                    game.move_card(id, ZoneType::Battlefield, player);
+                    group.push(id);
+                }
+                cards.push(group);
+            }
+            let source = cards[0][0];
+            game.card_mut(source).set_chosen_cards(cards[active as usize][..2].to_vec());
+            let mut sa = build_spell_ability(&game, source,
+                "DB$ SacrificeAll | ValidCards$ Creature.nonChosenCard | Controller$ TriggeredPlayer", PlayerId(0));
+            sa.is_trigger = true;
+            sa.set_triggering_object(AbilityKey::Player, active.to_string());
+            sa.set_triggering_object(AbilityKey::TriggeredPlayer, PlayerId(active));
+            game.stack.push(StackEntry { id: 1, spell_ability: sa, is_creature_spell: false,
+                is_permanent_spell: false, is_pending_cast: false, cast_from_zone: None,
+                optional_trigger_decider: None, optional_trigger_description: None,
+                optional_trigger_source_name: None });
+            let mut agents: Vec<Box<dyn PlayerAgent>> = (0..4)
+                .map(|_| Box::new(PassAgent) as Box<dyn PlayerAgent>).collect();
+            GameLoop::new(4).resolve_stack(&mut game, &mut agents);
+            for owner in 0..4 {
+                for (index, &id) in cards[owner].iter().enumerate() {
+                    let expected = if owner == active as usize && index == 2 { ZoneType::Graveyard } else { ZoneType::Battlefield };
+                    assert_eq!(game.card(id).zone, expected, "active={active} owner={owner} index={index}");
+                }
+            }
+        }
+    }
 }

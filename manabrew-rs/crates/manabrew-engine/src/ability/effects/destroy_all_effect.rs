@@ -1,6 +1,6 @@
 use forge_foundation::ZoneType;
 
-use super::{emit_zone_trigger_with_lki_counters, matches_valid_cards_for_sa, EffectContext};
+use super::{matches_valid_cards_for_sa, EffectContext};
 use crate::event::RunParams;
 use crate::ids::CardId;
 use crate::replacement::replacement_handler::{apply_replacements, ReplacementEvent};
@@ -40,67 +40,32 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
         }
     }
 
-    // Pass 2 — destroy each card, respecting Indestructible
+    // Capture the shared pre-departure state. Movement replacements are
+    // applied to the actual game before matching events, so an exile replacement
+    // never creates a fictional death trigger.
+    if to_destroy.is_empty() { return; }
+    let before = ctx.game.boxed_snapshot();
+    let mut departed = Vec::new();
     for card_id in to_destroy {
-        if ctx.game.card(card_id).zone != ZoneType::Battlefield {
-            continue; // May have already left (e.g. legendary rule, previous step)
-        }
-        // K:Indestructible keyword fast path (CR 702.12)
-        if ctx.game.card(card_id).has_keyword("Indestructible") {
-            continue;
-        }
-        // R$-based Destroy replacement (e.g. Darksteel Myr's replacement effect)
-        let mut destroy_event = ReplacementEvent::Destroy { target: card_id };
-        let result = apply_replacements(ctx.game, &mut destroy_event);
-        if result == ReplacementResult::Replaced {
-            continue;
-        }
-        let owner = ctx.game.card(card_id).owner;
-        // Capture +1/+1 counter count before move (for Modular death triggers)
-        let lki_p1p1 = *ctx
-            .game
-            .card(card_id)
-            .counters
-            .get(&crate::card::CounterType::P1P1)
-            .unwrap_or(&0);
-        // Capture LKI counters for death triggers
-        {
-            let lki_counters = ctx.game.card(card_id).counters.clone();
-            let lki_power = ctx.game.card(card_id).power();
-            let lki_toughness = ctx.game.card(card_id).toughness();
-            ctx.game.card_mut(card_id).lki_counters = Some(lki_counters);
-            ctx.game
-                .card_mut(card_id)
-                .set_lki_power_toughness(Some(lki_power), Some(lki_toughness));
-        }
-        ctx.move_card(card_id, ZoneType::Graveyard, owner);
-        ctx.trigger_handler.run_trigger(
-            TriggerType::Destroyed,
-            RunParams {
-                card: Some(card_id),
-                causer: sa.source,
-                cause_card: sa.source,
-                cause_player: Some(sa.activating_player),
-                ..Default::default()
-            },
-            false,
-        );
-        emit_zone_trigger_with_lki_counters(
-            ctx.trigger_handler,
-            card_id,
-            ZoneType::Battlefield,
-            ZoneType::Graveyard,
-            lki_p1p1,
-            ctx.game
-                .card(card_id)
-                .lki_power
-                .unwrap_or_else(|| ctx.game.card(card_id).power()),
-            ctx.game
-                .card(card_id)
-                .lki_toughness
-                .unwrap_or_else(|| ctx.game.card(card_id).toughness()),
-        );
+        if ctx.game.card(card_id).zone != ZoneType::Battlefield || ctx.game.card(card_id).has_keyword("Indestructible") { continue; }
+        let mut event = ReplacementEvent::Destroy { target: card_id };
+        if apply_replacements(ctx.game, &mut event) == ReplacementResult::Replaced { continue; }
+        let card = before.card(card_id);
+        let (owner, counters, power, toughness) = (card.owner,card.counters.clone(),card.power(),card.toughness());
+        let p1p1 = card.counter_count(&crate::card::CounterType::P1P1);
+        ctx.game.card_mut(card_id).lki_counters = Some(counters);
+        ctx.game.card_mut(card_id).set_lki_power_toughness(Some(power),Some(toughness));
+        let attached=card.attached_to.map(|id|(id,before.card(id).zone_timestamp));
+        let destination = ctx.move_card_destination(card_id,ZoneType::Graveyard,owner);
+        if destination != ZoneType::Battlefield { departed.push((card_id,destination,p1p1,power,toughness,attached)); }
     }
+    let mut events = Vec::new();
+    for (id,destination,p1p1,power,toughness,attached) in departed {
+        events.push((TriggerType::Destroyed,RunParams{card:Some(id),causer:sa.source,cause_card:sa.source,cause_player:Some(sa.activating_player),..Default::default()}));
+        events.push((TriggerType::ChangesZone,RunParams{card:Some(id),card_lki:Some(id),origin:Some(ZoneType::Battlefield),destination:Some(destination),lki_p1p1_counters:Some(p1p1),lki_power:Some(power),lki_toughness:Some(toughness),lki_attachment_captured:true,lki_attached_to:attached,..Default::default()}));
+    }
+    ctx.trigger_handler.match_departure_batch(&before,ctx.game,events);
+
 }
 
 #[cfg(test)]

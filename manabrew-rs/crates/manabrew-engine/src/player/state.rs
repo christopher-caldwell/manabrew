@@ -31,6 +31,8 @@ pub struct PlayerState {
     pub spells_cast_last_turn: i32,
     pub spells_cast_this_game: i32,
     pub cards_cast_this_turn: Vec<CardId>,
+    #[serde(default)]
+    pub cast_lki_this_turn: Vec<crate::card::Card>,
 
     pub max_hand_size: i32,
     pub starting_hand_size: i32,
@@ -63,12 +65,8 @@ pub struct PlayerState {
     pub damage_prevention: i32,
 
     pub energy_counters: i32,
-    // NOT IMPLEMENTED: experience counters (Commander sets — Meren, Mizzix,
-    // …) and ticket counters (Unfinity stickers). Neither is tracked on
-    // `PlayerState` yet, so `game_view_dto` serialises 0 for both. The DTO
-    // fields (`PlayerDto::experience_counters` / `ticket_counters`) and the UI
-    // badges already exist — the Java host populates them; wire real values
-    // here once these become engine state.
+    #[serde(default)]
+    pub other_counters: std::collections::BTreeMap<String, i32>,
     pub mana_shards: i32,
 
     pub mana_expended_this_turn: i32,
@@ -169,6 +167,7 @@ impl PlayerState {
             spells_cast_last_turn: 0,
             spells_cast_this_game: 0,
             cards_cast_this_turn: Vec::new(),
+            cast_lki_this_turn: Vec::new(),
             max_hand_size: 7,
             starting_hand_size: 7,
             unlimited_hand_size: false,
@@ -192,6 +191,7 @@ impl PlayerState {
             skip_next_untap: false,
             damage_prevention: 0,
             energy_counters: 0,
+            other_counters: Default::default(),
             mana_shards: 0,
             mana_expended_this_turn: 0,
             surveilled_this_turn: 0,
@@ -358,6 +358,7 @@ impl PlayerState {
         self.spells_cast_last_turn = 0;
         self.spells_cast_this_game = 0;
         self.cards_cast_this_turn.clear();
+        self.cast_lki_this_turn.clear();
         self.max_hand_size = 7;
         self.starting_hand_size = 7;
         self.unlimited_hand_size = false;
@@ -376,6 +377,7 @@ impl PlayerState {
         self.skip_next_untap = false;
         self.damage_prevention = 0;
         self.energy_counters = 0;
+        self.other_counters.clear();
         self.mana_shards = 0;
         self.mana_expended_this_turn = 0;
         self.surveilled_this_turn = 0;
@@ -454,6 +456,7 @@ impl PlayerState {
         self.spells_cast_last_turn = self.spells_cast_this_turn;
         self.spells_cast_this_turn = 0;
         self.cards_cast_this_turn.clear();
+        self.cast_lki_this_turn.clear();
         self.life_started_this_turn_with = self.life;
         self.life_lost_last_turn = self.life_lost_this_turn;
         self.life_gained_this_turn = 0;

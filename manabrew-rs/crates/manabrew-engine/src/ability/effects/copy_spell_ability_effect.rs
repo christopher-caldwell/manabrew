@@ -44,19 +44,15 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
         return;
     }
 
-    let original = if let Some(defined) = sa.defined() {
+    let original = if let Some(target) = sa.target_chosen.target_stack_entry {
+        ctx.game.stack.iter().find(|entry| entry.id == target)
+            .map(|entry| entry.spell_ability.clone())
+    } else if let Some(defined) = sa.defined() {
         crate::ability::ability_utils::get_defined_spell_abilities(defined, sa, ctx.game)
             .into_iter()
             .next()
     } else {
-        let stack_entries: Vec<_> = ctx.game.stack.iter().collect();
-        stack_entries.iter().rev().find_map(|entry| {
-            if Some(entry.id) != sa.ir.stack_id {
-                Some(entry.spell_ability.clone())
-            } else {
-                None
-            }
-        })
+        None
     };
 
     let original = match original {
@@ -106,4 +102,67 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
         );
         super::emit_targeting_triggers(ctx, source_id, &trigger_sa);
     }
+}
+
+#[cfg(test)]
+mod copy_target_regression {
+    use crate::{agent::{PassAgent, PlayerAgent}, card::Card, game::GameState,
+        game_loop::GameLoop, ids::{CardId, PlayerId}, spellability::build_spell_ability,
+        zone::magic_stack::StackEntry};
+    use forge_foundation::{CardTypeLine, ColorSet, ManaCost, ZoneType};
+
+    fn entry(sa: crate::spellability::SpellAbility) -> StackEntry {
+        StackEntry { id: 0, spell_ability: sa, is_creature_spell: false, is_permanent_spell: false,
+            is_pending_cast: false, cast_from_zone: None, optional_trigger_decider: None,
+            optional_trigger_description: None, optional_trigger_source_name: None }
+    }
+
+    #[test]
+    fn copy_uses_target_stack_entry_instead_of_topmost_decoy() {
+        let mut game = GameState::new(&["A", "B"], 40);
+        let player = PlayerId(0);
+        let mut ids = Vec::new();
+        for name in ["Target", "Decoy", "Copier"] {
+            let id = game.create_card(Card::new(CardId(0), name.into(), player,
+                CardTypeLine::parse("Instant"), ManaCost::parse(""), ColorSet::COLORLESS,
+                None, None, vec![], vec![]));
+            game.move_card(id, ZoneType::Stack, player);
+            ids.push(id);
+        }
+        let target = build_spell_ability(&game, ids[0], "SP$ GainLife | Defined$ You | LifeAmount$ 1", player);
+        let target_id = game.stack.push(entry(target));
+        let decoy = build_spell_ability(&game, ids[1], "SP$ Draw | Defined$ You | NumCards$ 1", player);
+        game.stack.push(entry(decoy));
+        let mut copier = build_spell_ability(&game, ids[2], "DB$ CopySpellAbility", player);
+        copier.is_trigger = true;
+        copier.target_chosen.target_stack_entry = Some(target_id);
+        game.stack.push(entry(copier));
+        let mut agents: Vec<Box<dyn PlayerAgent>> = (0..2).map(|_| Box::new(PassAgent) as Box<dyn PlayerAgent>).collect();
+        GameLoop::new(2).resolve_stack(&mut game, &mut agents);
+        let copied = game.stack.peek().unwrap();
+        assert_eq!(copied.spell_ability.api, Some(crate::ability::api_type::ApiType::GainLife));
+        assert!(copied.spell_ability.is_copy);
+    }
+    #[test]
+    fn missing_target_does_not_copy_an_unrelated_spell() {
+        let mut game = GameState::new(&["A", "B"], 40);
+        let player = PlayerId(0);
+        let id = game.create_card(Card::new(CardId(0), "Fixture".into(), player,
+            CardTypeLine::parse("Instant"), ManaCost::parse(""), ColorSet::COLORLESS,
+            None, None, vec![], vec![]));
+        game.move_card(id, ZoneType::Stack, player);
+        let decoy = build_spell_ability(&game, id, "SP$ Draw | Defined$ You | NumCards$ 1", player);
+        game.stack.push(entry(decoy));
+        let mut copier = build_spell_ability(&game, id, "DB$ CopySpellAbility", player);
+        copier.is_trigger = true;
+        copier.target_chosen.target_stack_entry = Some(999);
+        game.stack.push(entry(copier));
+        let mut agents: Vec<Box<dyn PlayerAgent>> = (0..2).map(|_| Box::new(PassAgent) as Box<dyn PlayerAgent>).collect();
+        GameLoop::new(2).resolve_stack(&mut game, &mut agents);
+        let top = game.stack.peek().unwrap();
+        assert!(!top.spell_ability.is_copy);
+        assert_eq!(top.spell_ability.api, Some(crate::ability::api_type::ApiType::Draw));
+        assert_eq!(game.stack.iter().count(), 1);
+    }
+
 }

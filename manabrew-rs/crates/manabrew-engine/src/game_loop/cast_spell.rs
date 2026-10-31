@@ -215,7 +215,7 @@ impl GameLoop {
 
         self.trigger_handler.register_active_trigger(game, card_id);
         crate::ability::effects::emit_zone_trigger(
-            &mut self.trigger_handler,
+            &mut self.trigger_handler, game,
             card_id,
             origin_zone,
             ZoneType::Battlefield,
@@ -947,8 +947,8 @@ impl GameLoop {
             let dash_cost_str = game.card(card_id).get_dash_cost().unwrap_or_default();
             forge_foundation::ManaCost::parse(&dash_cost_str)
         } else if is_blitz {
-            let blitz_cost_str = game.card(card_id).get_blitz_cost().unwrap_or_default();
-            forge_foundation::ManaCost::parse(&blitz_cost_str)
+            game.card(card_id).get_blitz_cost().map(|cost| forge_foundation::ManaCost::parse(&cost))
+                .or_else(|| crate::cost::cost_adjustment::granted_stack_blitz_cost(game, game.card(card_id), player))?
         } else if is_emerge {
             let emerge_cost_str = game.card(card_id).get_emerge_cost().unwrap_or_default();
             forge_foundation::ManaCost::parse(&emerge_cost_str)
@@ -1349,7 +1349,12 @@ impl GameLoop {
             // until canPayManaCost fails, then return the last payable X.
             // This correctly handles multi-color sources that inflate
             // pool.total_mana() but can only produce one mana per activation.
-            let available_mana = mana::calculate_available_mana(self.pool(player), game, player);
+            let mut x_context = mana::payment_context_for_sa(game, &sa);
+            x_context.is_spell = true;
+            x_context.is_activated_ability = false;
+            let available_mana = mana::calculate_available_mana_with_context(
+                self.pool(player), game, player, None, &[], Some(&x_context),
+            );
             let non_x_cost = mana_cost.without_x();
             let x_cost_adjustment =
                 crate::cost::cost_adjustment::compute_cost_adjustment_for_payment(
@@ -1461,17 +1466,6 @@ impl GameLoop {
         macro_rules! rollback_cast {
             () => {{
                 self.restore_snapshot(game, &cast_rollback_snapshot);
-                return None;
-            }};
-        }
-        macro_rules! rollback_cast_preserving_taps {
-            ($tapped_cards:expr) => {{
-                self.restore_snapshot(game, &cast_rollback_snapshot);
-                for tapped_id in $tapped_cards {
-                    if game.card_is_in_zone(tapped_id, ZoneType::Battlefield) {
-                        game.card_mut(tapped_id).set_tapped(true);
-                    }
-                }
                 return None;
             }};
         }
@@ -1681,6 +1675,7 @@ impl GameLoop {
                 .collect();
             mana::ManaPaymentContext {
                 is_spell: true,
+                payment_card: Some(card_id),
                 is_activated_ability: false,
                 sa_on_stack: true,
                 type_line: Some(card.type_line.clone()),
@@ -1720,10 +1715,9 @@ impl GameLoop {
         let keywords_before = self.pool(player).collect_keyword_mana();
         let counters_before = self.pool(player).collect_counter_mana();
         let triggers_before = self.pool(player).collect_trigger_mana();
-        // Track pool size before payment for ManaExpend
-        let pool_size_before = self.pool(player).total_mana();
         let colors_spent_to_cast = std::cell::Cell::new(0u16);
         let paying_mana_to_cast = std::cell::RefCell::new(Vec::new());
+        let paying_sources_to_cast = std::cell::RefCell::new(Vec::new());
         let failed_non_undoable_choices: std::cell::RefCell<Vec<(CardId, usize)>> =
             std::cell::RefCell::new(Vec::new());
 
@@ -1813,7 +1807,8 @@ impl GameLoop {
                                     let non_undoable = game
                                         .card(choice.card_id)
                                         .activated_abilities
-                                        .get(idx)
+                                        .iter()
+                                        .find(|ab| ab.ability_index == idx)
                                         .is_some_and(|ab| {
                                             ab.cost.parts.iter().any(|part| {
                                                 !matches!(
@@ -1836,6 +1831,7 @@ impl GameLoop {
                         paying_mana_to_cast
                             .borrow_mut()
                             .extend(result.paying_mana.iter().copied());
+                        paying_sources_to_cast.borrow_mut().extend(result.paying_mana_sources.iter().copied());
                         for &tapped_id in &result.tapped {
                             slf.trigger_handler.run_trigger(
                                 TriggerType::Taps,
@@ -1886,6 +1882,7 @@ impl GameLoop {
                         paying_mana_to_cast
                             .borrow_mut()
                             .extend(payment.paying_mana.iter().copied());
+                        paying_sources_to_cast.borrow_mut().extend(payment.paying_mana_sources.iter().copied());
                         if payment.life_paid > 0 {
                             slf.pay_life_cost(game, player, card_id, payment.life_paid);
                         }
@@ -1897,13 +1894,27 @@ impl GameLoop {
             );
             if !mana_payment.paid {
                 if mana_payment.preserve_taps_on_failure {
-                    let tapped_after_failed_mana_payment: Vec<CardId> = game
-                        .cards
-                        .iter()
-                        .filter(|card| card.zone == ZoneType::Battlefield && card.tapped)
-                        .map(|card| card.id)
-                        .collect();
-                    rollback_cast_preserving_taps!(tapped_after_failed_mana_payment);
+                    // Mana is paid before ordinary additional/alternate costs.
+                    // Preserve irreversible mana-ability effects and undo the
+                    // pending cast without replaying those effects. Cost
+                    // reductions that already mutate game state need a richer
+                    // transaction; abort explicitly instead of emitting a
+                    // corrupted game when they are present.
+                    let card = game.card(card_id);
+                    let mutated_reduction = card.has_keyword("Delve") || (card.has_keyword("Convoke") && (!sa.convoke_tapped.is_empty() || mana_payment.convoke_used))
+                        || card.has_keyword("Improvise") || card.get_offering_type().is_some()
+                        || sa.alt_cost == Some(crate::spellability::AlternativeCost::Emerge);
+                    if !sa.is_spell || mutated_reduction || game.card_current_zone(card_id) != ZoneType::Stack {
+                        panic!("unsupported irreversible mana rollback with mutating cost reduction or moved pending spell");
+                    }
+                    if let Some(id) = pending_stack_id { game.stack.remove_by_id(id); }
+                    let owner = game.card(card_id).owner;
+                    // Returning an uncompleted flashback cast is a reversal,
+                    // not the spell leaving the stack after being cast.
+                    if is_flashback { game.card_mut(card_id).cast_with_flashback = false; }
+                    if is_harmonize { game.card_mut(card_id).cast_with_harmonize = false; }
+                    game.move_card(card_id, announced_from_zone, owner);
+                    return None;
                 }
                 let non_undoable = std::mem::take(&mut *failed_non_undoable_choices.borrow_mut());
                 self.restore_snapshot(game, &cast_rollback_snapshot);
@@ -1939,13 +1950,15 @@ impl GameLoop {
 
         game.card_mut(card_id)
             .set_colors_spent_to_cast(colors_spent_to_cast.get());
+        let paid_mana = paying_mana_to_cast.into_inner();
+        let mana_spent = paid_mana.len() as i32;
+        sa.paying_mana = paid_mana.clone();
+        sa.paying_mana_sources = paying_sources_to_cast.into_inner();
         game.card_mut(card_id)
-            .set_paying_mana_to_cast(paying_mana_to_cast.into_inner());
+            .set_paying_mana_to_cast(paid_mana);
 
         // Fire ManaExpend triggers (Expend mechanic — cumulative per-turn tracking)
         {
-            let pool_size_after = self.pool(player).total_mana();
-            let mana_spent = pool_size_before - pool_size_after;
             if mana_spent > 0 {
                 let starting = game.player(player).mana_expended_this_turn;
                 let total = starting + mana_spent;
@@ -2741,4 +2754,780 @@ impl GameLoop {
             game.add_card_to_zone_bottom(ZoneType::Library, player, card_id);
         }
     }
+}
+
+#[cfg(test)]
+mod actual_mana_spend_regression {
+    use super::*;
+    use crate::agent::{PlayerAgent, PriorityActionSpace, TargetChoice};
+    use crate::player::actions::PlayerAction;
+    use crate::combat::DefenderId;
+    use crate::mana::ManaPool;
+    use forge_carddb::parse_card_script;
+    thread_local! { static TARGET_SELECTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+                    static CANCEL_MANA: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+                    static TAP_BEFORE_FAILURE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+                    static ATTACK_FIXTURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+                    static TAX_PROMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+                    static ATTACK_PROMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+                    static OBSERVED_DISQUALIFIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+                    static DELTA_EXTRA: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+                    static DELTA_SELECTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+                    static DELTA_CAP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+                    static DELTA_REQUIREMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+                    static DELTA_AVAILABLE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+                    static DELTA_GOAD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+                    static DELTA_GOAD_LEGAL: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+    thread_local! { static CONVOKE_FIXTURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+    struct AutoAgent(bool, bool);
+impl PlayerAgent for AutoAgent {
+    fn choose_targets_for(
+        &mut self,
+        sa: &mut SpellAbility,
+        game: &GameState,
+        _mana_pools: &[ManaPool],
+    ) -> bool {
+        if sa.api == Some(crate::ability::api_type::ApiType::Counter) {
+            sa.target_chosen.target_stack_entry = game.stack.iter().find(|entry| !entry.is_pending_cast).map(|entry| entry.id);
+            sa.target_chosen.target_stack_entry.is_some()
+        } else if sa.target_restrictions.is_some() {
+            sa.target_chosen.target_card = game.cards_in_zone(ZoneType::Graveyard, sa.activating_player)
+                .iter().copied().find(|id| game.card(*id).is_creature());
+            let selected = sa.target_chosen.target_card.is_some();
+            TARGET_SELECTED.with(|value| value.set(selected));
+            selected
+        } else { true }
+    }
+
+    fn mulligan_decision(
+        &mut self,
+        _player: PlayerId,
+        _hand: &[CardId],
+        _mulligan_count: u32,
+    ) -> bool {
+        true
+    }
+
+    fn choose_action(
+        &mut self,
+        _player: PlayerId,
+        _action_space: Option<&PriorityActionSpace>,
+        _request_action_space: &mut dyn FnMut() -> PriorityActionSpace,
+    ) -> PlayerAction {
+        PlayerAction::PassPriority
+    }
+
+    fn set_attack_requirements(&mut self, required: &[CardId], _goaded: &[(CardId, PlayerId)], legal: &[(CardId, Vec<DefenderId>)], _max: Option<usize>, _limits: &[(DefenderId, usize)]) {
+        if DELTA_CAP.with(|v|v.get()) {DELTA_REQUIREMENTS.with(|v|v.set(required.len())); DELTA_AVAILABLE.with(|v|v.set(legal.len())); DELTA_GOAD.with(|v|v.set(_goaded.len())); DELTA_GOAD_LEGAL.with(|v|v.set(_goaded.first().and_then(|(id,_)|legal.iter().find(|(x,_)|x==id)).map(|(_,d)|d.len()).unwrap_or(0)));}
+    }
+    fn choose_attackers(
+        &mut self,
+        _player: PlayerId,
+        _available: &[CardId],
+        _possible_defenders: &[DefenderId],
+    ) -> Vec<(CardId, DefenderId)> {
+        if ATTACK_FIXTURE.with(|f| f.get()) { ATTACK_PROMPTS.with(|v| v.set(v.get()+1)); _available.iter().take(if DELTA_CAP.with(|v|v.get()) {1} else {usize::MAX}).map(|&id| (id, _possible_defenders[0])).collect() }
+        else { Vec::new() }
+    }
+
+    fn pay_combat_cost(&mut self, _player: PlayerId, _attacker: CardId, _cost: i32, _description: &str,
+        _options: &[crate::agent::ManaAbilityOption], _tappable: &[CardId], _untappable: &[CardId], _pool: i32)
+        -> crate::agent::CombatCostAction {
+        let n = TAX_PROMPTS.with(|v| { let n=v.get(); v.set(n+1); n });
+        if n < if self.0 { 2 } else { 1 } {
+            crate::agent::CombatCostAction::TapLand { card_id: _tappable[0], mana_ability_index: None, express_choice: None }
+        } else if self.0 { crate::agent::CombatCostAction::Pay } else { crate::agent::CombatCostAction::Decline }
+    }
+
+    fn choose_blockers(
+        &mut self,
+        _player: PlayerId,
+        _attackers: &[CardId],
+        _available_blockers: &[CardId],
+        _max_blockers: Option<usize>,
+    ) -> Vec<(CardId, CardId)> {
+        Vec::new() // no blockers
+    }
+
+    fn choose_target_player(
+        &mut self,
+        _player: PlayerId,
+        valid: &[PlayerId],
+        _sa: Option<&SpellAbility>,
+    ) -> Option<PlayerId> {
+        valid.first().copied()
+    }
+
+    fn choose_target_card(
+        &mut self,
+        _player: PlayerId,
+        valid: &[CardId],
+        _sa: Option<&SpellAbility>,
+    ) -> Option<CardId> {
+        valid.first().copied()
+    }
+
+    fn choose_target_any(
+        &mut self,
+        _player: PlayerId,
+        valid_players: &[PlayerId],
+        valid_cards: &[CardId],
+        _sa: Option<&SpellAbility>,
+    ) -> TargetChoice {
+        if let Some(&pid) = valid_players.first() {
+            TargetChoice::Player(pid)
+        } else if let Some(&cid) = valid_cards.first() {
+            TargetChoice::Card(cid)
+        } else {
+            TargetChoice::None
+        }
+    }
+
+    fn choose_sacrifice(
+        &mut self,
+        _player: PlayerId,
+        valid: &[CardId],
+        _source: Option<CardId>,
+    ) -> Option<CardId> {
+        assert!(TARGET_SELECTED.with(|value| value.get()), "targets must be chosen before sacrifice payment");
+        if self.1 { None } else { valid.first().copied() }
+    }
+
+    fn choose_land_or_spell(&mut self, _player: PlayerId) -> Option<bool> { None }
+    fn choose_kicker(&mut self, _player: PlayerId, _cost: &str, _source: Option<CardId>) -> bool { let yes=DELTA_EXTRA.with(|v| v.get()); if yes { DELTA_SELECTED.with(|v| v.set(true)); } yes }
+    fn choose_multikicker(&mut self, _player: PlayerId, _cost: &str, max: u32, _source: Option<CardId>) -> u32 { if DELTA_EXTRA.with(|v| v.get()) {max.min(1)} else {0} }
+    fn choose_replicate(&mut self, _player: PlayerId, _cost: &str, max: u32, _source: Option<CardId>) -> u32 { if DELTA_EXTRA.with(|v| v.get()) && max>0 {DELTA_SELECTED.with(|v| v.set(true)); 1} else {0} }
+    fn confirm_action(&mut self, _player: PlayerId, _mode: Option<&str>, _message: &str,
+        _options: &[String], _source: Option<CardId>, _api: Option<crate::ability::api_type::ApiType>) -> bool { true }
+    fn confirm_payment(&mut self, _player: PlayerId, _kind: &str, _message: &str,
+        _source: Option<CardId>, _api: Option<crate::ability::api_type::ApiType>) -> bool { self.0 }
+    fn pay_mana_cost(&mut self, _player: PlayerId, _card_id: CardId, _card_name: &str,
+        _mana_cost: &str, _display: &str, _checkpoint: &str, _can_confirm: bool,
+        _allow_reserved: bool, _reserved: &[CardId], _options: &[crate::agent::ManaAbilityOption],
+        tappable: &[CardId], _untappable: &[CardId], _pool: &crate::mana::ManaPool)
+        -> crate::agent::ManaCostAction {
+            if CONVOKE_FIXTURE.with(|v| v.get()) {
+                if _can_confirm { return crate::agent::ManaCostAction::Pay {auto:false}; }
+                return crate::agent::ManaCostAction::TapForMana {card_id:*tappable.last().expect("convoke creature"), mana_ability_index:Some(usize::MAX), express_choice:None};
+            }
+            if TAP_BEFORE_FAILURE.with(|value| { let left = value.get(); if left > 0 { value.set(left - 1); true } else { false } }) {
+                crate::agent::ManaCostAction::TapForMana { card_id: tappable[0], mana_ability_index: None, express_choice: None }
+            } else if CANCEL_MANA.with(|value| value.get()) {
+                if _pool.total_mana() > 3 && _untappable.is_empty() { OBSERVED_DISQUALIFIED.with(|v| v.set(true)); }
+                crate::agent::ManaCostAction::AttemptedAndFailed }
+            else { crate::agent::ManaCostAction::Pay { auto: self.0 } }
+        }
+
+}
+    #[test]
+    fn auto_tapped_mana_counts_actual_spent_units() {
+        let mut game = GameState::new(&["A", "B"], 40);
+        let player = PlayerId(0);
+        let land = parse_card_script("Name:Forest\nTypes:Basic Land Forest\nA:AB$ Mana | Cost$ T | Produced$ G").unwrap();
+        for _ in 0..2 {
+            let id = game.create_card(Card::from_rules(&land, player));
+            game.move_card(id, ZoneType::Battlefield, player);
+        }
+        let spell = parse_card_script("Name:Fixture\nManaCost:1 G\nTypes:Sorcery\nA:SP$ GainLife | Defined$ You | LifeAmount$ 1").unwrap();
+        let id = game.create_card(Card::from_rules(&spell, player));
+        game.move_card(id, ZoneType::Hand, player);
+        let sa = crate::spellability::build_spell_ability(&game, id,
+            "SP$ GainLife | Defined$ You | LifeAmount$ 1", player);
+        let mut agents: Vec<Box<dyn PlayerAgent>> = (0..2).map(|_| Box::new(AutoAgent(true, false)) as Box<dyn PlayerAgent>).collect();
+        let mut game_loop = GameLoop::new(2);
+        assert!(game_loop.cast_card_spell_ability(&mut game, &mut agents, player, sa, false).is_some());
+        assert_eq!(game.player(player).mana_expended_this_turn, 2);
+        let observed = &game.stack.iter().find(|entry| entry.spell_ability.source == Some(id)).unwrap().spell_ability;
+        assert_eq!(observed.paying_mana.len(), 2);
+        let mut sources = observed.paying_mana_sources.clone();
+        sources.sort();
+        assert_eq!(sources, vec![Some(CardId(0)), Some(CardId(1))]);
+    }
+    #[test]
+    fn floating_mana_payment_and_failed_payment_preserve_actual_counts() {
+        for units in [1, 2] {
+            let mut game = GameState::new(&["A", "B"], 40);
+            let player = PlayerId(0);
+            let spell = parse_card_script("Name:Fixture\nManaCost:1 G\nTypes:Sorcery\nA:SP$ GainLife | Defined$ You | LifeAmount$ 1").unwrap();
+            let id = game.create_card(Card::from_rules(&spell, player));
+            game.move_card(id, ZoneType::Hand, player);
+            let sa = crate::spellability::build_spell_ability(&game, id,
+                "SP$ GainLife | Defined$ You | LifeAmount$ 1", player);
+            let mut agents: Vec<Box<dyn PlayerAgent>> = (0..2).map(|_| Box::new(AutoAgent(false, false)) as Box<dyn PlayerAgent>).collect();
+            let mut game_loop = GameLoop::new(2);
+            game_loop.pool_mut(player).add(forge_foundation::mana::ManaAtom::GREEN, units);
+            let result = game_loop.cast_card_spell_ability(&mut game, &mut agents, player, sa, false);
+            assert_eq!(result.is_some(), units == 2);
+            assert_eq!(game.player(player).mana_expended_this_turn, if units == 2 { 2 } else { 0 });
+            if units == 1 { assert_eq!(game.card(id).zone, ZoneType::Hand); }
+        }
+    }
+
+    #[test]
+    fn unless_payer_can_pay_or_decline_and_draw_goes_to_controller() {
+        assert_eq!(crate::cost::to_prompt_string(&crate::cost::parse_cost("1")), "{1}");
+        for pay in [false, true] {
+            let mut game = GameState::new(&["A", "B", "C", "D"], 40);
+            let owner = PlayerId(0);
+            let source_rules = parse_card_script("Name:Fixture\nManaCost:2 U\nTypes:Enchantment").unwrap();
+            let source = game.create_card(Card::from_rules(&source_rules, owner));
+            game.move_card(source, ZoneType::Battlefield, owner);
+            let draw_rules = parse_card_script("Name:Card\nManaCost:1\nTypes:Artifact").unwrap();
+            let drawn = game.create_card(Card::from_rules(&draw_rules, owner));
+            game.move_card(drawn, ZoneType::Library, owner);
+            let mut sa = crate::spellability::build_spell_ability(&game, source,
+                "DB$ Draw | Defined$ You | UnlessCost$ 1 | UnlessPayer$ TriggeredActivator | NumCards$ 1 | OptionalDecider$ You", owner);
+            sa.is_trigger = true;
+            sa.set_triggering_object(crate::ability::AbilityKey::Activator, PlayerId(2));
+            game.stack.push(crate::zone::magic_stack::StackEntry { id: 1, spell_ability: sa,
+                is_creature_spell: false, is_permanent_spell: false, is_pending_cast: false,
+                cast_from_zone: None, optional_trigger_decider: None, optional_trigger_description: None,
+                optional_trigger_source_name: None });
+            let mut agents: Vec<Box<dyn PlayerAgent>> = (0..4).map(|seat|
+                Box::new(AutoAgent(if seat == 2 { pay } else { true }, false)) as Box<dyn PlayerAgent>).collect();
+            let mut game_loop = GameLoop::new(4);
+            game_loop.pool_mut(PlayerId(2)).add(forge_foundation::mana::ManaAtom::GREEN, 1);
+            game_loop.resolve_stack(&mut game, &mut agents);
+            assert_eq!(game.card(drawn).zone, if pay { ZoneType::Library } else { ZoneType::Hand });
+            assert_eq!(game_loop.pool(PlayerId(2)).total_mana(), if pay { 0 } else { 1 });
+            assert_eq!(game.cards_in_zone(ZoneType::Hand, PlayerId(2)).len(), 0);
+        }
+    }
+
+    #[test]
+    fn flashback_pays_three_distinct_creatures_and_normal_cast_uses_mana() {
+        std::thread::Builder::new().stack_size(32 * 1024 * 1024).spawn(|| {
+        for (count, flashback, cancel) in [(3, true, false), (2, true, false), (0, false, false), (3, true, true)] {
+            TARGET_SELECTED.with(|value| value.set(false));
+            let mut game = GameState::new(&["A", "B"], 40);
+            let player = PlayerId(0);
+            let creature = parse_card_script("Name:Rat\nManaCost:1\nTypes:Creature Rat\nPT:1/1").unwrap();
+            let mut creatures = Vec::new();
+            for _ in 0..count {
+                let id = game.create_card(Card::from_rules(&creature, player));
+                game.move_card(id, ZoneType::Battlefield, player);
+                creatures.push(id);
+            }
+            let target = game.create_card(Card::from_rules(&creature, player));
+            game.move_card(target, ZoneType::Graveyard, player);
+            let rules = parse_card_script("Name:Fixture\nManaCost:2 B B\nTypes:Sorcery\nK:Flashback:Sac<3/Creature>\nA:SP$ ChangeZone | Origin$ Graveyard | Destination$ Battlefield | ValidTgts$ Creature.YouCtrl").unwrap();
+            let id = game.create_card(Card::from_rules(&rules, player));
+            game.move_card(id, if flashback { ZoneType::Graveyard } else { ZoneType::Hand }, player);
+            let mut sa = crate::spellability::build_spell_ability(&game, id,
+                "SP$ ChangeZone | Origin$ Graveyard | Destination$ Battlefield | ValidTgts$ Creature.YouCtrl", player);
+            sa.target_chosen.target_card = Some(target);
+            if flashback { sa.alt_cost = Some(crate::spellability::AlternativeCost::Flashback); }
+            let mut agents: Vec<Box<dyn PlayerAgent>> = (0..2).map(|_| Box::new(AutoAgent(false, cancel)) as Box<dyn PlayerAgent>).collect();
+            let mut game_loop = GameLoop::new(2);
+            if !flashback { game_loop.pool_mut(player).add(forge_foundation::mana::ManaAtom::BLACK, 4); }
+            let result = game_loop.cast_card_spell_ability(&mut game, &mut agents, player, sa, false);
+            assert_eq!(result.is_some(), (count == 3 && !cancel) || !flashback, "count={count}, flashback={flashback}, cancel={cancel}");
+            if count == 3 && !cancel { assert!(creatures.iter().all(|&c| game.card(c).zone == ZoneType::Graveyard)); }
+            if count == 2 || cancel { assert!(creatures.iter().all(|&c| game.card(c).zone == ZoneType::Battlefield)); }
+            if result.is_some() { assert_eq!(game.stack.peek().unwrap().spell_ability.target_chosen.target_card, Some(target)); }
+        }
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn alternate_exile_and_life_payment_keeps_floating_mana_and_requires_blue_card() {
+        std::thread::Builder::new().stack_size(32 * 1024 * 1024).spawn(|| {
+        for have_blue in [true, false] {
+            let mut game = GameState::new(&["A", "B"], 40);
+            let player = PlayerId(0);
+            let spell = parse_card_script("Name:Target\nManaCost:1\nTypes:Sorcery\nA:SP$ GainLife | Defined$ You | LifeAmount$ 1").unwrap();
+            let target = game.create_card(Card::from_rules(&spell, PlayerId(1)));
+            game.move_card(target, ZoneType::Stack, PlayerId(1));
+            let target_sa = crate::spellability::build_spell_ability(&game, target, "SP$ GainLife | Defined$ You | LifeAmount$ 1", PlayerId(1));
+            game.stack.push(crate::zone::magic_stack::StackEntry { id: 0, spell_ability: target_sa,
+                is_creature_spell: false, is_permanent_spell: false, is_pending_cast: false,
+                cast_from_zone: None, optional_trigger_decider: None, optional_trigger_description: None,
+                optional_trigger_source_name: None });
+            let force_rules = parse_card_script("Name:Fixture\nManaCost:3 U U\nTypes:Instant\nS:Mode$ AlternativeCost | ValidSA$ Spell.Self | EffectZone$ All | Cost$ PayLife<1> ExileFromHand<1/Card.Blue+Other>\nA:SP$ Counter | TargetType$ Spell | ValidTgts$ Card | Destination$ Graveyard").unwrap();
+            let force = game.create_card(Card::from_rules(&force_rules, player));
+            game.move_card(force, ZoneType::Hand, player);
+            let blue_rules = parse_card_script("Name:Blue card\nManaCost:U\nTypes:Sorcery").unwrap();
+            let blue = game.create_card(Card::from_rules(&blue_rules, player));
+            game.move_card(blue, if have_blue { ZoneType::Hand } else { ZoneType::Graveyard }, player);
+            let mut game_loop = GameLoop::new(2);
+            game_loop.pool_mut(player).add(forge_foundation::mana::ManaAtom::BLUE, 2);
+            let prepared = game_loop.prepare_card_spell_ability(&game, player, force,
+                crate::agent::PlayOption { card_id: force, mode: crate::agent::PlayCardMode::StaticAlternative, alt_cost_index: 0 });
+            if !have_blue { assert!(prepared.is_none()); assert_eq!(game.player(player).life, 40); continue; }
+            let mut agents: Vec<Box<dyn PlayerAgent>> = (0..2).map(|_| Box::new(AutoAgent(false, false)) as Box<dyn PlayerAgent>).collect();
+            let result = game_loop.play_spell_ability(&mut game, &mut agents, player, prepared.unwrap());
+            assert!(result.is_some());
+            assert_eq!(game.player(player).life, 39);
+            assert_eq!(game.card(blue).zone, ZoneType::Exile);
+            assert_eq!(game.player(player).mana_expended_this_turn, 0);
+            assert_eq!(game_loop.pool(player).total_mana(), 2);
+            assert!(game.stack.peek().unwrap().spell_ability.paying_mana.is_empty());
+        }
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn activated_cost_records_actual_spend_and_rollback() {
+        for (auto, units, succeeds) in [(false, 2, true), (false, 1, false), (true, 0, true)] {
+            let mut game = GameState::new(&["A", "B"], 40);
+            let player = PlayerId(0);
+            let source_rules = parse_card_script("Name:Ability Fixture\nTypes:Artifact").unwrap();
+            let id = game.create_card(Card::from_rules(&source_rules, player));
+            game.move_card(id, ZoneType::Battlefield, player);
+            if auto {
+                let land = parse_card_script("Name:Forest\nTypes:Basic Land Forest\nA:AB$ Mana | Cost$ T | Produced$ G").unwrap();
+                for _ in 0..2 { let land_id = game.create_card(Card::from_rules(&land, player)); game.move_card(land_id, ZoneType::Battlefield, player); }
+            }
+            let mut agents: Vec<Box<dyn PlayerAgent>> = (0..2).map(|_| Box::new(AutoAgent(auto, false)) as Box<dyn PlayerAgent>).collect();
+            let mut game_loop = GameLoop::new(2);
+            for n in 0..units {
+                let mut mana = crate::mana::Mana::simple(forge_foundation::mana::ManaAtom::GREEN);
+                mana.source_card = Some(CardId(80 + n as u32));
+                game_loop.pool_mut(player).add_mana(mana);
+            }
+            let mut sa = crate::spellability::build_spell_ability(&game, id,
+                "AB$ GainLife | Cost$ 1 G | LifeAmount$ 1", player);
+            let paid = game_loop.pay_ability_cost(&mut game, &mut agents, player, id,
+                &crate::cost::parse_cost("1 G"), None, false,
+                crate::game_loop::cost_payment::CostPaymentContext::ActivatedAbility, Some(&mut sa));
+            assert_eq!(paid, succeeds);
+            assert_eq!(sa.paying_mana.len(), if succeeds { 2 } else { 0 });
+            if succeeds && auto { assert_eq!(sa.paying_mana_sources, vec![Some(CardId(1)), Some(CardId(2))]); }
+            if succeeds && !auto { assert_eq!(sa.paying_mana_sources, vec![Some(CardId(80)), Some(CardId(81))]); }
+            if !succeeds { assert!(sa.paying_mana_sources.is_empty()); }
+            // Expend counts mana spent on spells, not activated abilities.
+            assert_eq!(game.player(player).mana_expended_this_turn, 0);
+            if !succeeds { assert_eq!(game_loop.pool(player).total_mana(), 1); }
+        }
+    }
+
+    #[test]
+    fn x_payment_records_sources_and_cancel_restores_pool() {
+        for cancelled in [false, true] {
+            let mut game = GameState::new(&["A", "B"], 40);
+            let player = PlayerId(0);
+            let spell = parse_card_script("Name:X Fixture\nManaCost:X G\nTypes:Instant\nA:SP$ GainLife | Defined$ You | LifeAmount$ 1").unwrap();
+            let id = game.create_card(Card::from_rules(&spell, player));
+            game.move_card(id, ZoneType::Hand, player);
+            let sa = crate::spellability::build_spell_ability(&game, id,
+                "SP$ GainLife | Defined$ You | LifeAmount$ 1", player);
+            let mut agents: Vec<Box<dyn PlayerAgent>> = (0..2).map(|_| Box::new(AutoAgent(false, false)) as Box<dyn PlayerAgent>).collect();
+            let mut game_loop = GameLoop::new(2);
+            for n in 0..5 {
+                let mut mana = crate::mana::Mana::simple(forge_foundation::mana::ManaAtom::GREEN);
+                mana.source_card = Some(CardId(80+n));
+                game_loop.pool_mut(player).add_mana(mana);
+            }
+            CANCEL_MANA.with(|value| value.set(cancelled));
+            let result = game_loop.cast_card_spell_ability(&mut game, &mut agents, player, sa, false);
+            CANCEL_MANA.with(|value| value.set(false));
+            if cancelled {
+                assert!(result.is_none());
+                assert_eq!(game_loop.pool(player).total_mana(), 5);
+                assert_eq!(game.card(id).zone, ZoneType::Hand);
+                assert_eq!(game.player(player).mana_expended_this_turn, 0);
+            } else {
+                assert!(result.is_some());
+                let paid = &game.stack.iter().find(|entry| entry.spell_ability.source == Some(id)).unwrap().spell_ability;
+                assert_eq!(paid.x_mana_cost_paid, 4);
+                assert_eq!(paid.paying_mana.len(), 5);
+                assert_eq!(paid.paying_mana_sources.len(), 5);
+                assert_eq!(game_loop.pool(player).total_mana(), 0);
+                assert_eq!(game.player(player).mana_expended_this_turn, 5);
+            }
+        }
+    }
+
+    #[test]
+    fn failed_x_cast_does_not_lose_mana_from_a_partial_land_tap() {
+        std::thread::Builder::new().stack_size(32 * 1024 * 1024).spawn(|| {
+        for tap_count in [1, 2] {
+        let mut game = GameState::new(&["A", "B"], 40);
+        let player = PlayerId(0);
+        let spell = parse_card_script("Name:X Fixture\nManaCost:X G\nTypes:Instant\nA:SP$ GainLife | Defined$ You | LifeAmount$ 1").unwrap();
+        let id = game.create_card(Card::from_rules(&spell, player));
+        game.move_card(id, ZoneType::Hand, player);
+        let land = parse_card_script("Name:Forest\nTypes:Basic Land Forest\nA:AB$ Mana | Cost$ T | Produced$ G").unwrap();
+        let mut lands = Vec::new();
+        for _ in 0..2 { let cid = game.create_card(Card::from_rules(&land, player)); game.move_card(cid, ZoneType::Battlefield, player); lands.push(cid); }
+        let sa = crate::spellability::build_spell_ability(&game, id, "SP$ GainLife | Defined$ You | LifeAmount$ 1", player);
+        let mut agents: Vec<Box<dyn PlayerAgent>> = (0..2).map(|_| Box::new(AutoAgent(false, false)) as Box<dyn PlayerAgent>).collect();
+        let mut game_loop = GameLoop::new(2);
+        game_loop.pool_mut(player).add(forge_foundation::mana::ManaAtom::GREEN, 3);
+        CANCEL_MANA.with(|value| value.set(true)); TAP_BEFORE_FAILURE.with(|value| value.set(tap_count));
+        let result = game_loop.cast_card_spell_ability(&mut game, &mut agents, player, sa, false);
+        CANCEL_MANA.with(|value| value.set(false)); TAP_BEFORE_FAILURE.with(|value| value.set(0));
+        assert!(result.is_none());
+        assert_eq!(game.card(id).zone, ZoneType::Hand);
+        let tapped = lands.iter().filter(|&&cid| game.card(cid).tapped).count();
+        // Either undo the reversible land ability, or retain its produced mana.
+        assert_eq!(game_loop.pool(player).total_mana(), 3 + tapped as i32);
+        }
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn failed_cast_after_sacrificing_mana_source_preserves_resources() {
+        std::thread::Builder::new().stack_size(32 * 1024 * 1024).spawn(|| {
+        let mut game = GameState::new(&["A", "B"], 40);
+        let player = PlayerId(0);
+        let spell = parse_card_script("Name:Fixture\nManaCost:G\nTypes:Instant\nA:SP$ GainLife | Defined$ You | LifeAmount$ 1").unwrap();
+        let id = game.create_card(Card::from_rules(&spell, player));
+        game.move_card(id, ZoneType::Hand, player);
+        let treasure = parse_card_script("Name:Treasure Fixture\nTypes:Artifact\nA:AB$ Mana | Cost$ T Sac<1/CARDNAME> | Produced$ G").unwrap();
+        let source = game.create_card(Card::from_rules(&treasure, player));
+        game.move_card(source, ZoneType::Battlefield, player);
+        let sa = crate::spellability::build_spell_ability(&game, id, "SP$ GainLife | Defined$ You | LifeAmount$ 1", player);
+        let mut agents: Vec<Box<dyn PlayerAgent>> = (0..2).map(|_| Box::new(AutoAgent(false, false)) as Box<dyn PlayerAgent>).collect();
+        let mut game_loop = GameLoop::new(2);
+        CANCEL_MANA.with(|value| value.set(true)); TAP_BEFORE_FAILURE.with(|value| value.set(1));
+        let result = game_loop.cast_card_spell_ability(&mut game, &mut agents, player, sa, false);
+        assert_eq!(TAP_BEFORE_FAILURE.with(|value| value.get()), 0, "mana source was not offered");
+        CANCEL_MANA.with(|value| value.set(false)); TAP_BEFORE_FAILURE.with(|value| value.set(0));
+        assert!(result.is_none());
+        assert_eq!(game.card(id).zone, ZoneType::Hand);
+        let restored = game.card(source).zone == ZoneType::Battlefield && !game.card(source).tapped;
+        let spent = game.card(source).zone == ZoneType::Graveyard && game_loop.pool(player).total_mana() == 1;
+        assert!(restored && game_loop.pool(player).total_mana() == 0 || spent, "source zone {:?}, tapped {}, pool {}", game.card(source).zone, game.card(source).tapped, game_loop.pool(player).total_mana());
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn actual_attack_tax_payment_and_decline_restore_attackers() {
+        std::thread::Builder::new().stack_size(32 * 1024 * 1024).spawn(|| {
+        for pay in [true, false] {
+            let mut game = GameState::new(&["A", "B"], 40);
+            let player = PlayerId(0); let defender = PlayerId(1);
+            let creature = parse_card_script("Name:Attacker\nTypes:Creature Human\nPT:2/2").unwrap();
+            let tax = parse_card_script("Name:Tax\nTypes:Enchantment\nS:Mode$ CantAttackUnless | ValidCard$ Creature | Target$ You | Cost$ 2").unwrap();
+            let a = game.create_card(Card::from_rules(&creature, player));
+            let t = game.create_card(Card::from_rules(&tax, defender));
+            game.move_card(a, ZoneType::Battlefield, player); game.card_mut(a).set_summoning_sick(false);
+            game.move_card(t, ZoneType::Battlefield, defender);
+            let forest = parse_card_script("Name:Forest\nTypes:Basic Land Forest\nA:AB$ Mana | Cost$ T | Produced$ G").unwrap();
+            let mut lands = Vec::new();
+            for _ in 0..2 { let id = game.create_card(Card::from_rules(&forest, player)); game.move_card(id, ZoneType::Battlefield, player); lands.push(id); }
+            let mut agents: Vec<Box<dyn PlayerAgent>> = vec![Box::new(AutoAgent(pay, false)), Box::new(AutoAgent(false, false))];
+            let mut gl = GameLoop::new(2); gl.pool_mut(player).add(forge_foundation::mana::ManaAtom::GREEN, 2);
+            ATTACK_FIXTURE.with(|f| f.set(true)); TAX_PROMPTS.with(|v| v.set(0));
+            gl.step_combat(&mut game, &mut agents);
+            ATTACK_FIXTURE.with(|f| f.set(false));
+            assert_eq!(TAX_PROMPTS.with(|v| v.get()), if pay { 3 } else { 2 });
+            assert_eq!(lands.iter().filter(|&&id| game.card(id).tapped).count(), if pay { 2 } else { 1 });
+            assert_eq!(game.player(defender).life, if pay { 38 } else { 40 });
+            assert_eq!(game.card(a).tapped, pay);
+        }
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn actual_goaded_attacker_needing_companion_handles_both_cases() {
+        std::thread::Builder::new().stack_size(32 * 1024 * 1024).spawn(|| {
+        for companion in [false, true] {
+            let mut game = GameState::new(&["A", "B"], 40);
+            let player = PlayerId(0); let defender = PlayerId(1);
+            let needs = parse_card_script("Name:Needs Friend\nTypes:Creature Human\nPT:2/2\nK:CARDNAME can't attack alone.").unwrap();
+            let simple = parse_card_script("Name:Friend\nTypes:Creature Human\nPT:2/2").unwrap();
+            let a = game.create_card(Card::from_rules(&needs, player));
+            game.move_card(a, ZoneType::Battlefield, player); game.card_mut(a).set_summoning_sick(false); game.card_mut(a).goaded_by=Some(defender);
+            if companion { let b=game.create_card(Card::from_rules(&simple, player)); game.move_card(b, ZoneType::Battlefield, player); game.card_mut(b).set_summoning_sick(false); }
+            let requirements = crate::combat::attack_requirement::compute_attack_requirements(&game.cards, &[a], defender);
+            assert!(requirements.iter().any(|requirement| requirement.attacker == a && requirement.has_requirement()));
+            assert!(!crate::combat::attack_restriction::get_restrictions(game.card(a)).is_empty());
+            let mut agents: Vec<Box<dyn PlayerAgent>> = vec![Box::new(AutoAgent(false, false)), Box::new(AutoAgent(false, false))];
+            ATTACK_FIXTURE.with(|v| v.set(true)); ATTACK_PROMPTS.with(|v| v.set(0));
+            GameLoop::new(2).step_combat(&mut game, &mut agents);
+            ATTACK_FIXTURE.with(|v| v.set(false));
+            assert_eq!(ATTACK_PROMPTS.with(|v| v.get()), 1);
+            assert_eq!(game.card(a).tapped, companion);
+            assert_eq!(game.player(defender).life, if companion { 36 } else { 40 });
+        }
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn failed_cast_after_disqualified_mana_ability_does_not_lose_resources() {
+        std::thread::Builder::new().stack_size(32 * 1024 * 1024).spawn(|| {
+            let mut game = GameState::new(&["A", "B"], 40); let player = PlayerId(0);
+            let spell = parse_card_script("Name:Fixture\nManaCost:X G\nTypes:Instant\nA:SP$ GainLife | Defined$ You | LifeAmount$ 1").unwrap();
+            let land = parse_card_script("Name:Costly Forest\nTypes:Basic Land Forest\nA:AB$ Mana | Cost$ T | Produced$ G | SubAbility$ DBPain\nSVar:DBPain:DB$ LoseLife | Defined$ You | LifeAmount$ 1").unwrap();
+            let id=game.create_card(Card::from_rules(&spell, player)); game.move_card(id, ZoneType::Hand, player);
+            let source=game.create_card(Card::from_rules(&land, player)); game.move_card(source, ZoneType::Battlefield, player);
+            let sa=crate::spellability::build_spell_ability(&game, id, "SP$ GainLife | Defined$ You | LifeAmount$ 1", player);
+            let mut agents: Vec<Box<dyn PlayerAgent>> = (0..2).map(|_| Box::new(AutoAgent(false,false)) as Box<dyn PlayerAgent>).collect();
+            let mut gl=GameLoop::new(2); gl.pool_mut(player).add(forge_foundation::mana::ManaAtom::GREEN, 3);
+            CANCEL_MANA.with(|v| v.set(true)); TAP_BEFORE_FAILURE.with(|v| v.set(1)); OBSERVED_DISQUALIFIED.with(|v| v.set(false));
+            let result=gl.cast_card_spell_ability(&mut game, &mut agents, player, sa, false);
+            assert!(OBSERVED_DISQUALIFIED.with(|v| v.get()), "fixture did not exercise disqualified mana ability");
+            CANCEL_MANA.with(|v| v.set(false)); TAP_BEFORE_FAILURE.with(|v| v.set(0));
+            assert!(result.is_none()); assert_eq!(game.card(id).zone, ZoneType::Hand);
+            let reversed=!game.card(source).tapped && gl.pool(player).total_mana()==3 && game.player(player).life==40;
+            let retained=game.card(source).tapped && gl.pool(player).total_mana()==4 && game.player(player).life==39;
+            assert!(reversed || retained, "tapped={} pool={} life={}", game.card(source).tapped, gl.pool(player).total_mana(), game.player(player).life);
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn failed_cast_retains_irreversible_mana_draw_and_produced_mana() {
+        std::thread::Builder::new().stack_size(32 * 1024 * 1024).spawn(|| {
+            let mut game = GameState::new(&["A", "B"], 40); let player = PlayerId(0);
+            let spell = parse_card_script("Name:Fixture\nManaCost:X G\nTypes:Instant\nA:SP$ GainLife | Defined$ You | LifeAmount$ 1").unwrap();
+            let land = parse_card_script("Name:Drawing Forest\nTypes:Basic Land Forest\nA:AB$ Mana | Cost$ T | Produced$ G | SubAbility$ DBDraw\nSVar:DBDraw:DB$ Draw | Defined$ You | NumCards$ 1").unwrap();
+            let filler = parse_card_script("Name:Drawn Card\nTypes:Creature Human\nPT:1/1").unwrap();
+            let id=game.create_card(Card::from_rules(&spell,player)); game.move_card(id,ZoneType::Hand,player);
+            let source=game.create_card(Card::from_rules(&land,player)); game.move_card(source,ZoneType::Battlefield,player);
+            let drawn=game.create_card(Card::from_rules(&filler,player)); game.move_card(drawn,ZoneType::Library,player);
+            let sa=crate::spellability::build_spell_ability(&game,id,"SP$ GainLife | Defined$ You | LifeAmount$ 1",player);
+            let mut agents: Vec<Box<dyn PlayerAgent>>=(0..2).map(|_|Box::new(AutoAgent(false,false)) as Box<dyn PlayerAgent>).collect();
+            let mut gl=GameLoop::new(2); gl.pool_mut(player).add(forge_foundation::mana::ManaAtom::GREEN,3);
+            CANCEL_MANA.with(|v|v.set(true)); TAP_BEFORE_FAILURE.with(|v|v.set(1)); OBSERVED_DISQUALIFIED.with(|v|v.set(false));
+            let result=gl.cast_card_spell_ability(&mut game,&mut agents,player,sa,false);
+            assert!(OBSERVED_DISQUALIFIED.with(|v|v.get()),"fixture did not exercise disqualified mana ability");
+            CANCEL_MANA.with(|v|v.set(false)); TAP_BEFORE_FAILURE.with(|v|v.set(0));
+            assert!(result.is_none()); assert_eq!(game.card(id).zone,ZoneType::Hand);
+            assert_eq!(game.card(drawn).zone,ZoneType::Hand); assert!(game.card(source).tapped);
+            assert_eq!(gl.pool(player).total_mana(),4);
+            assert!(game.stack.iter().all(|entry| entry.spell_ability.source != Some(id)));
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn failed_confirmation_after_manual_mana_preserves_or_undoes_effects() {
+      std::thread::Builder::new().stack_size(32*1024*1024).spawn(|| {
+        for auto in [false, true] {
+          for irreversible in [false, true] {
+            let mut game=GameState::new(&["A","B"],40); let player=PlayerId(0);
+            let spell=parse_card_script("Name:Fixture\nManaCost:2 G\nTypes:Instant\nA:SP$ GainLife | Defined$ You | LifeAmount$ 1").unwrap();
+            let source_text=if irreversible {"Name:Draw Land\nTypes:Basic Land Forest\nA:AB$ Mana | Cost$ T | Produced$ G | SubAbility$ DBDraw\nSVar:DBDraw:DB$ Draw | Defined$ You | NumCards$ 1"} else {"Name:Forest\nTypes:Basic Land Forest\nA:AB$ Mana | Cost$ T | Produced$ G"};
+            let land=parse_card_script(source_text).unwrap();
+            let filler=parse_card_script("Name:Drawn\nTypes:Creature Human\nPT:1/1").unwrap();
+            let id=game.create_card(Card::from_rules(&spell,player)); game.move_card(id,ZoneType::Hand,player);
+            let source=game.create_card(Card::from_rules(&land,player)); game.move_card(source,ZoneType::Battlefield,player);
+            let drawn=game.create_card(Card::from_rules(&filler,player)); game.move_card(drawn,ZoneType::Library,player);
+            let sa=crate::spellability::build_spell_ability(&game,id,"SP$ GainLife | Defined$ You | LifeAmount$ 1",player);
+            let mut agents:Vec<Box<dyn PlayerAgent>>=(0..2).map(|_|Box::new(AutoAgent(auto,false)) as Box<dyn PlayerAgent>).collect();
+            let mut gl=GameLoop::new(2); TAP_BEFORE_FAILURE.with(|v|v.set(1)); CANCEL_MANA.with(|v|v.set(false));
+            assert!(gl.cast_card_spell_ability(&mut game,&mut agents,player,sa,false).is_none());
+            TAP_BEFORE_FAILURE.with(|v|v.set(0));
+            assert_eq!(game.card(id).zone,ZoneType::Hand);
+            let retained=game.card(source).tapped && gl.pool(player).total_mana()==1;
+            let reversed=!game.card(source).tapped && gl.pool(player).total_mana()==0;
+            assert!(retained || (!irreversible && reversed),"auto={auto} irreversible={irreversible} tapped={} pool={}",game.card(source).tapped,gl.pool(player).total_mana());
+            assert_eq!(game.card(drawn).zone,if irreversible {ZoneType::Hand} else {ZoneType::Library});
+          }
+        }
+      }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn restricted_mana_is_spent_only_for_matching_spell_type() {
+        std::thread::Builder::new().stack_size(32 * 1024 * 1024).spawn(|| {
+        for (kind, expected) in [("Creature Human", true), ("Instant", false)] {
+            let mut game=GameState::new(&["A", "B"],40); let player=PlayerId(0);
+            let script=format!("Name:Restriction Fixture\nManaCost:G\nTypes:{kind}\nPT:1/1\nA:SP$ GainLife | Defined$ You | LifeAmount$ 1");
+            let rules=parse_card_script(&script).unwrap(); let id=game.create_card(Card::from_rules(&rules,player)); game.move_card(id,ZoneType::Hand,player);
+            let sa=crate::spellability::build_spell_ability(&game,id,"SP$ GainLife | Defined$ You | LifeAmount$ 1",player);
+            let mut agents: Vec<Box<dyn PlayerAgent>>=(0..2).map(|_|Box::new(AutoAgent(false,false)) as Box<dyn PlayerAgent>).collect();
+            let mut gl=GameLoop::new(2); let mut mana=crate::mana::Mana::simple(forge_foundation::mana::ManaAtom::GREEN);
+            mana.source_card=Some(CardId(80)); mana.restriction=Some("Spell.Creature".into()); gl.pool_mut(player).add_mana(mana);
+            let result=gl.cast_card_spell_ability(&mut game,&mut agents,player,sa,false);
+            assert_eq!(result.is_some(),expected);
+            assert_eq!(gl.pool(player).total_mana(),if expected {0} else {1});
+            if expected { let paid=&game.stack.peek().unwrap().spell_ability; assert_eq!(paid.paying_mana_sources,vec![Some(CardId(80))]); }
+            else { assert_eq!(game.card(id).zone,ZoneType::Hand); }
+        }
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn x_cast_auto_payment_agrees_with_opponent_aura_recipient() {
+        std::thread::Builder::new().stack_size(32 * 1024 * 1024).spawn(|| {
+        for (recipient,expected_x) in [("TriggeredCardController",1),("You",0)] {
+            let mut game=GameState::new(&["A","B"],40); let player=PlayerId(0); let opponent=PlayerId(1);
+            let spell=parse_card_script("Name:X Fixture\nManaCost:X B\nTypes:Instant\nA:SP$ GainLife | Defined$ You | LifeAmount$ 1").unwrap();
+            let land=parse_card_script("Name:Test Land\nTypes:Land\nA:AB$ Mana | Cost$ T | Produced$ B").unwrap();
+            let script=format!("Name:Test Aura\nTypes:Enchantment Aura\nT:Mode$ TapsForMana | ValidCard$ Card.AttachedBy | Execute$ TrigMana | Static$ True\nSVar:TrigMana:DB$ Mana | Produced$ G | Amount$ 1 | Defined$ {recipient}");
+            let aura=parse_card_script(&script).unwrap();
+            let spell_id=game.create_card(Card::from_rules(&spell,player)); game.move_card(spell_id,ZoneType::Hand,player);
+            let source=game.create_card(Card::from_rules(&land,player)); game.move_card(source,ZoneType::Battlefield,player);
+            let aura_id=game.create_card(Card::from_rules(&aura,opponent)); game.move_card(aura_id,ZoneType::Battlefield,opponent);
+            game.card_mut(aura_id).attach_to_entity(source); game.card_mut(source).attachments.push(aura_id);
+            let sa=crate::spellability::build_spell_ability(&game,spell_id,"SP$ GainLife | Defined$ You | LifeAmount$ 1",player);
+            let mut agents: Vec<Box<dyn PlayerAgent>>=(0..2).map(|_|Box::new(AutoAgent(true,false)) as Box<dyn PlayerAgent>).collect();
+            let mut gl=GameLoop::new(2); let result=gl.cast_card_spell_ability(&mut game,&mut agents,player,sa,false);
+            assert!(result.is_some(),"recipient={recipient}"); let paid=&game.stack.peek().unwrap().spell_ability;
+            assert_eq!(paid.x_mana_cost_paid,expected_x); assert_eq!(paid.paying_mana.len(),1+expected_x as usize);
+        }
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn delta_irreversible_cancellation_supported_cast_modes() {
+      std::thread::Builder::new().stack_size(32*1024*1024).spawn(|| {
+        for mode in ["normal","commander","flashback","phyrexian","kicker","replicate","convoke"] {
+          for effect in ["draw","life","sacdraw"] {
+            let mut game=GameState::new(&["A","B"],40); let player=PlayerId(0);
+            let mana=if mode=="phyrexian" {"2 G/P"} else {"2 G"};
+            let keyword=match mode {"convoke"=>"K:Convoke\n","flashback"=>"K:Flashback:2 G\n","kicker"=>"K:Kicker:1\n","replicate"=>"K:Replicate:1\n",_=>""};
+            let text=format!("Name:Delta Fixture\nManaCost:{mana}\nTypes:Instant\n{keyword}A:SP$ GainLife | Defined$ You | LifeAmount$ 1");
+            let spell=parse_card_script(&text).unwrap(); let id=game.create_card(Card::from_rules(&spell,player));
+            let zone=match mode {"commander"=>ZoneType::Command,"flashback"=>ZoneType::Graveyard,_=>ZoneType::Hand};
+            game.move_card(id,zone,player);
+            if mode=="commander" {game.player_register_commander(player,id); game.player_create_commander_effect(player,None); game.player_mut(player).commander_casts.insert(id.0,1); assert_eq!(game.player_commander_tax(player,id),2);}
+            let source_text=if effect=="sacdraw" {"Name:Delta Source\nTypes:Artifact\nA:AB$ Mana | Cost$ T Sac<1/CARDNAME> | Produced$ G | SubAbility$ DBEffect\nSVar:DBEffect:DB$ Draw | Defined$ You | NumCards$ 1"} else if effect=="draw" {"Name:Delta Source\nTypes:Basic Land Forest\nA:AB$ Mana | Cost$ T | Produced$ G | SubAbility$ DBEffect\nSVar:DBEffect:DB$ Draw | Defined$ You | NumCards$ 1"} else {"Name:Delta Source\nTypes:Basic Land Forest\nA:AB$ Mana | Cost$ T | Produced$ G | SubAbility$ DBEffect\nSVar:DBEffect:DB$ LoseLife | Defined$ You | LifeAmount$ 1"};
+            let source_rules=parse_card_script(source_text).unwrap(); let source=game.create_card(Card::from_rules(&source_rules,player)); game.move_card(source,ZoneType::Battlefield,player);
+            let filler=parse_card_script("Name:Drawn Card\nTypes:Creature Human\nPT:1/1").unwrap(); let drawn=game.create_card(Card::from_rules(&filler,player)); game.move_card(drawn,ZoneType::Library,player);
+            let mut sa=crate::spellability::build_spell_ability(&game,id,"SP$ GainLife | Defined$ You | LifeAmount$ 1",player);
+            if mode=="flashback" {sa.alt_cost=Some(crate::spellability::AlternativeCost::Flashback);}
+            let mut agents: Vec<Box<dyn PlayerAgent>>=(0..2).map(|_|Box::new(AutoAgent(true,false)) as Box<dyn PlayerAgent>).collect();
+            let mut gl=GameLoop::new(2); gl.pool_mut(player).add(forge_foundation::mana::ManaAtom::GREEN,5);
+            CANCEL_MANA.with(|v|v.set(true)); TAP_BEFORE_FAILURE.with(|v|v.set(1)); OBSERVED_DISQUALIFIED.with(|v|v.set(false)); DELTA_EXTRA.with(|v|v.set(true)); DELTA_SELECTED.with(|v|v.set(false));
+            let result=gl.cast_card_spell_ability(&mut game,&mut agents,player,sa,false);
+            if mode=="kicker" || mode=="replicate" { assert!(DELTA_SELECTED.with(|v|v.get()), "mode={mode} was not selected"); }
+            assert!(OBSERVED_DISQUALIFIED.with(|v|v.get()),"mode={mode} effect={effect} did not reach disqualified action");
+            CANCEL_MANA.with(|v|v.set(false)); TAP_BEFORE_FAILURE.with(|v|v.set(0)); DELTA_EXTRA.with(|v|v.set(false));
+            assert!(result.is_none()); assert_eq!(game.card(id).zone,zone,"mode={mode} effect={effect}");
+            assert_eq!(gl.pool(player).total_mana(),6,"mode={mode} effect={effect}");
+            if effect=="sacdraw" {assert_eq!(game.card(source).zone,ZoneType::Graveyard);} else {assert!(game.card(source).tapped);}
+            if effect=="life" {assert_eq!(game.player(player).life,39);} else {assert_eq!(game.card(drawn).zone,ZoneType::Hand);}
+            assert!(game.stack.iter().all(|entry|entry.spell_ability.source!=Some(id)));
+          }
+        }
+      }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn delta_cancel_after_irreversible_then_reversible_mana_actions() {
+      std::thread::Builder::new().stack_size(32*1024*1024).spawn(|| {
+        let mut game=GameState::new(&["A","B"],40); let player=PlayerId(0);
+        let spell=parse_card_script("Name:Fixture\nManaCost:2 G\nTypes:Instant\nA:SP$ GainLife | Defined$ You | LifeAmount$ 1").unwrap();
+        let drawland=parse_card_script("Name:Draw Land\nTypes:Basic Land Forest\nA:AB$ Mana | Cost$ T | Produced$ G | SubAbility$ DBDraw\nSVar:DBDraw:DB$ Draw | Defined$ You | NumCards$ 1").unwrap();
+        let forest=parse_card_script("Name:Forest\nTypes:Basic Land Forest\nA:AB$ Mana | Cost$ T | Produced$ G").unwrap();
+        let filler=parse_card_script("Name:Drawn\nTypes:Creature Human\nPT:1/1").unwrap();
+        let id=game.create_card(Card::from_rules(&spell,player)); game.move_card(id,ZoneType::Hand,player);
+        let first=game.create_card(Card::from_rules(&drawland,player)); game.move_card(first,ZoneType::Battlefield,player);
+        let second=game.create_card(Card::from_rules(&forest,player)); game.move_card(second,ZoneType::Battlefield,player);
+        let drawn=game.create_card(Card::from_rules(&filler,player)); game.move_card(drawn,ZoneType::Library,player);
+        let sa=crate::spellability::build_spell_ability(&game,id,"SP$ GainLife | Defined$ You | LifeAmount$ 1",player);
+        let mut agents: Vec<Box<dyn PlayerAgent>>=(0..2).map(|_|Box::new(AutoAgent(true,false)) as Box<dyn PlayerAgent>).collect();
+        let mut gl=GameLoop::new(2); gl.pool_mut(player).add(forge_foundation::mana::ManaAtom::GREEN,5);
+        CANCEL_MANA.with(|v|v.set(true)); TAP_BEFORE_FAILURE.with(|v|v.set(2));
+        let result=gl.cast_card_spell_ability(&mut game,&mut agents,player,sa,false);
+        CANCEL_MANA.with(|v|v.set(false)); TAP_BEFORE_FAILURE.with(|v|v.set(0));
+        assert!(result.is_none()); assert_eq!(game.card(id).zone,ZoneType::Hand); assert_eq!(game.card(drawn).zone,ZoneType::Hand);
+        assert!(game.card(first).tapped); assert!(!game.card(second).tapped); assert_eq!(gl.pool(player).total_mana(),6);
+      }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn delta_auto_failed_payment_retains_irreversible_effect_and_refunds_mana() {
+      std::thread::Builder::new().stack_size(32*1024*1024).spawn(|| {
+        let mut game=GameState::new(&["A","B"],40); let player=PlayerId(0);
+        let spell=parse_card_script("Name:Fixture\nManaCost:2 G\nTypes:Instant\nA:SP$ GainLife | Defined$ You | LifeAmount$ 1").unwrap();
+        let land=parse_card_script("Name:Draw Land\nTypes:Basic Land Forest\nA:AB$ Mana | Cost$ T | Produced$ G | SubAbility$ DBDraw\nSVar:DBDraw:DB$ Draw | Defined$ You | NumCards$ 1").unwrap();
+        let filler=parse_card_script("Name:Drawn\nTypes:Creature Human\nPT:1/1").unwrap();
+        let id=game.create_card(Card::from_rules(&spell,player)); game.move_card(id,ZoneType::Hand,player);
+        let source=game.create_card(Card::from_rules(&land,player)); game.move_card(source,ZoneType::Battlefield,player);
+        let drawn=game.create_card(Card::from_rules(&filler,player)); game.move_card(drawn,ZoneType::Library,player);
+        let sa=crate::spellability::build_spell_ability(&game,id,"SP$ GainLife | Defined$ You | LifeAmount$ 1",player);
+        let mut agents: Vec<Box<dyn PlayerAgent>>=(0..2).map(|_|Box::new(AutoAgent(true,false)) as Box<dyn PlayerAgent>).collect();
+        let mut gl=GameLoop::new(2);
+        for _ in 0..5 { let mut m=crate::mana::Mana::simple(forge_foundation::mana::ManaAtom::GREEN); m.restriction=Some("Spell.Creature".into()); m.source_card=Some(CardId(80)); gl.pool_mut(player).add_mana(m); }
+        CANCEL_MANA.with(|v|v.set(false)); TAP_BEFORE_FAILURE.with(|v|v.set(0));
+        let result=gl.cast_card_spell_ability(&mut game,&mut agents,player,sa,false);
+        assert!(result.is_none()); assert_eq!(game.card(id).zone,ZoneType::Hand); assert_eq!(game.card(drawn).zone,ZoneType::Hand);
+        assert!(game.card(source).tapped); assert_eq!(gl.pool(player).total_mana(),6);
+        let ctx=crate::mana::ManaPaymentContext {is_spell:true,type_line:Some(forge_foundation::CardTypeLine::parse("Instant")),..Default::default()};
+        assert!(!gl.pool(player).can_pay_for_spell(&forge_foundation::ManaCost::parse("2 G"),&ctx));
+      }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn delta_actual_large_goad_companion_and_global_cap_progresses() {
+      std::thread::Builder::new().stack_size(32*1024*1024).spawn(|| {
+        for count in [12,13,32] {
+          let mut game=GameState::new(&["A","B"],40); let player=PlayerId(0); let opponent=PlayerId(1);
+          let needs=parse_card_script("Name:Needs Friend\nTypes:Creature Human\nPT:2/2\nK:CARDNAME can't attack alone.").unwrap();
+          let friend=parse_card_script("Name:Friend\nTypes:Creature Human\nPT:2/2").unwrap();
+          let limit=parse_card_script("Name:Limit\nTypes:Artifact\nS:Mode$ AttackRestrict").unwrap();
+          let mut first=None;
+          for i in 0..count { let card=game.create_card(Card::from_rules(if i==0 {&needs}else{&friend},player)); game.move_card(card,ZoneType::Battlefield,player); game.card_mut(card).set_summoning_sick(false); if i==0 {first=Some(card); game.card_mut(card).goaded_by=Some(opponent);} }
+          let cap=game.create_card(Card::from_rules(&limit,opponent)); game.move_card(cap,ZoneType::Battlefield,opponent);
+          assert_eq!(crate::staticability::static_ability_attack_restrict::global_attack_restrict(&game.cards),Some(1));
+          let mut agents: Vec<Box<dyn PlayerAgent>>=vec![Box::new(AutoAgent(false,false)),Box::new(AutoAgent(false,false))];
+          ATTACK_FIXTURE.with(|v|v.set(true)); DELTA_CAP.with(|v|v.set(true)); ATTACK_PROMPTS.with(|v|v.set(0));
+          GameLoop::new(2).step_combat(&mut game,&mut agents);
+          ATTACK_FIXTURE.with(|v|v.set(false)); DELTA_CAP.with(|v|v.set(false));
+          assert_eq!(DELTA_AVAILABLE.with(|v|v.get()),count,"available count");
+          assert_eq!(DELTA_REQUIREMENTS.with(|v|v.get()),1,"required count, goad={} legal={}",DELTA_GOAD.with(|v|v.get()),DELTA_GOAD_LEGAL.with(|v|v.get()));
+          assert_eq!(ATTACK_PROMPTS.with(|v|v.get()),1,"count={count}"); assert!(!game.card(first.unwrap()).tapped); assert_eq!(game.player(opponent).life,40);
+        }
+      }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn convoke_payment_taps_creature_and_casts_without_floating_mana() {
+      std::thread::Builder::new().stack_size(32*1024*1024).spawn(|| {
+        let mut game=GameState::new(&["A","B"],40); let player=PlayerId(0);
+        let spell=parse_card_script("Name:Convoke Fixture\nManaCost:W\nTypes:Instant\nK:Convoke\nA:SP$ GainLife | Defined$ You | LifeAmount$ 1").unwrap();
+        let creature=parse_card_script("Name:Helper\nManaCost:W\nTypes:Creature Human\nPT:1/1").unwrap();
+        let id=game.create_card(Card::from_rules(&spell,player)); game.move_card(id,ZoneType::Hand,player);
+        let helper=game.create_card(Card::from_rules(&creature,player)); game.move_card(helper,ZoneType::Battlefield,player);
+        let sa=crate::spellability::build_spell_ability(&game,id,"SP$ GainLife | Defined$ You | LifeAmount$ 1",player);
+        let mut agents:Vec<Box<dyn PlayerAgent>>=(0..2).map(|_|Box::new(AutoAgent(false,false)) as Box<dyn PlayerAgent>).collect();
+        let mut gl=GameLoop::new(2); CONVOKE_FIXTURE.with(|v|v.set(true));
+        let result=gl.cast_card_spell_ability(&mut game,&mut agents,player,sa,false);
+        CONVOKE_FIXTURE.with(|v|v.set(false));
+        assert!(result.is_some()); assert!(game.card(helper).tapped); assert_eq!(game.card(id).zone,ZoneType::Stack); assert_eq!(gl.pool(player).total_mana(),0);
+      }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn auto_payment_uses_restricted_source_for_matching_spells_only() {
+      std::thread::Builder::new().stack_size(32*1024*1024).spawn(|| {
+        for (kind,restriction,expected) in [("Creature Human","Spell.Creature",true),("Instant","Spell.Creature",false),("Creature Angel","Spell.Angel",true),("Creature Human","Spell.Angel",false)] {
+          let mut game=GameState::new(&["A","B"],40);let player=PlayerId(0);
+          let script=format!("Name:Cost Fixture\nManaCost:1 G\nTypes:{kind}\nPT:1/1\nA:SP$ GainLife | Defined$ You | LifeAmount$ 1");
+          let spell=parse_card_script(&script).unwrap();let id=game.create_card(Card::from_rules(&spell,player));game.move_card(id,ZoneType::Hand,player);
+          let land=parse_card_script("Name:Forest\nTypes:Basic Land Forest\nA:AB$ Mana | Cost$ T | Produced$ G").unwrap();
+          let restricted=parse_card_script(&format!("Name:Creature Rock\nTypes:Artifact\nA:AB$ Mana | Cost$ T | Produced$ Any | RestrictValid$ {restriction}")).unwrap();
+          let a=game.create_card(Card::from_rules(&land,player));game.move_card(a,ZoneType::Battlefield,player);
+          let b=game.create_card(Card::from_rules(&restricted,player));game.move_card(b,ZoneType::Battlefield,player);
+          let sa=crate::spellability::build_spell_ability(&game,id,"SP$ GainLife | Defined$ You | LifeAmount$ 1",player);
+          let mut agents:Vec<Box<dyn PlayerAgent>>=(0..2).map(|_|Box::new(AutoAgent(true,false)) as Box<dyn PlayerAgent>).collect();let mut gl=GameLoop::new(2);
+          let outcome=gl.cast_card_spell_ability(&mut game,&mut agents,player,sa,false);
+          assert_eq!(outcome.is_some(),expected,"kind={kind}");
+          if expected {assert!(game.card(a).tapped);assert!(game.card(b).tapped);}
+          else {assert!(!game.card(b).tapped);assert_eq!(game.card(id).zone,ZoneType::Hand);}
+        }
+      }).unwrap().join().unwrap();
+    }
+
+
+    #[test]
+    fn x_bound_respects_restricted_sources_and_preserves_matching_mana() {
+      std::thread::Builder::new().stack_size(32*1024*1024).spawn(|| {
+        for floating in [false,true] {
+        for (kind,restriction,expected_x) in [("Creature Construct","Spell.Angel",2),("Creature Angel","Spell.Angel",3),("Instant","Spell.Creature",2),("Creature Construct","Spell.Creature",3)] {
+          let mut game=GameState::new(&["A","B"],40);let player=PlayerId(0);
+          let rules=parse_card_script(&format!("Name:X Fixture\nManaCost:X X\nTypes:{kind}\nPT:0/0\nA:SP$ GainLife | Defined$ You | LifeAmount$ 1")).unwrap();
+          let id=game.create_card(Card::from_rules(&rules,player));game.move_card(id,ZoneType::Hand,player);
+          let land=parse_card_script("Name:Plains\nTypes:Basic Land Plains\nA:AB$ Mana | Cost$ T | Produced$ W").unwrap();
+          for _ in 0..5 { let lid=game.create_card(Card::from_rules(&land,player));game.move_card(lid,ZoneType::Battlefield,player); }
+          let rock=parse_card_script(&format!("Name:Restricted Rock\nTypes:Artifact\nA:AB$ Mana | Cost$ T | Produced$ W | RestrictValid$ {restriction}")).unwrap();
+          let rid=game.create_card(Card::from_rules(&rock,player));game.move_card(rid,ZoneType::Battlefield,player);
+          let sa=crate::spellability::build_spell_ability(&game,id,"SP$ GainLife | Defined$ You | LifeAmount$ 1",player);
+          let mut agents:Vec<Box<dyn PlayerAgent>>=(0..2).map(|_|Box::new(AutoAgent(true,false)) as Box<dyn PlayerAgent>).collect();let mut gl=GameLoop::new(2);
+          if floating { game.tap(rid);let mut atom=crate::mana::Mana::simple(forge_foundation::mana::ManaAtom::WHITE);atom.restriction=Some(restriction.into());atom.source_card=Some(rid);gl.pool_mut(player).add_mana(atom); }
+          let result=gl.cast_card_spell_ability(&mut game,&mut agents,player,sa,false);
+          assert!(result.is_some(),"an affordable X must cast: kind={kind}");
+          let paid=&game.stack.iter().find(|e| e.spell_ability.source==Some(id)).unwrap().spell_ability;
+          assert_eq!(paid.x_mana_cost_paid,expected_x,"kind={kind}");
+          assert_eq!(paid.paying_mana.len(),(expected_x*2) as usize);
+          assert_eq!(game.card(rid).tapped,floating || expected_x==3,"nonmatching source must stay untapped");
+        }
+        }
+      }).unwrap().join().unwrap();
+    }
+
 }

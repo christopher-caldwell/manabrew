@@ -58,7 +58,7 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
     for &id in &graveyard {
         ctx.move_card(id, ZoneType::Graveyard, target);
         emit_zone_trigger(
-            ctx.trigger_handler,
+            ctx.trigger_handler, ctx.game,
             id,
             ZoneType::Library,
             ZoneType::Graveyard,

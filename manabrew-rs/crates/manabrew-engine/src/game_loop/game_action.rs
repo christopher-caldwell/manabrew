@@ -74,7 +74,7 @@ pub(crate) fn perform_sacrifice(
             false,
         );
         crate::ability::effects::emit_zone_trigger_with_lki_counters(
-            trigger_handler,
+            trigger_handler, game,
             card_id,
             ZoneType::Battlefield,
             ZoneType::Graveyard,
@@ -180,6 +180,7 @@ impl GameLoop {
         }
         let can_activate = |card_id: CardId, ab: &crate::ability::ActivatedAbility| {
             let card = game.card(card_id);
+            if card.phased_out { return false; }
             if !card.room_ability_active(
                 ab.params
                     .get("CardState")
@@ -321,7 +322,7 @@ impl GameLoop {
                     continue;
                 }
                 // Skip abilities with ActivationZone$ Hand — they're for hand, not battlefield
-                if ab.activation_zone == Some(ZoneType::Hand) {
+                if ab.activation_zone.is_some_and(|zone| zone != ZoneType::Battlefield) {
                     continue;
                 }
                 if can_activate(card_id, ab) {
@@ -378,6 +379,15 @@ impl GameLoop {
                     continue;
                 }
                 if ab.activation_zone == Some(ZoneType::Exile) && can_activate(card_id, ab) {
+                    result.push((card_id, ab.ability_index));
+                }
+            }
+        }
+
+        for card_id in game.cards_in_zone(ZoneType::Command, player).iter().copied() {
+            for ab in &game.card(card_id).activated_abilities {
+                if !ab.is_mana_ability && !ab.is_unlock_door
+                    && ab.activation_zone == Some(ZoneType::Command) && can_activate(card_id, ab) {
                     result.push((card_id, ab.ability_index));
                 }
             }

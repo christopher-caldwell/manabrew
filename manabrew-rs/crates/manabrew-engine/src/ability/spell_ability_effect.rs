@@ -552,7 +552,7 @@ pub fn exile_effect_command(
     // Register zone triggers
     trigger_handler.register_active_trigger(game, card_id);
     super::effects::zone_triggers::emit_zone_trigger(
-        trigger_handler,
+        trigger_handler, game,
         card_id,
         old_zone,
         forge_foundation::ZoneType::Exile,

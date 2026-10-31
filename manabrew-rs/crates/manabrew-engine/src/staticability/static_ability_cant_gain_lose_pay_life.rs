@@ -91,13 +91,9 @@ fn any_common(
     _cause: Option<&SpellAbility>,
     is_cost: bool,
 ) -> bool {
-    for card in game
-        .cards
-        .iter()
-        .filter(|c| c.zone == ZoneType::Battlefield)
-    {
+    for card in game.cards.iter().filter(|c| !c.phased_out) {
         for st_ab in &card.static_abilities {
-            if !modes.iter().any(|m| st_ab.check_mode(m)) {
+            if !st_ab.check_conditions(card, game) || !modes.iter().any(|m| st_ab.check_mode(m)) {
                 continue;
             }
             if let Some(for_cost) = st_ab.ir.for_cost {
