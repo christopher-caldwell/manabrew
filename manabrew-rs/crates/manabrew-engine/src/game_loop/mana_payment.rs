@@ -17,11 +17,15 @@ pub(crate) struct ManaPaymentSession<'a> {
     pub reserved_sacrifices: &'a [CardId],
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManaAbilityResolution { Resolved, Failed, FailedPreservingEffects }
+
 #[derive(Clone, Copy)]
 pub(crate) struct ManaPaymentResult {
     pub paid: bool,
     pub preserve_taps_on_failure: bool,
     pub convoke_used: bool,
+    pub independent_mana_effects: bool,
 }
 
 impl ManaPaymentResult {
@@ -30,6 +34,7 @@ impl ManaPaymentResult {
             paid: true,
             preserve_taps_on_failure: false,
             convoke_used: false,
+            independent_mana_effects: false,
         }
     }
 
@@ -38,14 +43,16 @@ impl ManaPaymentResult {
             paid: false,
             preserve_taps_on_failure: false,
             convoke_used: false,
+            independent_mana_effects: false,
         }
     }
 
-    fn failed_preserving_taps(convoke_used: bool) -> Self {
+    fn failed_preserving_taps(convoke_used: bool, independent_mana_effects: bool) -> Self {
         Self {
             paid: false,
             preserve_taps_on_failure: true,
             convoke_used,
+            independent_mana_effects,
         }
     }
 }
@@ -107,7 +114,7 @@ where
         CardId,
         &ActivatedAbility,
         Option<u16>,
-    ) -> bool,
+    ) -> ManaAbilityResolution,
     FBasicLandTap: FnMut(&mut GameState, PlayerId, CardId),
     FUndoable: FnMut(&GameState, &[ManaPool], PlayerId) -> Vec<CardId>,
     FBeginUndo: FnMut(&GameState, &[ManaPool], PlayerId, CardId) -> TUndo,
@@ -125,6 +132,8 @@ where
     // Only the narrowly recognized independent mana/draw path can be
     // reversed without restoring an irreversible mana activation.
     let mut convoke_reverse_safe = true;
+    let mut independent_mana_effects = true;
+    let mut preserved_nested_effects = false;
 
     macro_rules! fail_with_undo {
         () => {{
@@ -143,7 +152,7 @@ where
                         _ => {}
                     }
                 }
-                let mut fully_undoable = true;
+                let mut fully_undoable = !preserved_nested_effects;
                 while let Some(&source) = outstanding.last() {
                     let undoable = undoable_mana_sources(game, mana_pools, session.player);
                     if !undoable.contains(&source) || !undo_mana_action(game, mana_pools, session.player, source) {
@@ -177,7 +186,7 @@ where
                         game.card_mut(source).tapped = false;
                     }
                 }
-                return ManaPaymentResult::failed_preserving_taps(false);
+                return ManaPaymentResult::failed_preserving_taps(false, independent_mana_effects);
         }};
     }
 
@@ -189,6 +198,18 @@ where
         let mut tappable_lands = lands;
         tappable_lands.extend(convoke_sources.iter().copied());
         let mut mana_ability_options = mana_sources.mana_ability_options;
+        // Offer costed mana abilities when their costs can be paid without
+        // using the ability's own source.
+        for &source in &mana_sources.source_cards {
+            for ab in &game.card(source).activated_abilities {
+                let activation_ctx = mana::ManaPaymentContext { is_activated_ability:true, payment_card:Some(source), ..Default::default() };
+                if !ab.is_mana_ability || !ab.cost.parts.iter().any(|p| matches!(p, crate::cost::CostPart::Mana{..}))
+                    || !crate::cost::can_pay_ignoring_mana(&ab.cost,game,source,session.player)
+                    || !mana::can_pay_mana_cost_with_reserved_sacrifices(game,&mana_pools[session.player.index()],session.player,source,&ab.cost,session.reserved_sacrifices,Some(&activation_ctx)) { continue; }
+                let (produced_mana,produced_mana_amount)=mana::mana_ability_prompt_metadata(game,source,session.player,ab);
+                mana_ability_options.push(crate::agent::ManaAbilityOption {card_id:source,ability_index:ab.ability_index,description:ab.ability_text.clone(),cost:ab.cost_string(),produced_mana,produced_mana_amount});
+            }
+        }
         mana_ability_options.retain(|option| !rejected_mana_abilities.contains(&(option.card_id, option.ability_index)));
         let untappable_lands = undoable_mana_sources(game, mana_pools, session.player);
         let pool_ref = mana_pools[session.player.index()].clone();
@@ -280,24 +301,32 @@ where
                     let old_life = game.player(session.player).life;
                     let old_counters = game.card(land_id).counters.clone();
                     let pool_snapshot = mana_pools[player_idx].begin_tap_tracking();
+                    let ability_independent = independent_nested_mana_effects(game, session.player, land_id, &ab);
                     let independent = convoke_records.is_empty() ||
-                        (independent_mana_draw_only(game, land_id, &ab)
-                            && !convoke_records.iter().any(|(source, _)| *source == land_id));
+                        (independent_mana_draw_only(game, land_id, &ab) && !convoke_records.iter().any(|(source, _)| *source == land_id));
                     // A convoke tap pays this spell, never the activation cost
                     // of a mana ability used while casting it.
                     let held = mana_pools[player_idx].take_convoke_contributions(session.card_id);
-                    let resolved = resolve_mana_ability(
+                    let resolution = resolve_mana_ability(
                         game, agents, mana_pools, session.player, land_id, &ab, express_choice,
                     );
                     mana_pools[player_idx].restore_convoke_contributions(held);
-                    if resolved { convoke_reverse_safe &= independent; }
+                    let resolved = resolution == ManaAbilityResolution::Resolved;
+                    if resolution == ManaAbilityResolution::FailedPreservingEffects {
+                        preserved_nested_effects = true;
+                        // The nested activation is not the pending ability;
+                        // its effects remain even when the outer cast fails.
+                        convoke_reverse_safe = false;
+                    }
+                    if resolved { convoke_reverse_safe &= independent; independent_mana_effects &= ability_independent; }
                     let produced = mana_pools[player_idx].end_tap_tracking(&pool_snapshot);
                     let produced_count = produced.len();
-                    let progressed = resolved && (produced_count > 0
+                    let progressed = resolution == ManaAbilityResolution::FailedPreservingEffects
+                        || (resolved && (produced_count > 0
                         || game.card(land_id).tapped != old_tapped
                         || game.card(land_id).zone_timestamp != old_timestamp
                         || game.card(land_id).counters != old_counters
-                        || game.player(session.player).life != old_life);
+                        || game.player(session.player).life != old_life));
                     if resolved {
                         executed_actions.push(ManaCostAction::TapForMana {
                             card_id: land_id,
@@ -327,8 +356,10 @@ where
                     let player_idx = session.player.index();
                     let undo_record = begin_mana_undo(game, mana_pools, session.player, land_id);
                     let pool_snapshot = mana_pools[player_idx].begin_tap_tracking();
+                    let basic_independent = no_active_trigger_or_replacement(game);
+                    independent_mana_effects &= basic_independent;
                     if !convoke_records.is_empty() {
-                        convoke_reverse_safe &= no_active_trigger_or_replacement(game)
+                        convoke_reverse_safe &= basic_independent
                             && !convoke_records.iter().any(|(source, _)| *source == land_id);
                     }
                     game.tap(land_id);
@@ -402,7 +433,7 @@ where
                             notify_mana_payment_resolved(agents, session.player, &executed_actions);
                             // The auto-payer refunded consumed mana objects and
                             // retained its activations; do not restore a stale pool.
-                            return ManaPaymentResult::failed_preserving_taps(convoke_used);
+                            return ManaPaymentResult::failed_preserving_taps(convoke_used, false);
                         }
                         if mana_pools[session.player.index()].mana_entries().iter().any(|m| m.convoke_for == Some(session.card_id)) {
                             panic!("unsupported unused convoke contribution after auto payment");
@@ -628,7 +659,7 @@ impl GameLoop {
             },
             |game, _mana_pools, player| unsafe { try_pay_from_pool(&mut *self_ptr, game, player) },
             |game, agents, _mana_pools, player, card_id, ab, express_choice| unsafe {
-                (&mut *self_ptr).resolve_mana_ability(
+                (&mut *self_ptr).resolve_mana_ability_with_outcome(
                     game,
                     agents,
                     player,
@@ -690,6 +721,16 @@ impl GameLoop {
 fn no_active_trigger_or_replacement(game: &GameState) -> bool {
     !game.cards.iter().any(|c| matches!(c.zone, ZoneType::Battlefield | ZoneType::Command)
         && (!c.triggers.is_empty() || !c.replacement_effects.is_empty()))
+}
+
+fn independent_nested_mana_effects(game: &GameState, player: PlayerId, source: CardId, ab: &ActivatedAbility) -> bool {
+    if independent_mana_draw_only(game, source, ab) { return true; }
+    if !no_active_trigger_or_replacement(game) || !ab.ability_kind.eq_ignore_ascii_case("Mana")
+        || ab.sub_ability.is_some() || ab.cost.parts.len() != 2 { return false; }
+    let tap = ab.cost.parts.iter().filter(|p| matches!(p, crate::cost::CostPart::Tap)).count() == 1;
+    let self_sac = ab.cost.parts.iter().filter(|p| matches!(p, crate::cost::CostPart::Sacrifice {type_filter, amount}
+        if type_filter == "CARDNAME" && amount.resolve(game, source, player) == 1)).count() == 1;
+    tap && self_sac
 }
 
 fn independent_mana_draw_only(game: &GameState, source: CardId, ab: &ActivatedAbility) -> bool {

@@ -2370,6 +2370,8 @@ pub fn can_pay_mana_cost_with_reserved_sacrifices(
     payment_ctx: Option<&crate::mana::ManaPaymentContext>,
 ) -> bool {
     let mana_cost = mana_cost_from_cost(cost);
+    let eligible_pool = payment_ctx.map(|ctx| pool.filtered_for_context(ctx)).unwrap_or_else(|| pool.clone());
+    let pool = &eligible_pool;
     let mut source_masks: Vec<u16> = Vec::new();
 
     for _ in 0..pool.white() {
@@ -2499,7 +2501,62 @@ pub fn can_pay_mana_cost_with_reserved_sacrifices(
     source_masks.len() - committed.len() >= generic_count as usize
 }
 
-pub fn can_pay_spell_mana_cost_for_action_space(
+/// Plan a no-target, one-color costed mana ability with a conservatively
+/// simulated activation cost. Complex nested-source cases remain unsupported.
+pub fn plan_pooled_costed_color_mana(game:&GameState,pool:&ManaPool,player:PlayerId,current_spell:CardId,cost:&ManaCost,payment_ctx:&crate::mana::ManaPaymentContext)->Option<(CardId,usize,u16)> {
+    if can_pay_spell_mana_cost_without_costed_sources(game,pool,player,current_spell,cost,payment_ctx) {return None;}
+    if game.cards.iter().any(|c| matches!(c.zone,ZoneType::Battlefield|ZoneType::Command) && (!c.replacement_effects.is_empty() || c.triggers.iter().any(|t|matches!(t.kind,crate::trigger::TriggerType::TapsForMana|crate::trigger::TriggerType::ManaAdded)))) {return None;}
+    for &id in game.cards_in_zone(ZoneType::Battlefield,player) {
+        if id==current_spell || game.card(id).tapped {continue;}
+        let card=game.card(id);
+        for ab in &card.activated_abilities {
+            if !ab.is_mana_ability || !ab.ability_kind.eq_ignore_ascii_case("ChooseColor") || ab.params.has("Choices") || ab.params.has("Exclude") || ab.params.has("TwoColors") || ab.params.has("UpTo") || ab.params.get("Defined").is_some_and(|v|v!="You") || !ab.cost.parts.iter().any(|p|matches!(p,CostPart::Mana{..})) || !ab.cost.parts.iter().all(|p|matches!(p,CostPart::Tap|CostPart::Mana{..})) {continue;}
+            let Some(raw)=ab.sub_ability.as_deref().and_then(|key|card.svars.get(key)) else {continue;};
+            let params=crate::parsing::Params::from_raw(raw);
+            if params.get("DB")!=Some("Mana") || params.get("Produced")!=Some("Chosen") || params.inner().keys().any(|key| !matches!(key.as_str(),"DB"|"Produced"|"Amount"|"SubAbility"|"SpellDescription")) {continue;}
+            let activation_cost=mana_cost_from_cost(&ab.cost);
+            let mut initial=game.clone();initial.tap(id);let mut paid_pool=pool.clone();
+            let activation_ctx=crate::mana::ManaPaymentContext{is_activated_ability:true,..Default::default()};
+            // Preserve exact source/ability identities in the simulated trace.
+            // The convenience helper collapses them to card IDs and cannot
+            // establish whether funding sources have reversible side effects.
+            let mut decline_complex = |_choice: ManaPayCallback<'_>| None;
+            let Some(result)=crate::mana::pay_mana_cost_auto_with_callback(&mut initial,&mut paid_pool,player,&activation_cost,Some(id),0,&activation_ctx,false,&mut decline_complex) else {continue;};
+            if result.cancelled || result.life_paid!=0 {continue;}
+            // Until all side effects can be simulated as one transaction, only
+            // borrow straightforward tap sources (including nonbasic lands and
+            // mana artifacts) without global mana triggers
+            // or replacement effects. Do not infer legality from gross output.
+            if !result.choices.is_empty() && game.cards.iter().any(|c| c.zone==ZoneType::Battlefield && (!c.replacement_effects.is_empty() || c.triggers.iter().any(|t|t.kind==crate::trigger::TriggerType::TapsForMana))) {continue;}
+            if result.choices.iter().any(|choice| {
+                let card=game.card(choice.card_id);
+                match choice.mana_ability_index.and_then(|i|card.activated_abilities.iter().find(|a|a.ability_index==i)) {
+                    Some(source_ab) => !source_ab.ability_kind.eq_ignore_ascii_case("Mana")
+                        || source_ab.is_mana_reflected || source_ab.restrict_valid.is_some()
+                        || source_ab.sub_ability.is_some() || source_ab.cost.parts.len()!=1
+                        || !matches!(source_ab.cost.parts[0],CostPart::Tap),
+                    None => !card.is_land() || !card.type_line.is_basic(),
+                }
+            }) {continue;}
+            for (name,atom) in [("White",ManaAtom::WHITE),("Blue",ManaAtom::BLUE),("Black",ManaAtom::BLACK),("Red",ManaAtom::RED),("Green",ManaAtom::GREEN)] {
+                let mut simulated=initial.clone();simulated.card_mut(id).chosen_colors=vec![name.to_string()];
+                let sa=crate::spellability::build_spell_ability(&simulated,id,raw,player);
+                let amount=crate::svar::resolve_numeric_svar(&simulated,&sa,"Amount",1).max(0);
+                if amount==0 {continue;}
+                let mut next_pool=paid_pool.clone();next_pool.add(atom,amount);
+                if can_pay_spell_mana_cost_without_costed_sources(&simulated,&next_pool,player,current_spell,cost,payment_ctx) {return Some((id,ab.ability_index,atom));}
+            }
+        }
+    }
+    None
+}
+
+pub fn can_pay_spell_mana_cost_for_action_space(game:&GameState,pool:&ManaPool,player:PlayerId,current_spell:CardId,cost:&ManaCost,payment_ctx:&crate::mana::ManaPaymentContext)->bool {
+    can_pay_spell_mana_cost_without_costed_sources(game,pool,player,current_spell,cost,payment_ctx)
+        || plan_pooled_costed_color_mana(game,pool,player,current_spell,cost,payment_ctx).is_some()
+}
+
+fn can_pay_spell_mana_cost_without_costed_sources(
     game: &GameState,
     pool: &ManaPool,
     player: PlayerId,
@@ -3184,6 +3241,18 @@ mod tests {
             vec![],
             abilities.into_iter().map(|s| s.to_string()).collect(),
         )
+    }
+
+    #[test]
+    fn costed_mana_ability_funding_respects_restricted_floating_mana() {
+        let game = GameState::new(&["P1", "P2"], 20); let player = PlayerId(0);
+        let cost = crate::cost::parse_cost("2 T");
+        let ctx = crate::mana::ManaPaymentContext { is_activated_ability:true, ..Default::default() };
+        let mut pool = ManaPool::new();
+        for _ in 0..2 { let mut m=crate::mana::Mana::simple(ManaAtom::GREEN); m.restriction=Some("Spell.Creature".into()); pool.add_mana(m); }
+        assert!(!can_pay_mana_cost_with_reserved_sacrifices(&game,&pool,player,CardId(0),&cost,&[],Some(&ctx)));
+        for _ in 0..2 { let mut m=crate::mana::Mana::simple(ManaAtom::GREEN); m.restriction=Some("Activated".into()); pool.add_mana(m); }
+        assert!(can_pay_mana_cost_with_reserved_sacrifices(&game,&pool,player,CardId(0),&cost,&[],Some(&ctx)));
     }
 
     #[test]

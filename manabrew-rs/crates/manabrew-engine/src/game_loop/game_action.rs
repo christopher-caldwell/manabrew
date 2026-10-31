@@ -582,8 +582,18 @@ impl GameLoop {
         ab: &crate::ability::activated::ActivatedAbility,
         express_choice: Option<u16>,
     ) -> bool {
+        self.resolve_mana_ability_with_outcome(game, agents, player, card_id, ab, express_choice)
+            == super::mana_payment::ManaAbilityResolution::Resolved
+    }
+
+    pub(crate) fn resolve_mana_ability_with_outcome(
+        &mut self, game: &mut GameState, agents: &mut [Box<dyn PlayerAgent>], player: PlayerId,
+        card_id: CardId, ab: &crate::ability::activated::ActivatedAbility, express_choice: Option<u16>,
+    ) -> super::mana_payment::ManaAbilityResolution {
+        use super::cost_payment::AbilityCostOutcome;
+        use super::mana_payment::ManaAbilityResolution;
         let api = crate::ability::api_type::ApiType::smart_value_of(ab.ability_kind.as_str());
-        if !self.pay_ability_cost(
+        match self.pay_ability_cost_with_outcome(
             game,
             agents,
             player,
@@ -594,7 +604,25 @@ impl GameLoop {
             CostPaymentContext::ManaAbility,
             None,
         ) {
-            return false;
+            AbilityCostOutcome::Paid => {},
+            AbilityCostOutcome::Failed => return ManaAbilityResolution::Failed,
+            AbilityCostOutcome::FailedPreservingManaEffects => return ManaAbilityResolution::FailedPreservingEffects,
+        }
+        // Mana abilities with costs beyond tapping are not safely reversible
+        // by restoring a snapshot after later payment is cancelled.
+        if ab.cost.parts.iter().any(|p| !matches!(p, crate::cost::CostPart::Tap)) {
+            self.mark_mana_undo_disqualified();
+        }
+
+        if ab.ability_kind.eq_ignore_ascii_case("ChooseColor") && ab.is_mana_ability {
+            let mut sa = crate::spellability::build_spell_ability(game, card_id, &ab.ability_text, player);
+            sa.express_mana_choice = express_choice;
+            let entry = StackEntry { id:0, spell_ability:sa, is_pending_cast:false, is_creature_spell:false, is_permanent_spell:false, cast_from_zone:None, optional_trigger_decider:None, optional_trigger_description:None, optional_trigger_source_name:None };
+            self.resolve_spell_effect(game, agents, &entry);
+            self.mark_mana_undo_disqualified();
+            self.trigger_handler.run_trigger(TriggerType::TapsForMana, RunParams {card:Some(card_id),player:Some(player),activator:Some(player),..Default::default()}, false);
+            self.trigger_handler.run_trigger(TriggerType::ManaAdded, RunParams {card:Some(card_id),player:Some(player),activator:Some(player),..Default::default()}, false);
+            return ManaAbilityResolution::Resolved;
         }
 
         // If this is a ManaReflected ability, delegate to the effect resolver
@@ -625,7 +653,7 @@ impl GameLoop {
                 },
                 false,
             );
-            return true;
+            return ManaAbilityResolution::Resolved;
         }
 
         // Build metadata params for produced mana
@@ -700,7 +728,7 @@ impl GameLoop {
                     false,
                 );
                 self.mark_mana_undo_disqualified();
-                return true;
+                return ManaAbilityResolution::Resolved;
             }
 
             // Determine mana production (color choice, Amount$, replacement effects)
@@ -757,7 +785,7 @@ impl GameLoop {
         for pt in pending {
             self.resolve_single_effect(game, agents, &pt.entry.spell_ability, None);
         }
-        true
+        ManaAbilityResolution::Resolved
     }
 
     /// Activate a non-mana ability: choose targets, pay costs, put on stack.

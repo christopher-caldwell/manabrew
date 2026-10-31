@@ -60,6 +60,15 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
 
     ctx.game.card_mut(source_id).clear_chosen_colors();
 
+    if let Some(atom)=sa.express_mana_choice {
+        let chosen=match atom {forge_foundation::ManaAtom::WHITE=>Some("White"),forge_foundation::ManaAtom::BLUE=>Some("Blue"),forge_foundation::ManaAtom::BLACK=>Some("Black"),forge_foundation::ManaAtom::RED=>Some("Red"),forge_foundation::ManaAtom::GREEN=>Some("Green"),_=>None};
+        if count_min==1 && count_max==1 {
+            if let Some(color)=chosen.filter(|color|valid_colors.iter().any(|v|v.eq_ignore_ascii_case(color))) {
+                ctx.game.card_mut(source_id).chosen_colors=vec![color.to_string()];return;
+            }
+        }
+    }
+
     for player in players {
         ctx.agents[player.index()].snapshot_state(ctx.game, ctx.mana_pools);
         let chosen =

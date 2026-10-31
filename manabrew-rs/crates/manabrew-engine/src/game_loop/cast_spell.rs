@@ -1755,6 +1755,15 @@ impl GameLoop {
                     crate::cost::can_pay_ignoring_mana(&ab.cost, game, land_id, player)
                 },
                 |slf, game, agents, session| {
+                    let mut costed_action = None;
+                    if let Some((source,index,color)) = mana::plan_pooled_costed_color_mana(game,slf.pool(session.player),session.player,session.card_id,session.mana_cost,&payment_ctx) {
+                        if let Some(ab)=game.card(source).activated_abilities.iter().find(|a|a.ability_index==index).cloned() {
+                            if !slf.resolve_mana_ability(game,agents,session.player,source,&ab,Some(color)) {
+                                return Some(vec![ManaCostAction::AttemptedAndFailed]);
+                            }
+                            costed_action=Some(ManaCostAction::TapForMana{card_id:source,mana_ability_index:Some(index),express_choice:Some(color)});
+                        }
+                    }
                     let auto_result = {
                         let game_ptr: *mut GameState = game;
                         let trigger_handler_ptr = std::ptr::from_mut(&mut slf.trigger_handler);
@@ -1800,6 +1809,7 @@ impl GameLoop {
                                 },
                             })
                             .collect();
+                        if let Some(action)=costed_action { trace.insert(0,action); }
                         if result.cancelled {
                             failed_non_undoable_choices.borrow_mut().extend(
                                 result.choices.iter().filter_map(|choice| {
@@ -1853,7 +1863,7 @@ impl GameLoop {
                         }
                         Some(trace)
                     } else {
-                        None
+                        costed_action.map(|action|vec![action,ManaCostAction::AttemptedAndFailed])
                     }
                 },
                 |slf, game, player| {
@@ -3099,6 +3109,20 @@ impl PlayerAgent for AutoAgent {
             assert_eq!(game.player(player).mana_expended_this_turn, 0);
             if !succeeds { assert_eq!(game_loop.pool(player).total_mana(), 1); }
         }
+    }
+
+    #[test]
+    fn mana_ability_cost_never_spends_spell_restricted_mana() {
+      std::thread::Builder::new().stack_size(32*1024*1024).spawn(|| {
+       for (restriction, succeeds) in [("Spell.Creature",false),("Activated",true),("nonSpell",true)] {
+        let mut game=GameState::new(&["A","B"],40); let player=PlayerId(0);
+        let rules=parse_card_script("Name:Source\nTypes:Artifact").unwrap();let id=game.create_card(Card::from_rules(&rules,player));game.move_card(id,ZoneType::Battlefield,player);
+        let mut agents:Vec<Box<dyn PlayerAgent>>=(0..2).map(|_|Box::new(AutoAgent(false,false)) as Box<dyn PlayerAgent>).collect();
+        let mut gl=GameLoop::new(2); for _ in 0..2 {let mut m=crate::mana::Mana::simple(forge_foundation::mana::ManaAtom::GREEN);m.restriction=Some(restriction.into());gl.pool_mut(player).add_mana(m);}
+        let paid=gl.pay_ability_cost(&mut game,&mut agents,player,id,&crate::cost::parse_cost("2 T"),None,false,crate::game_loop::cost_payment::CostPaymentContext::ManaAbility,None);
+        assert_eq!(paid,succeeds,"{restriction}");assert_eq!(gl.pool(player).total_mana(),if succeeds {0} else {2},"{restriction}");assert_eq!(game.card(id).tapped,succeeds,"{restriction}");
+       }
+      }).unwrap().join().unwrap();
     }
 
     #[test]

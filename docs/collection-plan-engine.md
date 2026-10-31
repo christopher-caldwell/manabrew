@@ -4,6 +4,8 @@ This fork maintains the Manabrew engine and bot used by the Collection Plan's
 headless Commander research. Engine changes and their regression tests belong in
 ordinary source files here. The collection repository retains its adapter,
 collector, immutable runtime receipts, experiment design and analysis tools.
+The owner explicitly replaced upstream agent instructions and conventions with
+this fork's own root guidance.
 
 Upstream: <https://github.com/witchesofthehill/manabrew>.
 Fork: <https://github.com/christopher-caldwell/manabrew>.
@@ -29,9 +31,19 @@ The imported repair scope includes mana ability identity, no-progress handling,
 departure and counter LKI, protection duration, damage source attribution,
 controller-list consistency and bounded convoke cancellation. DEV-027 remains
 scoped: complex mixed effects still reach explicit guards. Nykthos's broader
-costed mana planning and cancellation repair is still being developed separately
-and is not part of this import. Do not launch the planned measurement study on
-the strength of this migration.
+costed mana planning and cancellation repair is integrated as a separate source
+change after the initial import. Its source tests and archived-card checks passed
+in the repair workspace; the actual fork build still requires final setup gates.
+Do not launch the planned measurement study on the strength of this migration.
+
+The Nykthos repair covers its ChooseColor-to-Mana classification, net available
+mana with basic-land and Sol Ring funding, restricted mana, nested cancellation
+after a draw or self-sacrifice, and retry after real progress. Complex triggered
+and replacement paths remain explicitly guarded or unverified. The feasibility
+planner can understate availability in unsupported positions. The curated
+repair-source archive receipt passed 226 checks, and its source suites passed
+389 engine, 29 bot and two interface tests. These are scoped observations, not
+universal engine certification or permission for bulk measurement.
 
 ## Runtime and change discipline
 

@@ -1,6 +1,9 @@
 use super::mana_payment::ManaPaymentSession;
 use super::*;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AbilityCostOutcome { Paid, Failed, FailedPreservingManaEffects }
+
 pub(crate) enum CostPaymentContext {
     TriggerResolve,
     ActivatedAbility,
@@ -386,6 +389,14 @@ impl GameLoop {
     /// Pay the cost parts of an activated ability (tap, mana, life, sacrifice, etc.).
     /// Mirrors Java's `CostPayment.payCost()` iterating over `CostPart`s.
     pub(crate) fn pay_ability_cost(
+        &mut self, game: &mut GameState, agents: &mut [Box<dyn PlayerAgent>], player: PlayerId,
+        card_id: CardId, cost: &crate::cost::Cost, api: Option<crate::ability::api_type::ApiType>,
+        mandatory: bool, context: CostPaymentContext, sa: Option<&mut SpellAbility>,
+    ) -> bool {
+        self.pay_ability_cost_with_outcome(game, agents, player, card_id, cost, api, mandatory, context, sa) == AbilityCostOutcome::Paid
+    }
+
+    pub(crate) fn pay_ability_cost_with_outcome(
         &mut self,
         game: &mut GameState,
         agents: &mut [Box<dyn PlayerAgent>],
@@ -396,12 +407,16 @@ impl GameLoop {
         mandatory: bool,
         context: CostPaymentContext,
         mut sa: Option<&mut SpellAbility>,
-    ) -> bool {
+    ) -> AbilityCostOutcome {
         game.card_mut(card_id).paid_cost_exiled_cards.clear();
         // Java CostPayment is transactional: if any later cost part fails,
         // previously applied parts are undone. Mirror that via full snapshot.
         let payment_snapshot = self.make_snapshot(game, true);
         let mut payment_ok = true;
+        let mut preserve_mana_effects = false;
+        let mut independent_mana_effects = false;
+        let source_epoch = game.card(card_id).zone_timestamp;
+        let source_was_tapped = game.card(card_id).tapped;
         let paid_ability_mana = std::cell::RefCell::new(Vec::new());
         let paid_ability_sources = std::cell::RefCell::new(Vec::new());
 
@@ -555,7 +570,7 @@ impl GameLoop {
         }
         if !payment_ok {
             self.restore_snapshot(game, &payment_snapshot);
-            return false;
+            return AbilityCostOutcome::Failed;
         }
 
         self.reserved_sacrifice_stack
@@ -600,6 +615,14 @@ impl GameLoop {
                     let cost_str = mana_cost.to_string();
                     let payable_mana_cost =
                         crate::mana::apply_player_life_payment_keywords(game, player, &mana_cost);
+                    let ability_payment_ctx = mana::ManaPaymentContext {
+                        is_activated_ability: matches!(context, CostPaymentContext::ActivatedAbility | CostPaymentContext::ManaAbility),
+                        payment_card: Some(card_id),
+                        type_line: Some(game.card(card_id).type_line.clone()),
+                        card_name: Some(card_name.clone()),
+                        card_color: Some(game.card(card_id).color),
+                        ..Default::default()
+                    };
                     let session = ManaPaymentSession {
                         player,
                         card_id,
@@ -610,7 +633,7 @@ impl GameLoop {
                         cost_checkpoint_str: &cost_str,
                         is_activated_ability: matches!(
                             context,
-                            CostPaymentContext::ActivatedAbility
+                            CostPaymentContext::ActivatedAbility | CostPaymentContext::ManaAbility
                         ),
                         reserved_sacrifices: &reserved_sacrifices,
                     };
@@ -665,8 +688,8 @@ impl GameLoop {
                                 &trace,
                             );
                             if let Some(life_to_pay) = slf.mana_pools[session.player.index()]
-                                .try_pay_with_phyrexian_life_unrestricted(
-                                    session.mana_cost,
+                                .try_pay_for_spell_converted_with_phyrexian_life(
+                                    session.mana_cost, &ability_payment_ctx, false,
                                     game.player(session.player).life,
                                 )
                             {
@@ -704,14 +727,14 @@ impl GameLoop {
                         |slf, game, player| {
                             let mut test_pool = slf.mana_pools[player.index()].clone();
                             if let Some(test_life_to_pay) = test_pool
-                                .try_pay_with_phyrexian_life_unrestricted(
-                                    &payable_mana_cost,
+                                .try_pay_for_spell_converted_with_phyrexian_life(
+                                    &payable_mana_cost, &ability_payment_ctx, false,
                                     game.player(player).life,
                                 )
                             {
                                 let life_to_pay = slf.mana_pools[player.index()]
-                                    .try_pay_with_phyrexian_life_unrestricted(
-                                        &payable_mana_cost,
+                                    .try_pay_for_spell_converted_with_phyrexian_life(
+                                        &payable_mana_cost, &ability_payment_ctx, false,
                                         game.player(player).life,
                                     )
                                     .expect("tested phyrexian payment should still be legal");
@@ -736,6 +759,8 @@ impl GameLoop {
                         &saved_matrix,
                     );
                     if !mana_payment.paid {
+                        preserve_mana_effects = mana_payment.preserve_taps_on_failure;
+                        independent_mana_effects = mana_payment.independent_mana_effects;
                         payment_ok = false;
                         break;
                     }
@@ -1347,14 +1372,33 @@ impl GameLoop {
         self.reserved_sacrifice_stack.pop();
         self.reserved_source_reuse_stack.pop();
         if !payment_ok {
+            if preserve_mana_effects {
+                // A narrow, auditable boundary: a pending tap+mana ability
+                // may be reversed without erasing an irreversible nested mana
+                // activation only when no active triggers/replacements can
+                // have observed or changed its source.
+                let simple = matches!(context, CostPaymentContext::ManaAbility)
+                    && cost.parts.len() == 2
+                    && cost.parts.iter().filter(|p| matches!(p, CostPart::Tap)).count() == 1
+                    && cost.parts.iter().filter(|p| matches!(p, CostPart::Mana { .. })).count() == 1
+                    && independent_mana_effects && !source_was_tapped
+                    && game.card(card_id).zone == ZoneType::Battlefield
+                    && game.card(card_id).zone_timestamp == source_epoch
+                    && !game.cards.iter().any(|c| matches!(c.zone, ZoneType::Battlefield | ZoneType::Command)
+                        && (!c.triggers.is_empty() || !c.replacement_effects.is_empty()));
+                if !simple { panic!("unsupported irreversible nested mana-cost cancellation"); }
+                game.card_mut(card_id).tapped = false;
+                self.mark_mana_undo_disqualified();
+                return AbilityCostOutcome::FailedPreservingManaEffects;
+            }
             self.restore_snapshot(game, &payment_snapshot);
-            return false;
+            return AbilityCostOutcome::Failed;
         }
         if let Some(ability) = sa.as_deref_mut() {
             ability.paying_mana.extend(paid_ability_mana.into_inner());
             ability.paying_mana_sources.extend(paid_ability_sources.into_inner());
         }
-        true
+        AbilityCostOutcome::Paid
     }
 
     /// Pay additional costs from an SP$ ability line (non-mana cost parts only).

@@ -354,6 +354,22 @@ pub(crate) fn assemble_card(
         }
     }
 
+    // A no-target ChooseColor → Mana chain is a mana ability when its
+    // optional tail is limited to cleanup.
+    for ab in &mut card.activated_abilities {
+        if !ab.ability_kind.eq_ignore_ascii_case("ChooseColor") || ab.params.has("ValidTgts") || ab.params.is_true("Planeswalker") { continue; }
+        let Some(name)=ab.sub_ability.as_deref() else { continue; };
+        let Some(raw)=card.svars.get(name) else { continue; };
+        let params=crate::parsing::Params::from_raw(raw);
+        if params.get("DB")==Some("Mana") && !params.has("ValidTgts") {
+            let tail_safe=params.get("SubAbility").and_then(|next|card.svars.get(next)).map(|tail| {
+                let parsed=crate::parsing::Params::from_raw(tail);
+                parsed.get("DB")==Some("Cleanup") && !parsed.has("ValidTgts") && !parsed.has("SubAbility")
+            }).unwrap_or(params.get("SubAbility").is_none());
+            if tail_safe { ab.is_mana_ability=true; }
+        }
+    }
+
     // Parsed triggers and any constructor-time synthetic abilities/triggers have
     // now all been attached. Refresh the base counts so continuous-layer reset
     // logic does not strip real printed abilities from hidden-zone cards.
