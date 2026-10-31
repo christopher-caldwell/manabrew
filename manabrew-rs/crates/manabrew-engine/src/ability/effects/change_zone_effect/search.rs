@@ -9,6 +9,22 @@ use super::helpers::{get_land_subtypes, matches_with_context};
 use crate::ids::{CardId, PlayerId};
 use crate::spellability::SpellAbility;
 
+// Accept only offered IDs; an unrestricted mandatory library search must find
+// a card if one exists, even if a bot returns no selection or a stale ID.
+fn legal_single_search_choice(
+    chosen: Option<CardId>,
+    candidates: &[CardId],
+    must_find: bool,
+) -> Option<CardId> {
+    chosen.filter(|id| candidates.contains(id)).or_else(|| {
+        if must_find {
+            candidates.first().copied()
+        } else {
+            None
+        }
+    })
+}
+
 /// EACH clause search: one card per clause separated by "&".
 pub(super) fn resolve_each_search(
     ctx: &mut EffectContext,
@@ -63,18 +79,18 @@ pub(super) fn resolve_single_search(
     // emitted (returning null). The cancel-prompt is then skipped when the
     // candidate list is empty (Java line 1215 `fetchList.isEmpty()` short).
     ctx.agents[chooser.index()].snapshot_state(ctx.game, ctx.mana_pools);
-    let chosen = ctx.agents[chooser.index()]
-        .choose_single_card_for_zone_change(
-            ctx.game,
-            chooser,
-            candidates,
-            sa.select_prompt().unwrap_or("Select card for zone change"),
-            is_optional,
-        )
-        .into_iter()
-        .collect::<Vec<_>>();
-    if !chosen.is_empty() {
-        return chosen;
+    let chosen = ctx.agents[chooser.index()].choose_single_card_for_zone_change(
+        ctx.game,
+        chooser,
+        candidates,
+        sa.select_prompt().unwrap_or("Select card for zone change"),
+        is_optional,
+    );
+    let must_find = !is_optional
+        && sa.change_type() == Some("Card")
+        && sa.origin_zones().contains(&ZoneType::Library);
+    if let Some(id) = legal_single_search_choice(chosen, candidates, must_find) {
+        return vec![id];
     }
 
     if !sa.ir.skip_cancel_prompt && !candidates.is_empty() {
@@ -311,4 +327,31 @@ pub(super) fn resolve_defined_player_choice(
         collected.extend(resolve_defined_player_cards(ctx, sa, origin_zone, pid));
     }
     collected
+}
+
+#[cfg(test)]
+mod choice_tests {
+    use super::*;
+    #[test]
+    fn single_search_validates_choices_and_preserves_failure_to_find() {
+        let offered = [CardId(1), CardId(2)];
+        assert_eq!(
+            legal_single_search_choice(Some(CardId(2)), &offered, true),
+            Some(CardId(2))
+        );
+        assert_eq!(legal_single_search_choice(None, &offered, false), None);
+        assert_eq!(
+            legal_single_search_choice(Some(CardId(9)), &offered, false),
+            None
+        );
+        assert_eq!(
+            legal_single_search_choice(None, &offered, true),
+            Some(CardId(1))
+        );
+        assert_eq!(
+            legal_single_search_choice(Some(CardId(9)), &offered, true),
+            Some(CardId(1))
+        );
+        assert_eq!(legal_single_search_choice(None, &[], true), None);
+    }
 }

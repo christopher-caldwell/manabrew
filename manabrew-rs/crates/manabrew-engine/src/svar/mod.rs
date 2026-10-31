@@ -1745,6 +1745,18 @@ pub fn resolve_count_svar_for_sa(
         return do_x_math(highest_life, operators, game, source_id, controller, sa);
     }
 
+    // Conditional operands are expressions, evaluated only for the chosen branch.
+    if let Some(rest) = expr.strip_prefix("Count$Delirium.") {
+        if let Some((yes, no)) = rest.split_once('.') {
+            let chosen = if game.player_has_delirium(controller) {
+                yes
+            } else {
+                no
+            };
+            return resolve_svar_expression(chosen, game, source_id, controller, sa);
+        }
+    }
+
     // Count$Metalcraft.A.B — return A if controller has 3+ artifacts, else B.
     if let Some(rest) = expr.strip_prefix("Count$Metalcraft.") {
         let parts: Vec<&str> = rest.splitn(2, '.').collect();
@@ -2306,6 +2318,62 @@ mod tests {
     use crate::game::GameState;
     use crate::ids::{CardId, PlayerId};
     use crate::spellability::SpellAbility;
+
+    #[test]
+    fn delirium_count_uses_distinct_types_in_controller_graveyard() {
+        use forge_foundation::ZoneType;
+        let mut game = GameState::new(&["A", "B"], 20);
+        let p0 = PlayerId(0);
+        let p1 = PlayerId(1);
+        let make = |owner, name: &str, types: &str| {
+            Card::new(
+                CardId(0),
+                name.to_string(),
+                owner,
+                CardTypeLine::parse(types),
+                ManaCost::parse(""),
+                ColorSet::COLORLESS,
+                None,
+                None,
+                vec![],
+                vec![],
+            )
+        };
+        let host = game.create_card(make(p0, "Host", "Sorcery"));
+        let sa = SpellAbility::new_simple(Some(host), p0, "DB$ Draw");
+        let count = |g: &GameState, p| {
+            super::resolve_count_svar_for_sa("Count$Delirium.7.3", g, host, p, &sa)
+        };
+        assert_eq!(count(&game, p0), 3);
+        assert_eq!(
+            super::resolve_count_svar_for_sa("Count$Delirium.1.0", &game, host, p0, &sa),
+            0
+        );
+        for types in ["Artifact Creature", "Artifact", "Instant"] {
+            let id = game.create_card(make(p0, types, types));
+            game.move_card(id, ZoneType::Graveyard, p0);
+        }
+        assert_eq!(game.player_graveyard_type_count(p0), 3);
+        assert_eq!(count(&game, p0), 3);
+        let opposing = game.create_card(make(p1, "Opponent", "Enchantment Creature Land Sorcery"));
+        game.move_card(opposing, ZoneType::Graveyard, p1);
+        assert_eq!(count(&game, p0), 3);
+        assert_eq!(count(&game, p1), 7);
+        let fourth = game.create_card(make(p0, "Fourth", "Sorcery"));
+        game.move_card(fourth, ZoneType::Graveyard, p0);
+        assert_eq!(count(&game, p0), 7);
+        let fifth = game.create_card(make(p0, "Fifth", "Land"));
+        game.move_card(fifth, ZoneType::Graveyard, p0);
+        assert_eq!(count(&game, p0), 7);
+        assert_eq!(
+            super::resolve_count_svar_for_sa("Count$Delirium.1.0", &game, host, p0, &sa),
+            1
+        );
+        assert_eq!(
+            super::resolve_count_svar_for_sa("Count$Kicked.7.3", &game, host, p0, &sa),
+            3
+        );
+    }
 
     #[test]
     fn resolves_player_count_defined_life_total_twice() {
