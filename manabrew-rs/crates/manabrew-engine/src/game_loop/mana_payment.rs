@@ -303,7 +303,7 @@ where
                     let pool_snapshot = mana_pools[player_idx].begin_tap_tracking();
                     let ability_independent = independent_nested_mana_effects(game, session.player, land_id, &ab);
                     let independent = convoke_records.is_empty() ||
-                        (independent_mana_draw_only(game, land_id, &ab) && !convoke_records.iter().any(|(source, _)| *source == land_id));
+                        ((independent_mana_draw_only(game, land_id, &ab) || independent_tap_mana_self_damage(game, land_id, &ab)) && !convoke_records.iter().any(|(source, _)| *source == land_id));
                     // A convoke tap pays this spell, never the activation cost
                     // of a mana ability used while casting it.
                     let held = mana_pools[player_idx].take_convoke_contributions(session.card_id);
@@ -733,6 +733,31 @@ fn independent_nested_mana_effects(game: &GameState, player: PlayerId, source: C
     tap && self_sac
 }
 
+// A plain tap mana ability that deals one damage to its controller cannot
+// observe a pending convoke contribution. Zone-change, draw and spell-cast
+// triggers cannot observe this activation; combat-only damage triggers cannot
+// observe its noncombat damage. Counterspell replacements likewise cannot
+// affect it. Other triggers and replacements remain guarded.
+fn independent_tap_mana_self_damage(game: &GameState, source: CardId, ab: &ActivatedAbility) -> bool {
+    if !ab.ability_kind.eq_ignore_ascii_case("Mana") || ab.cost.parts.len() != 1
+        || !matches!(ab.cost.parts[0], crate::cost::CostPart::Tap) { return false; }
+    if game.cards.iter().filter(|c| matches!(c.zone, ZoneType::Battlefield | ZoneType::Command))
+        .any(|c| c.replacement_effects.iter().any(|r| r.event != crate::replacement::replacement_effect::ReplacementType::Counter)
+            || c.triggers.iter().any(|t| {
+            use crate::trigger::TriggerType;
+            match t.kind {
+                TriggerType::ChangesZone | TriggerType::Drawn | TriggerType::SpellCast => false,
+                TriggerType::DamageDone => !t.base.card_trait_base.get_param("CombatDamage").is_some_and(|v| v.eq_ignore_ascii_case("True")),
+                _ => true,
+            }
+        })) { return false; }
+    ab.sub_ability.as_ref().and_then(|key| game.card(source).svars.get(key)).is_some_and(|raw| {
+        let p = crate::parsing::Params::from_raw(raw);
+        p.get("DB") == Some("DealDamage") && p.get("Defined") == Some("You") && p.get("NumDmg") == Some("1")
+            && p.inner().keys().all(|k| matches!(k.as_str(), "DB" | "Defined" | "NumDmg" | "SpellDescription"))
+    })
+}
+
 fn independent_mana_draw_only(game: &GameState, source: CardId, ab: &ActivatedAbility) -> bool {
     if !ab.ability_kind.eq_ignore_ascii_case("Mana") || ab.cost.parts.len() != 1
         || !matches!(ab.cost.parts[0], crate::cost::CostPart::Tap) { return false; }
@@ -782,4 +807,45 @@ fn convoke_atom(game: &GameState, source: CardId, cost: &ManaCost) -> u16 {
     let needed = colors & (cost.color_profile() as u16);
     let pick = if needed != 0 { needed } else { colors };
     1u16 << pick.trailing_zeros()
+}
+
+#[cfg(test)]
+mod cancellation_guard_tests {
+    use super::*;
+    use crate::card::Card;
+    use forge_carddb::parse_card_script;
+
+    #[test]
+    fn pain_mana_cancellation_accepts_only_noninterfering_context() {
+        let mut game = GameState::new(&["A", "B"], 40);
+        let player = PlayerId(0);
+        let land = parse_card_script("Name:Pain Source\nTypes:Land\nA:AB$ Mana | Cost$ T | Produced$ G | SubAbility$ Pain\nSVar:Pain:DB$ DealDamage | NumDmg$ 1 | Defined$ You").unwrap();
+        let id = game.create_card(Card::from_rules(&land, player));
+        game.move_card(id, ZoneType::Battlefield, player);
+        let ability = game.card(id).activated_abilities[0].clone();
+        assert!(independent_tap_mana_self_damage(&game, id, &ability));
+        let zone = parse_card_script("Name:Zone Observer\nTypes:Creature\nT:Mode$ ChangesZone | Execute$ T\nSVar:T:DB$ Draw | Defined$ You | NumCards$ 1").unwrap();
+        let observer = game.create_card(Card::from_rules(&zone, player));
+        game.move_card(observer, ZoneType::Battlefield, player);
+        assert!(independent_tap_mana_self_damage(&game, id, &ability));
+        let safe = parse_card_script("Name:Combat Observer\nTypes:Creature\nT:Mode$ DamageDone | CombatDamage$ True | Execute$ T\nT:Mode$ Drawn | Execute$ T\nT:Mode$ SpellCast | Execute$ T\nSVar:T:DB$ Draw | Defined$ You | NumCards$ 1").unwrap();
+        let observer = game.create_card(Card::from_rules(&safe, player));
+        game.move_card(observer, ZoneType::Battlefield, player);
+        assert!(independent_tap_mana_self_damage(&game, id, &ability));
+        use crate::replacement::replacement_effect::{ReplacementEffect, ReplacementLayer, ReplacementType};
+        game.card_mut(observer).replacement_effects.push(ReplacementEffect::new(ReplacementType::Counter, ReplacementLayer::Other, crate::parsing::Params::from_raw(""), vec![]));
+        assert!(independent_tap_mana_self_damage(&game, id, &ability));
+        game.card_mut(observer).replacement_effects.push(ReplacementEffect::new(ReplacementType::ProduceMana, ReplacementLayer::Other, crate::parsing::Params::from_raw(""), vec![]));
+        assert!(!independent_tap_mana_self_damage(&game, id, &ability));
+        game.card_mut(observer).replacement_effects.pop();
+        let damage = parse_card_script("Name:Damage Observer\nTypes:Creature\nT:Mode$ DamageDone | Execute$ T\nSVar:T:DB$ Draw | Defined$ You | NumCards$ 1").unwrap();
+        let damage_observer = game.create_card(Card::from_rules(&damage, player));
+        game.move_card(damage_observer, ZoneType::Battlefield, player);
+        assert!(!independent_tap_mana_self_damage(&game, id, &ability));
+        game.move_card(damage_observer, ZoneType::Graveyard, player);
+        let taps = parse_card_script("Name:Tap Observer\nTypes:Creature\nT:Mode$ TapsForMana | Execute$ T\nSVar:T:DB$ Draw | Defined$ You | NumCards$ 1").unwrap();
+        let observer = game.create_card(Card::from_rules(&taps, player));
+        game.move_card(observer, ZoneType::Battlefield, player);
+        assert!(!independent_tap_mana_self_damage(&game, id, &ability));
+    }
 }

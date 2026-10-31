@@ -2501,11 +2501,37 @@ pub fn can_pay_mana_cost_with_reserved_sacrifices(
     source_masks.len() - committed.len() >= generic_count as usize
 }
 
+// Only tap and mana-production replacements can affect a plan composed of
+// simple tap sources. Unknown replacements remain conservatively unsafe.
+fn costed_plan_has_unsafe_replacement(game: &GameState) -> bool {
+    use crate::replacement::replacement_effect::ReplacementType;
+    game.cards.iter().filter(|c| matches!(c.zone, ZoneType::Battlefield | ZoneType::Command))
+        .flat_map(|c| c.replacement_effects.iter())
+        .any(|r| matches!(r.event, ReplacementType::ProduceMana | ReplacementType::Tap | ReplacementType::Other(_)))
+}
+
+// The only narrowed trigger is a `Card.AttachedBy` taps-for-mana trigger:
+// it cannot observe any other permanent. Unknown selectors and ManaAdded
+// remain unsafe until their complete applicability can be established.
+fn costed_plan_has_unsafe_trigger(game: &GameState, sources: &[CardId]) -> bool {
+    game.cards.iter().filter(|c| matches!(c.zone, ZoneType::Battlefield | ZoneType::Command))
+        .any(|host| host.triggers.iter().any(|trigger| {
+            match trigger.kind {
+                crate::trigger::TriggerType::TapsForMana => {
+                    let attached_only = trigger.base.card_trait_base.get_param("ValidCard") == Some("Card.AttachedBy");
+                    !(attached_only && host.attached_to.is_some_and(|id| !sources.contains(&id)))
+                }
+                crate::trigger::TriggerType::ManaAdded => true,
+                _ => false,
+            }
+        }))
+}
+
 /// Plan a no-target, one-color costed mana ability with a conservatively
 /// simulated activation cost. Complex nested-source cases remain unsupported.
 pub fn plan_pooled_costed_color_mana(game:&GameState,pool:&ManaPool,player:PlayerId,current_spell:CardId,cost:&ManaCost,payment_ctx:&crate::mana::ManaPaymentContext)->Option<(CardId,usize,u16)> {
     if can_pay_spell_mana_cost_without_costed_sources(game,pool,player,current_spell,cost,payment_ctx) {return None;}
-    if game.cards.iter().any(|c| matches!(c.zone,ZoneType::Battlefield|ZoneType::Command) && (!c.replacement_effects.is_empty() || c.triggers.iter().any(|t|matches!(t.kind,crate::trigger::TriggerType::TapsForMana|crate::trigger::TriggerType::ManaAdded)))) {return None;}
+    if costed_plan_has_unsafe_replacement(game) { return None; }
     for &id in game.cards_in_zone(ZoneType::Battlefield,player) {
         if id==current_spell || game.card(id).tapped {continue;}
         let card=game.card(id);
@@ -2523,11 +2549,15 @@ pub fn plan_pooled_costed_color_mana(game:&GameState,pool:&ManaPool,player:Playe
             let mut decline_complex = |_choice: ManaPayCallback<'_>| None;
             let Some(result)=crate::mana::pay_mana_cost_auto_with_callback(&mut initial,&mut paid_pool,player,&activation_cost,Some(id),0,&activation_ctx,false,&mut decline_complex) else {continue;};
             if result.cancelled || result.life_paid!=0 {continue;}
-            // Until all side effects can be simulated as one transaction, only
-            // borrow straightforward tap sources (including nonbasic lands and
-            // mana artifacts) without global mana triggers
-            // or replacement effects. Do not infer legality from gross output.
-            if !result.choices.is_empty() && game.cards.iter().any(|c| c.zone==ZoneType::Battlefield && (!c.replacement_effects.is_empty() || c.triggers.iter().any(|t|t.kind==crate::trigger::TriggerType::TapsForMana))) {continue;}
+            // The remaining spell payment may use additional controlled
+            // permanents. Include them conservatively as well as the exact
+            // activation funding and the costed source itself.
+            let mut sources: Vec<CardId> = result.choices.iter().map(|choice| choice.card_id).collect();
+            sources.extend_from_slice(game.cards_in_zone(ZoneType::Battlefield, player));
+            sources.push(id);
+            if costed_plan_has_unsafe_trigger(game, &sources) { continue; }
+            // Only straightforward tap sources are simulated. Do not infer
+            // legality from gross output or from a nontrivial funding cost.
             if result.choices.iter().any(|choice| {
                 let card=game.card(choice.card_id);
                 match choice.mana_ability_index.and_then(|i|card.activated_abilities.iter().find(|a|a.ability_index==i)) {
@@ -3253,6 +3283,24 @@ mod tests {
         assert!(!can_pay_mana_cost_with_reserved_sacrifices(&game,&pool,player,CardId(0),&cost,&[],Some(&ctx)));
         for _ in 0..2 { let mut m=crate::mana::Mana::simple(ManaAtom::GREEN); m.restriction=Some("Activated".into()); pool.add_mana(m); }
         assert!(can_pay_mana_cost_with_reserved_sacrifices(&game,&pool,player,CardId(0),&cost,&[],Some(&ctx)));
+    }
+
+    #[test]
+    fn costed_plan_ignores_unrelated_replacements_and_disjoint_attached_trigger() {
+        use crate::replacement::replacement_effect::{ReplacementEffect, ReplacementLayer, ReplacementType};
+        use crate::parsing::Params;
+        use forge_carddb::parse_card_script;
+        let mut game=GameState::new(&["A","B"],40);let player=PlayerId(0);let opponent=PlayerId(1);
+        let own=game.create_card(make_card(0,player,"Own Forest","Land Forest",vec![]));game.move_card(own,ZoneType::Battlefield,player);
+        let other=game.create_card(make_card(1,opponent,"Other Forest","Land Forest",vec![]));game.move_card(other,ZoneType::Battlefield,opponent);
+        let rules=parse_card_script("Name:Mana Aura\nTypes:Enchantment Aura\nT:Mode$ TapsForMana | ValidCard$ Card.AttachedBy | Execute$ TrigMana\nSVar:TrigMana:DB$ Mana | Produced$ G").unwrap();
+        let aura=game.create_card(Card::from_rules(&rules,opponent));game.move_card(aura,ZoneType::Battlefield,opponent);game.card_mut(aura).attach_to_entity(other);
+        assert!(!costed_plan_has_unsafe_trigger(&game,&[own]));
+        assert!(costed_plan_has_unsafe_trigger(&game,&[other]));
+        game.card_mut(aura).replacement_effects.push(ReplacementEffect::new(ReplacementType::Moved,ReplacementLayer::Other,Params::from_raw(""),vec![]));
+        assert!(!costed_plan_has_unsafe_replacement(&game));
+        game.card_mut(aura).replacement_effects.push(ReplacementEffect::new(ReplacementType::ProduceMana,ReplacementLayer::Other,Params::from_raw(""),vec![]));
+        assert!(costed_plan_has_unsafe_replacement(&game));
     }
 
     #[test]

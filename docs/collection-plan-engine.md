@@ -64,3 +64,14 @@ deck research, not general completion of the engine, desktop app or web service.
 
 Local reconstruction and source-equivalence receipts are ignored data in the
 collection checkout under `sim/.local/fork-adoption-20261031/`.
+
+## Targeted candidate readiness repairs
+
+The subsequent readiness audit reproduced four actual-list defects: zero damage
+from paid Crackle with Power, unrelated effects suppressing Nykthos, mixed
+convoke/painland cancellation, and infect bypassing damage prevention. Their
+scoped repairs pass 393 engine library tests and 249 standalone archived-card
+probes, including Chord with the three frozen opponent commanders together.
+These source checks precede the combined published runtime build. Relevant or
+unknown damage/mana triggers, other replacement effects and complex mixed cost
+paths remain guarded; the recorded scope is not complete engine certification.

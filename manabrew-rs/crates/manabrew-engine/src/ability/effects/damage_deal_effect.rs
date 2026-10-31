@@ -22,8 +22,9 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
     // For triggered abilities, resolve Defined$ for target. Some effects use
     // bare `Player` to mean "each player", so collect all defined players here
     // and fan out below instead of forcing everything through a single target.
-    let target_players: Vec<_> = if let Some(target_player) = sa.target_chosen.target_player {
-        vec![target_player]
+    let chosen_players = sa.target_chosen.all_target_players();
+    let target_players: Vec<_> = if !chosen_players.is_empty() {
+        chosen_players
     } else if let Some(defined) = sa.defined() {
         crate::ability::ability_utils::resolve_defined_players_with_sa(
             defined,
@@ -409,7 +410,15 @@ fn resolve_amount_expr(ctx: &EffectContext, sa: &SpellAbility, amount: &AmountEx
     match amount {
         AmountExpr::Literal(value) => Some(*value),
         AmountExpr::X => Some(resolve_x_amount(ctx, sa)),
-        AmountExpr::SVar(name) => Some(resolve_svar_amount(ctx, sa, name)),
+        // The local fast path does not evaluate arithmetic on nested SVars.
+        // Let the shared resolver handle those expressions (for example,
+        // Crackle with Power's `SVar$X/Times.5`) rather than returning zero.
+        AmountExpr::SVar(name) => {
+            let has_math = sa.source
+                .and_then(|source| ctx.game.card(source).get_s_var(name))
+                .is_some_and(|expression| expression.contains('/'));
+            if has_math { None } else { Some(resolve_svar_amount(ctx, sa, name)) }
+        },
         AmountExpr::Raw(_) => None,
     }
 }
@@ -518,5 +527,55 @@ fn evaluate_svar_expr(ctx: &EffectContext, sa: &SpellAbility, expr: &str) -> i32
             .map(|id| ctx.game.card(id).toughness())
             .unwrap_or(0),
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod numeric_damage_regressions {
+    use super::*;
+    use std::collections::HashMap;
+    use crate::agent::{PassAgent, PlayerAgent};
+    use crate::card::Card;
+    use crate::game::GameState;
+    use crate::ids::PlayerId;
+    use crate::mana::ManaPool;
+    use crate::trigger::handler::TriggerHandler;
+    use forge_carddb::parse_card_script;
+    use forge_foundation::ZoneType;
+
+    #[test]
+    fn named_svar_arithmetic_and_other_damage_amounts() {
+        let mut game = GameState::new(&["A", "B", "C", "D"], 40);
+        let player = PlayerId(0);
+        let rules = parse_card_script("Name:Damage Fixture\nTypes:Sorcery\nA:SP$ DealDamage | NumDmg$ Y\nSVar:X:Count$xPaid\nSVar:Y:SVar$X/Times.5").unwrap();
+        let source = game.create_card(Card::from_rules(&rules, player));
+        game.move_card(source, ZoneType::Stack, player);
+        let mut scaled = crate::spellability::build_spell_ability(&game, source, "SP$ DealDamage | NumDmg$ Y", player);
+        scaled.x_mana_cost_paid = 4;
+        let copied = scaled.clone();
+        let mut x_only = crate::spellability::build_spell_ability(&game, source, "SP$ DealDamage | NumDmg$ X", player);
+        x_only.x_mana_cost_paid = 4;
+        let fixed = crate::spellability::build_spell_ability(&game, source, "SP$ DealDamage | NumDmg$ 3", player);
+        let mut trigger_handler = TriggerHandler::new();
+        let mut agents: Vec<Box<dyn PlayerAgent>> = vec![Box::new(PassAgent), Box::new(PassAgent), Box::new(PassAgent), Box::new(PassAgent)];
+        let mut pools = vec![ManaPool::default(); 4];
+        let templates = HashMap::new(); let variants = HashMap::new();
+        let fallback = HashMap::new(); let editions = HashMap::new();
+        let mut rng = crate::game_rng::ThreadRngAdapter;
+        let mut ctx = EffectContext { game: &mut game, combat: None, agents: &mut agents, trigger_handler: &mut trigger_handler,
+            token_templates: &templates, token_art_variants: &variants, token_fallback: &fallback,
+            edition_dates: &editions, mana_pools: &mut pools, parent_target_card: None, rng: &mut rng };
+        assert_eq!(resolve_damage_amount(&ctx, &scaled), 20);
+        assert_eq!(resolve_damage_amount(&ctx, &copied), 20);
+        assert_eq!(resolve_damage_amount(&ctx, &x_only), 4);
+        assert_eq!(resolve_damage_amount(&ctx, &fixed), 3);
+        for player in [PlayerId(1), PlayerId(2), PlayerId(3)] {
+            scaled.target_chosen.add(None, Some(player));
+        }
+        let copied_targets = scaled.clone();
+        <DamageDealEffect as crate::ability::spell_ability_effect::SpellAbilityEffect>::resolve(&mut ctx, &scaled);
+        assert_eq!((1..4).map(|i| ctx.game.player(PlayerId(i)).life).collect::<Vec<_>>(), vec![20, 20, 20]);
+        <DamageDealEffect as crate::ability::spell_ability_effect::SpellAbilityEffect>::resolve(&mut ctx, &copied_targets);
+        assert_eq!((1..4).map(|i| ctx.game.player(PlayerId(i)).life).collect::<Vec<_>>(), vec![0, 0, 0]);
     }
 }

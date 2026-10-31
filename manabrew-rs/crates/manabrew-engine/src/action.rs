@@ -780,51 +780,30 @@ impl GameState {
         is_combat: bool,
         agents: Option<&mut [Box<dyn crate::agent::PlayerAgent>]>,
     ) -> i32 {
-        if amount <= 0 {
-            return 0;
-        }
-        if !self.card(target).can_be_dealt_damage() {
-            return 0;
-        }
-        let mut event = ReplacementEvent::DamageToCard {
-            target,
-            amount,
-            source,
-            is_combat,
-        };
-        if let Some(agents) = agents {
-            apply_replacements_with_agents(self, agents, &mut event);
-        } else {
+        let final_amount = self.damage_to_card_after_prevention(target, amount, source, is_combat, agents);
+        if final_amount <= 0 { return 0; }
+        let dealt = self.cards[target.index()].add_damage_after_prevention(final_amount);
+        if dealt > 0 {
+            let mut event = ReplacementEvent::DealtDamage { target, amount: dealt, source };
             apply_replacements(self, &mut event);
         }
-        if let ReplacementEvent::DamageToCard {
-            amount: mut final_amount,
-            ..
-        } = event
-        {
-            // Consume PreventDamage shields. Each shield prevents 1 damage and
-            // is removed. Mirrors Java's per-shield ReplaceDamage effect cards
-            // in the Command zone, but using the legacy `damage_prevention`
-            // counter pending the proper Command-zone effect-card port.
-            let shields = self.cards[target.index()].damage_prevention;
-            if shields > 0 && final_amount > 0 {
-                let consumed = shields.min(final_amount);
-                self.cards[target.index()].damage_prevention -= consumed;
-                final_amount -= consumed;
-            }
-            if final_amount > 0 {
-                let dealt = self.cards[target.index()].add_damage_after_prevention(final_amount);
-                // Fire DealtDamage replacement event after damage is applied.
-                let mut dealt_event = ReplacementEvent::DealtDamage {
-                    target,
-                    amount: dealt,
-                    source,
-                };
-                if dealt > 0 {
-                    apply_replacements(self, &mut dealt_event);
-                }
-                return dealt;
-            }
+        dealt
+    }
+
+    /// Run damage replacements and consume prevention before choosing how
+    /// damage is represented (marked damage or infect/wither counters).
+    pub fn damage_to_card_after_prevention(
+        &mut self, target: CardId, amount: i32, source: Option<CardId>, is_combat: bool,
+        agents: Option<&mut [Box<dyn crate::agent::PlayerAgent>]>,
+    ) -> i32 {
+        if amount <= 0 || !self.card(target).can_be_dealt_damage() { return 0; }
+        let mut event = ReplacementEvent::DamageToCard { target, amount, source, is_combat };
+        if let Some(agents) = agents { apply_replacements_with_agents(self, agents, &mut event); }
+        else { apply_replacements(self, &mut event); }
+        if let ReplacementEvent::DamageToCard { amount, .. } = event {
+            let prevented = self.cards[target.index()].damage_prevention.min(amount.max(0));
+            self.cards[target.index()].damage_prevention -= prevented;
+            return (amount - prevented).max(0);
         }
         0
     }
@@ -860,36 +839,24 @@ impl GameState {
         is_combat: bool,
         agents: Option<&mut [Box<dyn crate::agent::PlayerAgent>]>,
     ) -> i32 {
-        if amount <= 0 {
-            return 0;
-        }
-        if crate::staticability::static_ability_cant_gain_lose_pay_life::cant_lose_life(
-            self, target,
-        ) {
-            return 0;
-        }
-        if crate::player::has_keyword(self, target, "Protection from everything") {
-            return 0;
-        }
-        let mut event = ReplacementEvent::DamageToPlayer {
-            target,
-            amount,
-            source,
-            is_combat,
-        };
-        if let Some(agents) = agents {
-            apply_replacements_with_agents(self, agents, &mut event);
-        } else {
-            apply_replacements(self, &mut event);
-        }
-        if let ReplacementEvent::DamageToPlayer {
-            amount: final_amount,
-            ..
-        } = event
-        {
-            if final_amount > 0 {
-                return self.player_deal_damage(target, final_amount);
-            }
+        if crate::staticability::static_ability_cant_gain_lose_pay_life::cant_lose_life(self, target) { return 0; }
+        let amount = self.damage_to_player_after_prevention(target, amount, source, is_combat, agents);
+        if amount > 0 { self.player_deal_damage(target, amount) } else { 0 }
+    }
+
+    /// Apply player damage replacements and prevention before life or poison.
+    pub fn damage_to_player_after_prevention(
+        &mut self, target: PlayerId, amount: i32, source: Option<CardId>, is_combat: bool,
+        agents: Option<&mut [Box<dyn crate::agent::PlayerAgent>]>,
+    ) -> i32 {
+        if amount <= 0 || crate::player::has_keyword(self, target, "Protection from everything") { return 0; }
+        let mut event = ReplacementEvent::DamageToPlayer { target, amount, source, is_combat };
+        if let Some(agents) = agents { apply_replacements_with_agents(self, agents, &mut event); }
+        else { apply_replacements(self, &mut event); }
+        if let ReplacementEvent::DamageToPlayer { amount, .. } = event {
+            let prevented = self.player(target).damage_prevention.min(amount.max(0));
+            self.player_mut(target).damage_prevention -= prevented;
+            return (amount - prevented).max(0);
         }
         0
     }
