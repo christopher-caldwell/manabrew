@@ -1585,8 +1585,11 @@ impl GameLoop {
         let improvise_untapped: Vec<_> = if game.card(card_id).has_keyword("Improvise") {
             game.cards_in_zone(ZoneType::Battlefield, player).iter().copied()
                 .filter(|&id| game.card(id).type_line.is_artifact() && !game.card(id).tapped)
+                .map(|id| (id, game.card(id).zone_timestamp))
                 .collect()
         } else { Vec::new() };
+        let improvise_without_observers = !game.cards.iter().any(|c| matches!(c.zone, ZoneType::Battlefield | ZoneType::Command)
+            && (!c.triggers.is_empty() || !c.replacement_effects.is_empty()));
         let mut total_unpaid = ManaCostBeingPaid::from_mana_cost(&payable_base_cost);
         if !crate::cost::cost_adjustment::adjust(
             game,
@@ -1602,9 +1605,9 @@ impl GameLoop {
         ) {
             rollback_cast!();
         }
-        let improvise_mutated = improvise_untapped.iter().any(|&id| {
-            game.card(id).zone != ZoneType::Battlefield || game.card(id).tapped
-        });
+        let improvise_selected: Vec<_> = improvise_untapped.into_iter().filter(|&(id, epoch)| {
+            game.card(id).zone != ZoneType::Battlefield || game.card(id).zone_timestamp != epoch || game.card(id).tapped
+        }).collect();
         let total_cost = crate::mana::apply_player_life_payment_keywords(
             game,
             player,
@@ -1922,12 +1925,21 @@ impl GameLoop {
                     // transaction; abort explicitly instead of emitting a
                     // corrupted game when they are present.
                     let card = game.card(card_id);
+                    let safe_improvise = improvise_selected.is_empty() || (improvise_without_observers
+                        && mana_payment.independent_mana_effects
+                        && improvise_selected.iter().all(|&(id, epoch)| {
+                            let c = game.card(id);
+                            c.zone == ZoneType::Battlefield && c.zone_timestamp == epoch && c.tapped
+                        }));
                     let mutated_reduction = card.has_keyword("Delve") || (card.has_keyword("Convoke") && (!sa.convoke_tapped.is_empty() || mana_payment.convoke_used))
-                        || improvise_mutated || mana_payment.convoke_used || card.get_offering_type().is_some()
+                        || !safe_improvise || mana_payment.convoke_used || card.get_offering_type().is_some()
                         || sa.alt_cost == Some(crate::spellability::AlternativeCost::Emerge);
                     if !sa.is_spell || mutated_reduction || game.card_current_zone(card_id) != ZoneType::Stack {
                         panic!("unsupported irreversible mana rollback with mutating cost reduction or moved pending spell");
                     }
+                    // Undo the pending cost without producing an untap event.
+                    // Independent completed mana effects remain intact.
+                    for (id, _) in improvise_selected { game.card_mut(id).tapped = false; }
                     if let Some(id) = pending_stack_id { game.stack.remove_by_id(id); }
                     let owner = game.card(card_id).owner;
                     // Returning an uncompleted flashback cast is a reversal,
@@ -3435,8 +3447,9 @@ impl PlayerAgent for AutoAgent {
     }
 
     #[test]
-    fn improvise_reduction_remains_guarded_after_irreversible_payment() {
+    fn improvise_reduction_reverses_after_independent_irreversible_payment() {
       std::thread::Builder::new().stack_size(32*1024*1024).spawn(|| {
+        for observer in [false, true] {
         let mut game=GameState::new(&["A","B"],40); let player=PlayerId(0);
         let spell=parse_card_script("Name:Fixture\nManaCost:2 G\nTypes:Instant\nK:Improvise\nA:SP$ GainLife | Defined$ You | LifeAmount$ 1").unwrap();
         let land=parse_card_script("Name:Draw Land\nTypes:Basic Land Forest\nA:AB$ Mana | Cost$ T | Produced$ G | SubAbility$ DBDraw\nSVar:DBDraw:DB$ Draw | Defined$ You | NumCards$ 1").unwrap();
@@ -3444,12 +3457,26 @@ impl PlayerAgent for AutoAgent {
         let id=game.create_card(Card::from_rules(&spell,player)); game.move_card(id,ZoneType::Hand,player);
         let source=game.create_card(Card::from_rules(&land,player)); game.move_card(source,ZoneType::Battlefield,player);
         let helper=game.create_card(Card::from_rules(&artifact,player)); game.move_card(helper,ZoneType::Battlefield,player);
+        let filler=parse_card_script("Name:Drawn\nTypes:Creature Human\nPT:1/1").unwrap();
+        let drawn=game.create_card(Card::from_rules(&filler,player)); game.move_card(drawn,ZoneType::Library,player);
+        if observer {
+            let rules=parse_card_script("Name:Tap Observer\nTypes:Enchantment\nT:Mode$ Taps | ValidCard$ Card | Execute$ Gain\nSVar:Gain:DB$ GainLife | Defined$ You | LifeAmount$ 1").unwrap();
+            let watcher=game.create_card(Card::from_rules(&rules,player)); game.move_card(watcher,ZoneType::Battlefield,player);
+        }
         let sa=crate::spellability::build_spell_ability(&game,id,"SP$ GainLife | Defined$ You | LifeAmount$ 1",player);
         let mut agents: Vec<Box<dyn PlayerAgent>>=(0..2).map(|_|Box::new(AutoAgent(true,false)) as Box<dyn PlayerAgent>).collect();
         let mut gl=GameLoop::new(2); gl.pool_mut(player).add(forge_foundation::mana::ManaAtom::GREEN,5);
         IMPROVISE_FIXTURE.with(|v|v.set(true)); CANCEL_MANA.with(|v|v.set(true)); TAP_BEFORE_FAILURE.with(|v|v.set(1));
         let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||gl.cast_card_spell_ability(&mut game,&mut agents,player,sa,false)));
-        assert!(game.card(helper).tapped); assert!(result.is_err(),"an applied reduction must remain guarded");
+        if observer {
+            assert!(result.is_err(),"an observing trigger must remain guarded");
+        } else {
+            assert!(result.is_ok(),"independent mana effects permit reversing the pending Improvise tap");
+            assert!(result.unwrap().is_none()); assert!(!game.card(helper).tapped);
+            assert_eq!(game.card(id).zone, ZoneType::Hand); assert!(game.card(source).tapped);
+            assert_eq!(game.card(drawn).zone, ZoneType::Hand); assert_eq!(gl.pool(player).total_mana(),6);
+        }
+        }
       }).unwrap().join().unwrap();
     }
 
