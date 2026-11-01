@@ -264,6 +264,30 @@ mod tests {
     }
 
     #[test]
+    fn activated_offer_respects_spell_only_mana() {
+        let player = PlayerId(0);
+        let mut game = GameState::new(&["P1", "P2"], 20);
+        let mut add = |name, types, abilities| {
+            let id = game.create_card(make_card(0, player, name, types, abilities));
+            game.add_card_to_zone(ZoneType::Battlefield, player, id);
+            game.card_mut(id).zone = ZoneType::Battlefield;
+            id
+        };
+        let ability = add("Ability", "Artifact", vec!["AB$ Draw | Cost$ 1 W | NumCards$ 1"]);
+        let restricted = add("Angel source", "Artifact", vec!["AB$ Mana | Cost$ T | Produced$ W | RestrictValid$ Spell.Angel"]);
+        let land = add("Plains", "Land", vec!["AB$ Mana | Cost$ T | Produced$ W"]);
+        let engine = GameLoop::new(2);
+        let offered = |g: &GameState| engine.get_activatable_abilities(g, player, true).iter().any(|(id, _)| *id == ability);
+        assert!(!offered(&game));
+        game.card_mut(restricted).activated_abilities[0] = parse_activated_ability("AB$ Mana | Cost$ T | Produced$ W | RestrictValid$ Activated", 0).unwrap();
+        assert!(offered(&game), "mana restricted to activated abilities must remain usable");
+        // Reparse so both the IR and raw parameters describe unrestricted mana.
+        game.card_mut(restricted).activated_abilities[0] = parse_activated_ability("AB$ Mana | Cost$ T | Produced$ W", 0).unwrap();
+        assert!(offered(&game));
+        assert!(!game.card(restricted).tapped && !game.card(land).tapped);
+    }
+
+    #[test]
     fn tapped_non_tap_mana_source_is_available_for_payment() {
         let player = PlayerId(0);
         let mut game = GameState::new(&["P1", "P2"], 20);

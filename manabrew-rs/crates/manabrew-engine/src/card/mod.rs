@@ -1504,6 +1504,9 @@ impl Card {
         let target = format!("Protection from {quality}");
         self.keywords.contains_string_ignore_case(&target)
             || self.granted_keywords.contains_string_ignore_case(&target)
+            || self.pump_keywords.contains_string_ignore_case(&target)
+            || (["white", "blue", "black", "red", "green"].iter().any(|c| c.eq_ignore_ascii_case(quality))
+                && self.get_protections().iter().any(|p| p == "each color"))
     }
 
     /// Get all "Protection from X" values this card has.
@@ -1513,6 +1516,7 @@ impl Card {
             .keywords
             .iter_strings()
             .chain(self.granted_keywords.iter_strings())
+            .chain(self.pump_keywords.iter_strings())
         {
             if let Some(from) = kw.strip_prefix("Protection from ") {
                 prots.push(from.to_lowercase());
@@ -1527,6 +1531,9 @@ impl Card {
     pub fn is_protected_from(&self, source: &Card) -> bool {
         for prot in self.get_protections() {
             match prot.as_str() {
+                "each color" => {
+                    if !source.color.is_colorless() { return true; }
+                }
                 "white" => {
                     if source.color.has_white() {
                         return true;
@@ -4427,6 +4434,20 @@ mod tests {
         assert!(!card.has_shroud());
         assert!(!card.has_fear());
         assert!(!card.has_shadow());
+    }
+
+    #[test]
+    fn temporary_protection_from_each_color_excludes_colorless() {
+        let mut target = Card::new(CardId(0), "Target".into(), PlayerId(0), CardTypeLine::parse("Creature"), ManaCost::zero(), ColorSet::WHITE, Some(2), Some(2), vec![], vec![]);
+        let source = |id, color| Card::new(CardId(id), "Source".into(), PlayerId(1), CardTypeLine::parse("Instant"), ManaCost::zero(), color, None, None, vec![], vec![]);
+        let white=source(1,ColorSet::WHITE);let red=source(2,ColorSet::RED);let colorless=source(3,ColorSet::COLORLESS);
+        assert!(!target.is_protected_from(&white));
+        target.pump_keywords.add("Protection from each color");
+        assert!(target.is_protected_from(&white) && target.is_protected_from(&red));
+        assert!(!target.is_protected_from(&colorless));
+        assert!(target.has_protection_from("white"));
+        target.pump_keywords.remove("Protection from each color");
+        assert!(!target.is_protected_from(&white));
     }
 
     #[test]

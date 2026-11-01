@@ -573,6 +573,14 @@ impl GameLoop {
             return AbilityCostOutcome::Failed;
         }
 
+        // Pay the mana part first for a two-part tap-and-mana mana ability.
+        let defer_mana_ability_tap = matches!(context, CostPaymentContext::ManaAbility)
+            && cost.parts.len() == 2
+            && cost.parts.iter().filter(|p| matches!(p, CostPart::Tap)).count() == 1
+            && cost.parts.iter().filter(|p| matches!(p, CostPart::Mana { .. })).count() == 1;
+        if defer_mana_ability_tap && !reserved_sacrifices.contains(&card_id) {
+            reserved_sacrifices.push(card_id);
+        }
         self.reserved_sacrifice_stack
             .push(reserved_sacrifices.clone());
         self.reserved_source_reuse_stack
@@ -580,9 +588,17 @@ impl GameLoop {
 
         // Phase 2: execute payments.
         let mut pre_sac_idx = 0usize;
-        for part in cost.parts.clone() {
+        let mut execution_parts = cost.parts.clone();
+        if defer_mana_ability_tap {
+            execution_parts.sort_by_key(|part| if matches!(part, CostPart::Mana { .. }) { 0 } else { 1 });
+        }
+        for part in execution_parts {
             match &part {
                 CostPart::Tap => {
+                    if defer_mana_ability_tap && (game.card(card_id).zone != ZoneType::Battlefield
+                        || game.card(card_id).zone_timestamp != source_epoch || game.card(card_id).tapped) {
+                        panic!("unsupported changed mana ability source after nested payment");
+                    }
                     game.tap(card_id);
                     self.trigger_handler.run_trigger(
                         TriggerType::Taps,
@@ -635,6 +651,7 @@ impl GameLoop {
                             context,
                             CostPaymentContext::ActivatedAbility | CostPaymentContext::ManaAbility
                         ),
+                        exclude_pending_source: defer_mana_ability_tap,
                         reserved_sacrifices: &reserved_sacrifices,
                     };
                     let mana_payment = self.pay_mana_cost_session(
@@ -1373,6 +1390,11 @@ impl GameLoop {
         self.reserved_source_reuse_stack.pop();
         if !payment_ok {
             if preserve_mana_effects {
+                if defer_mana_ability_tap && game.card(card_id).zone == ZoneType::Battlefield
+                    && game.card(card_id).zone_timestamp == source_epoch && !game.card(card_id).tapped {
+                    self.mark_mana_undo_disqualified();
+                    return AbilityCostOutcome::FailedPreservingManaEffects;
+                }
                 // A narrow, auditable boundary: a pending tap+mana ability
                 // may be reversed without erasing an irreversible nested mana
                 // activation only when no active triggers/replacements can

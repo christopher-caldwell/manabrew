@@ -686,6 +686,13 @@ pub(super) fn choose_type<T: Responder>(
     type_category: &str,
     valid_types: &[String],
 ) -> Option<String> {
+    choose_type_for_source(agent, _player, type_category, valid_types, None)
+}
+
+pub(super) fn choose_type_for_source<T: Responder>(
+    agent: &mut PromptAgent<T>, _player: PlayerId, type_category: &str,
+    valid_types: &[String], source: Option<CardId>,
+) -> Option<String> {
     if valid_types.is_empty() {
         return None;
     }
@@ -694,7 +701,7 @@ pub(super) fn choose_type<T: Responder>(
     } else {
         format!("Choose a {type_category} type")
     };
-    send_selection(agent, &title, None, valid_types.to_vec(), 1, 1, None);
+    send_selection(agent, &title, None, valid_types.to_vec(), 1, 1, source);
     match recv_selection(agent) {
         Some(chosen_indices) => chosen_indices
             .first()

@@ -1248,6 +1248,11 @@ impl<R: Responder> PlayerAgent for PromptAgent<R> {
         choices::choose_type(self, player, type_category, valid_types)
     }
 
+    fn choose_type_for_source(&mut self, player: PlayerId, type_category: &str,
+        valid_types: &[String], source: Option<CardId>) -> Option<String> {
+        choices::choose_type_for_source(self, player, type_category, valid_types, source)
+    }
+
     fn choose_counter_type(
         &mut self,
         player: PlayerId,

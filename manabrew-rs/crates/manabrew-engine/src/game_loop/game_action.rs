@@ -218,8 +218,9 @@ impl GameLoop {
             }
             // Activated abilities that require targets should only be offered
             // when at least one legal target candidate exists.
-            let sa_for_target_check =
+            let mut sa_for_target_check =
                 crate::spellability::build_spell_ability(game, card_id, &ab.ability_text, player);
+            sa_for_target_check.is_activated = true;
             if crate::staticability::static_ability_cant_be_cast::cant_be_activated_ability(
                 game,
                 &game.cards,
@@ -261,11 +262,13 @@ impl GameLoop {
             let reserved_sacrifices =
                 Self::fixed_reserved_sacrifices_for_action(&sa_for_target_check, card_id);
             let mana_for_check = if needs_mana {
-                mana::calculate_available_mana_excluding(
+                mana::calculate_available_mana_with_context(
                     self.pool(player),
                     game,
                     player,
                     Some(card_id),
+                    &reserved_sacrifices,
+                    Some(&crate::mana::payment_context_for_sa(game, &sa_for_target_check)),
                 )
             } else {
                 available_mana.clone()

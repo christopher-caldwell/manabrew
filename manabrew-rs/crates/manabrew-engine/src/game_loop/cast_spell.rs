@@ -1745,6 +1745,7 @@ impl GameLoop {
                 cost_display_str: &cost_display_str,
                 cost_checkpoint_str: &cost_checkpoint_str,
                 is_activated_ability: false,
+                exclude_pending_source: false,
                 reserved_sacrifices: &combined_reserved_sacrifices,
             };
             let mana_payment = self.pay_mana_cost_session(

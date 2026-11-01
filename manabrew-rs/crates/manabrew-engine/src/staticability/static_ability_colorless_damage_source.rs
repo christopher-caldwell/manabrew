@@ -45,6 +45,10 @@ pub fn source_has_color(cards: &[Card], source_card: &Card, color_name: &str) ->
 pub fn target_is_protected_from_source(cards: &[Card], target: &Card, source: &Card) -> bool {
     for prot in target.get_protections() {
         match prot.as_str() {
+            "each color" => {
+                if ["white", "blue", "black", "red", "green"].iter()
+                    .any(|color| source_has_color(cards, source, color)) { return true; }
+            }
             "white" | "blue" | "black" | "red" | "green" | "colorless" => {
                 if source_has_color(cards, source, &prot) {
                     return true;

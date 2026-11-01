@@ -55,7 +55,7 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
     }
 
     let chosen =
-        ctx.agents[controller.index()].choose_type(controller, &type_category, &valid_types);
+        ctx.agents[controller.index()].choose_type_for_source(controller, &type_category, &valid_types, sa.source);
 
     if let Some(chosen_type) = chosen {
         if let Some(source_id) = sa.source {

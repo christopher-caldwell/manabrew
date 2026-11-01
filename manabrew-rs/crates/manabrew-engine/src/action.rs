@@ -1692,6 +1692,9 @@ impl GameState {
             self.add_card_to_zone(zone, new_controller, card_id);
         }
         self.cards[card_id.index()].set_controller(new_controller);
+        if zone == ZoneType::Battlefield {
+            apply_continuous_effects(self);
+        }
     }
 
     fn expire_until_lose_control_keyword_changes(&mut self, host: CardId) {
@@ -1799,6 +1802,29 @@ mod tests {
             vec![],
         );
         game.create_card(card)
+    }
+
+    #[test]
+    fn ascend_permanent_blessing_persists_and_is_player_specific() {
+        let mut game = GameState::new(&["Alice", "Bob"], 20);
+        let (alice, bob) = (PlayerId(0), PlayerId(1));
+        let host = make_creature(&mut game, "Ascend", alice, 1, 1);
+        game.card_mut(host).keywords.add("Ascend");
+        game.move_card(host, ZoneType::Battlefield, alice);
+        for i in 0..8 {
+            let id = make_creature(&mut game, &format!("A{i}"), alice, 1, 1);
+            game.move_card(id, ZoneType::Battlefield, alice);
+        }
+        assert!(!game.player_has_blessing(alice));
+        let opponent = make_creature(&mut game, "Other", bob, 1, 1);
+        game.move_card(opponent, ZoneType::Battlefield, bob);
+        assert!(!game.player_has_blessing(alice));
+        game.change_controller(opponent, alice);
+        assert!(game.player_has_blessing(alice));
+        assert!(!game.player_has_blessing(bob));
+        game.move_card(host, ZoneType::Graveyard, alice);
+        game.move_card(opponent, ZoneType::Graveyard, bob);
+        assert!(game.player_has_blessing(alice));
     }
 
     #[test]

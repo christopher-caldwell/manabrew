@@ -14,6 +14,7 @@ pub(crate) struct ManaPaymentSession<'a> {
     pub cost_display_str: &'a str,
     pub cost_checkpoint_str: &'a str,
     pub is_activated_ability: bool,
+    pub exclude_pending_source: bool,
     pub reserved_sacrifices: &'a [CardId],
 }
 
@@ -193,14 +194,16 @@ where
     loop {
         let mana_sources =
             mana::collect_mana_payment_sources(game, session.player, session.reserved_sacrifices);
-        let lands = mana_sources.source_cards.clone();
+        let lands: Vec<_> = mana_sources.source_cards.iter().copied()
+            .filter(|&id| !session.exclude_pending_source || id != session.card_id).collect();
         let convoke_sources = convoke_payment_sources(game, session.player, session.card_id);
-        let mut tappable_lands = lands;
+        let mut tappable_lands = lands.clone();
         tappable_lands.extend(convoke_sources.iter().copied());
         let mut mana_ability_options = mana_sources.mana_ability_options;
+        if session.exclude_pending_source { mana_ability_options.retain(|o| o.card_id != session.card_id); }
         // Offer costed mana abilities when their costs can be paid without
         // using the ability's own source.
-        for &source in &mana_sources.source_cards {
+        for &source in &lands {
             for ab in &game.card(source).activated_abilities {
                 let activation_ctx = mana::ManaPaymentContext { is_activated_ability:true, payment_card:Some(source), ..Default::default() };
                 if !ab.is_mana_ability || !ab.cost.parts.iter().any(|p| matches!(p, crate::cost::CostPart::Mana{..}))

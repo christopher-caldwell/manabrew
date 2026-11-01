@@ -1733,6 +1733,14 @@ pub fn resolve_count_svar_for_sa(
         );
     }
 
+    if let Some(operators) = expr.strip_prefix("Count$LifeOppsLostThisTurn") {
+        let lost = game.alive_players().into_iter()
+            .filter(|&pid| crate::player::player_predicates::is_opponent_of(game, controller, pid))
+            .map(|pid| game.player(pid).life_lost_this_turn)
+            .sum();
+        return do_x_math(lost, operators.strip_prefix('/').unwrap_or(operators), game, source_id, controller, sa);
+    }
+
     if let Some(operators) = expr.strip_prefix("Count$OppGreatestLifeTotal") {
         let operators = operators.strip_prefix('/').unwrap_or(operators);
         let highest_life = game
@@ -1746,6 +1754,12 @@ pub fn resolve_count_svar_for_sa(
     }
 
     // Conditional operands are expressions, evaluated only for the chosen branch.
+    if let Some(rest) = expr.strip_prefix("Count$Blessing.") {
+        if let Some((yes, no)) = rest.split_once('.') {
+            let chosen = if game.player_has_blessing(controller) { yes } else { no };
+            return resolve_svar_expression(chosen, game, source_id, controller, sa);
+        }
+    }
     if let Some(rest) = expr.strip_prefix("Count$Delirium.") {
         if let Some((yes, no)) = rest.split_once('.') {
             let chosen = if game.player_has_delirium(controller) {
@@ -2318,6 +2332,32 @@ mod tests {
     use crate::game::GameState;
     use crate::ids::{CardId, PlayerId};
     use crate::spellability::SpellAbility;
+
+    #[test]
+    fn blessing_and_opponent_life_loss_counts_use_player_state() {
+        let mut game = GameState::new(&["A", "B", "C"], 40);
+        let (a, b, c) = (PlayerId(0), PlayerId(1), PlayerId(2));
+        let host = game.create_card(Card::new(CardId(0), "Host".into(), a,
+            CardTypeLine::parse("Creature"), ManaCost::parse(""), ColorSet::COLORLESS,
+            None, None, vec![], vec![]));
+        let sa = SpellAbility::new_simple(Some(host), a, "DB$ Draw");
+        let count = |g: &GameState, p, expr| super::resolve_count_svar_for_sa(expr, g, host, p, &sa);
+        assert_eq!(count(&game, a, "Count$Blessing.0.1"), 1);
+        game.player_set_blessing(a, true);
+        assert_eq!(count(&game, a, "Count$Blessing.0.1"), 0);
+        assert_eq!(count(&game, b, "Count$Blessing.0.1"), 1);
+        game.player_mut(a).lose_life(8);
+        game.player_mut(b).lose_life(3);
+        game.player_mut(b).gain_life(3);
+        game.player_mut(c).lose_life(2);
+        assert_eq!(count(&game, a, "Count$LifeOppsLostThisTurn"), 5);
+        assert_eq!(count(&game, b, "Count$LifeOppsLostThisTurn"), 10);
+        assert_eq!(count(&game, a, "Count$LifeOppsLostThisTurn/LimitMax.1"), 1);
+        game.player_mut(b).new_turn();
+        game.player_mut(c).new_turn();
+        assert_eq!(count(&game, a, "Count$LifeOppsLostThisTurn"), 0);
+        assert_eq!(count(&game, a, "Count$Blessing.0.1"), 0);
+    }
 
     #[test]
     fn delirium_count_uses_distinct_types_in_controller_graveyard() {

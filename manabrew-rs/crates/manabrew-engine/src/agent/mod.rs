@@ -770,6 +770,12 @@ pub trait PlayerAgent {
         valid_types.first().cloned()
     }
 
+    /// Like choose_type, with the object causing the choice when known.
+    fn choose_type_for_source(&mut self, player: PlayerId, type_category: &str,
+        valid_types: &[String], _source: Option<CardId>) -> Option<String> {
+        self.choose_type(player, type_category, valid_types)
+    }
+
     /// Choose a counter type.
     fn choose_counter_type(
         &mut self,

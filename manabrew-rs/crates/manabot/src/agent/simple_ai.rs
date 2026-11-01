@@ -1419,6 +1419,7 @@ impl BotAgent for SimpleAi {
             .as_ref()
             .map_or_else(|| "none".to_string(), |card| card.id.clone());
         let prompt_card_text = prompt.source_card.as_ref().map(|card| card.text.to_ascii_lowercase()).unwrap_or_default();
+        let prompt_source_name = prompt.source_card.as_ref().map(|card| card.identity.name.clone()).unwrap_or_default();
         let pending_hand_refill = self.pending_hand_refill_source.take();
         let prompt_source_text = prompt
             .source_ability_text
@@ -1882,6 +1883,36 @@ impl BotAgent for SimpleAi {
                 min_total,
                 max_total,
             }) => {
+                // These tribal payoffs care about the controller's actual
+                // creatures and prospective spells, not the first legal type.
+                let tribal_source = matches!(prompt_source_name.as_str(), "Roaming Throne" | "Herald's Horn");
+                if tribal_source && presentation.title == "Choose a Creature type" {
+                    if let Some(view) = self.view.as_ref() {
+                        let best = options.iter().enumerate().filter_map(|(index, option)| {
+                            let score: usize = view.zones.iter().filter(|zone|
+                                zone.owner_id == deciding_player_id && matches!(zone.zone,
+                                    ZoneKind::Battlefield | ZoneKind::Hand | ZoneKind::Command))
+                                .map(|zone| zone.cards.iter().map(|card| match card {
+                                    CardView::Visible(card) if card.id != prompt_source_id
+                                        && card.types.iter().any(|t| t == "Creature")
+                                        && card.subtypes.iter().any(|t| t.eq_ignore_ascii_case(&option.label)) => {
+                                            let base = if zone.zone == ZoneKind::Command { 4 } else { 2 };
+                                            let mentions_type = card.text.split(|ch: char| !ch.is_alphanumeric() && ch != '-')
+                                                .any(|word| word.eq_ignore_ascii_case(&option.label)
+                                                    || word.strip_suffix('s').is_some_and(|singular| singular.eq_ignore_ascii_case(&option.label)));
+                                            base + if mentions_type { 3 } else { 0 }
+                                        }
+                                    _ => 0,
+                                }).sum::<usize>()).sum();
+                            (score > 0).then_some((index, score))
+                        }).max_by_key(|&(_, score)| score);
+                        if let Some((index, _)) = best {
+                            return Some(PromptOutput::ChooseFromSelection(ChooseFromSelectionOutput::SelectionDecision {
+                                chosen_indices: vec![index],
+                            }));
+                        }
+                    }
+                }
                 let signature =
                     format!("select:{}|{min_total}|{max_total}|{}", presentation.title, options.len());
                 let search = presentation.title.to_ascii_lowercase().contains("search");
@@ -1892,7 +1923,11 @@ impl BotAgent for SimpleAi {
                 let useful_extra_recovery_mode = presentation.title.eq_ignore_ascii_case("Choose Mode") && max_total >= 2
                     && options.iter().any(|option| option.label.to_ascii_lowercase().contains("return target creature card from your graveyard to the battlefield"))
                     && self.view.as_ref().is_some_and(|view| view.zones.iter().any(|zone| zone.zone==ZoneKind::Graveyard && zone.owner_id==deciding_player_id && zone.cards.iter().any(|card| matches!(card, CardView::Visible(card) if card.types.iter().any(|kind|kind=="Creature")))));
-                let target = if useful_extra_recovery_mode || search || self.looping_on(signature) {
+                let safe_will_modes = prompt_source_name == "Akroma's Will" && presentation.title == "Choose Mode"
+                    && max_total >= 2 && options.len() == 2
+                    && self.battlefield(&deciding_player_id).any(|card| card.types.iter().any(|t| t == "Creature"))
+                    && !self.battlefield(&deciding_player_id).any(|card| card.types.iter().any(|t| t == "Creature") && !card.attachment_ids.is_empty());
+                let target = if safe_will_modes || useful_extra_recovery_mode || search || self.looping_on(signature) {
                     max_total
                 } else if own_activation {
                     min_total.max(1).min(max_total)
@@ -2686,5 +2721,55 @@ mod repair_damage_policy_tests {
         let mut bot=SimpleAi::default();bot.observe(view.clone());assert_ne!(choose(&mut bot),"player-0");
         let redirected:TargetRef=serde_json::from_value(json!({"id":"stack-1","kind":"spell","intent":"hostile"})).unwrap();
         view.stack.push(StackObjectDto{id:"stack-2".into(),controller_id:"player-1".into(),targets:vec![redirected],..Default::default()});bot.observe(view);assert_eq!(bot.pending_damage("player-0","player-1"),0);
+    }
+}
+
+#[cfg(test)]
+mod tribal_will_policy_regression {
+    use super::SimpleAi;
+    use crate::agent::BotAgent;
+    use manabrew_protocol::game::{CardDto, CardView, GameViewDto, ZoneDto, ZoneKind};
+    use manabrew_protocol::transport::AgentPrompt;
+    use serde_json::json;
+
+    fn card(id: &str, tribe: &str) -> CardDto {
+        CardDto { id: id.into(), controller_id: "player-0".into(), owner_id: "player-0".into(),
+            types: vec!["Creature".into()], subtypes: vec![tribe.into()], ..Default::default() }
+    }
+    fn choose(source: &str, title: &str, options: &[&str], max: usize, view: GameViewDto) -> Vec<usize> {
+        let mut bot = SimpleAi::default(); bot.observe(view);
+        let opts: Vec<_> = options.iter().map(|label| json!({"label":label,"weight":1,"canRepeat":false})).collect();
+        let prompt: AgentPrompt = serde_json::from_value(json!({"promptId":1,"decidingPlayerId":"player-0",
+            "sourceCard":{"id":"card-99","identity":{"name":source}},
+            "input":{"type":"chooseFromSelection","presentation":{"title":title,"targets":[]},
+                "options":opts,"minTotal":1,"maxTotal":max}})).unwrap();
+        serde_json::from_value(serde_json::to_value(bot.decide(prompt).unwrap()).unwrap()["output"]["chosenIndices"].clone()).unwrap()
+    }
+    fn view(tribe: &str, attached: bool) -> GameViewDto {
+        let mut v=GameViewDto::default(); let mut c=card("card-1",tribe);
+        if attached { c.attachment_ids.push("card-3".into()); }
+        v.zones.push(ZoneDto { zone: ZoneKind::Battlefield, owner_id:"player-0".into(), cards:vec![CardView::Visible(c)], count:1 }); v
+    }
+    #[test]
+    fn tribe_choice_uses_relevant_creatures_and_does_not_force_dragons() {
+        for (source, tribe, expected) in [("Roaming Throne","Dragon",1),("Herald's Horn","Angel",2),("Roaming Throne","Dinosaur",3)] {
+            assert_eq!(choose(source,"Choose a Creature type", &["Advisor","Dragon","Angel","Dinosaur"],1,view(tribe,false)),vec![expected]);
+        }
+        let mut mixed=view("Dragon",false);
+        if let CardView::Visible(ref mut c)=mixed.zones[0].cards[0] {c.subtypes.push("Spirit".into());c.text="Whenever another Dragon enters, copy it.".into();}
+        assert_eq!(choose("Roaming Throne","Choose a Creature type", &["Advisor","Spirit","Dragon"],1,mixed),vec![2]);
+        assert_eq!(choose("Other","Choose a Creature type", &["Advisor","Dragon"],1,view("Dragon",false)),vec![0]);
+        assert_eq!(choose("Herald's Horn","Choose a Creature type", &["Advisor","Dragon"],1,GameViewDto::default()),vec![0]);
+        let mut substring=view("Elf",false);
+        if let CardView::Visible(ref mut c)=substring.zones[0].cards[0] {c.subtypes.push("Warrior".into());c.text="It protects itself and other Warriors.".into();}
+        assert_eq!(choose("Herald's Horn","Choose a Creature type", &["Elf","Warrior"],1,substring),vec![1]);
+    }
+    #[test]
+    fn will_uses_both_only_when_available_and_safe() {
+        let modes=["Flying and double strike", "Lifelink and protection"];
+        assert_eq!(choose("Akroma's Will","Choose Mode",&modes,2,view("Angel",false)),vec![0,1]);
+        assert_eq!(choose("Akroma's Will","Choose Mode",&modes,1,view("Angel",false)),vec![0]);
+        assert_eq!(choose("Akroma's Will","Choose Mode",&modes,2,view("Angel",true)),vec![0]);
+        assert_eq!(choose("Other","Choose Mode",&modes,2,view("Angel",false)),vec![0]);
     }
 }

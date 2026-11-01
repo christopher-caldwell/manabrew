@@ -188,7 +188,7 @@ fn execute_replace_with(
     replace_with: &str,
     game: &mut GameState,
     source_card_id: CardId,
-    event: &ReplacementEvent,
+    event: &mut ReplacementEvent,
     agents: Option<&mut [Box<dyn PlayerAgent>]>,
     mut runtime: Option<&mut ReplacementRuntime<'_>>,
 ) -> bool {
@@ -198,6 +198,30 @@ fn execute_replace_with(
     let controller = game.card(source_card_id).controller;
     let mut sa = build_spell_ability(game, source_card_id, &raw, controller);
     effect.set_replacing_objects(event, &mut sa);
+
+    // ETB counter replacements modify the pending move's counter table. The
+    // entering object is not yet on the battlefield, so resolving an ordinary
+    // PutCounter against it would either fail targeting or lose the counters
+    // when the zone change creates the new object.
+    if sa.api == Some(crate::ability::api_type::ApiType::PutCounter)
+        && sa.ir.etb && sa.defined_ref() == Some(&crate::ability::ability_ir::DefinedRef::ReplacedCard)
+    {
+        if !effects::condition::check_condition(game, &sa)
+            || !effects::condition::check_condition_present(game, &sa, controller, source_card_id) {
+            return false;
+        }
+        let count = crate::svar::resolve_numeric_svar(game, &sa, crate::parsing::keys::COUNTER_NUM, 1).max(0);
+        let kind = sa.ir.counter_type.clone().unwrap_or_else(|| effects::parse_counter_type(
+            sa.ir.counter_type_text.as_deref().unwrap_or("P1P1")));
+        if let ReplacementEvent::Moved { counter_map, .. } = event {
+            if count > 0 {
+                let mut counters = std::collections::BTreeMap::new();
+                counters.insert(kind, count);
+                counter_map.get_or_insert_with(Vec::new).push(super::replacement_handler::CounterMapValue { source: Some(controller), counters });
+            }
+            return true;
+        }
+    }
 
     // `local_agents_storage` keeps the fallback Vec alive when the caller
     // didn't provide agents; we hand back a borrow into it.

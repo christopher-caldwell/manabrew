@@ -183,6 +183,7 @@ fn pay_mana_cost_for_effect(
             cost_display_str: &cost_str,
             cost_checkpoint_str: &cost_str,
             is_activated_ability: false,
+            exclude_pending_source: false,
             reserved_sacrifices: &[],
         },
         |game, player, cid, ab, _reserved| {

@@ -703,6 +703,21 @@ pub fn apply_continuous_effects(game: &mut GameState) {
             card.generate_basic_land_mana_abilities();
         }
     }
+
+    // Ascend on a permanent is a continuous state condition, not a trigger.
+    // Re-evaluate after layers so granted/removed keywords and phased objects
+    // are respected, then recompute effects that depend on the new blessing.
+    let gaining: Vec<_> = game.player_order.iter().copied().filter(|&player| {
+        !game.player_has_blessing(player) && game.player(player).is_alive()
+            && game.cards_in_zone(ZoneType::Battlefield, player).iter()
+                .filter(|&&id| !game.card(id).phased_out).count() >= 10
+            && game.cards_in_zone(ZoneType::Battlefield, player).iter()
+                .any(|&id| !game.card(id).phased_out && game.card(id).has_keyword("Ascend"))
+    }).collect();
+    if !gaining.is_empty() {
+        for player in gaining { game.player_set_blessing(player, true); }
+        apply_continuous_effects(game);
+    }
 }
 
 fn apply_player_rules_effects(game: &mut GameState, source_id: CardId, sa: &StaticAbility) {
