@@ -573,11 +573,16 @@ impl GameLoop {
             return AbilityCostOutcome::Failed;
         }
 
-        // Pay the mana part first for a two-part tap-and-mana mana ability.
-        let defer_mana_ability_tap = matches!(context, CostPaymentContext::ManaAbility)
-            && cost.parts.len() == 2
+        // Pay mana before the pending tap/life costs when these are the only
+        // components. A cancelled nested mana activation must retain its
+        // completed effects without leaving a half-paid outer activation.
+        let defer_mana_ability_tap = (matches!(context, CostPaymentContext::ManaAbility) && cost.parts.len() == 2
+            || matches!(context, CostPaymentContext::ActivatedAbility)
+                && (2..=3).contains(&cost.parts.len())
+                && cost.parts.iter().all(|p| matches!(p, CostPart::Mana { .. } | CostPart::Tap | CostPart::PayLife(_))))
             && cost.parts.iter().filter(|p| matches!(p, CostPart::Tap)).count() == 1
-            && cost.parts.iter().filter(|p| matches!(p, CostPart::Mana { .. })).count() == 1;
+            && cost.parts.iter().filter(|p| matches!(p, CostPart::Mana { .. })).count() == 1
+            && cost.parts.iter().filter(|p| matches!(p, CostPart::PayLife(_))).count() <= 1;
         if defer_mana_ability_tap && !reserved_sacrifices.contains(&card_id) {
             reserved_sacrifices.push(card_id);
         }

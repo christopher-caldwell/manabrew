@@ -2811,7 +2811,7 @@ mod actual_mana_spend_regression {
                     static DELTA_AVAILABLE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
                     static DELTA_GOAD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
                     static DELTA_GOAD_LEGAL: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
-    thread_local! { static CONVOKE_FIXTURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; static IMPROVISE_FIXTURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+    thread_local! { static CONVOKE_FIXTURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; static IMPROVISE_FIXTURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; static NESTED_ABILITY_FIXTURE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) }; static NESTED_ABILITY_FINISH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
     struct AutoAgent(bool, bool);
 impl PlayerAgent for AutoAgent {
     fn choose_targets_for(
@@ -2942,6 +2942,14 @@ impl PlayerAgent for AutoAgent {
         _allow_reserved: bool, _reserved: &[CardId], _options: &[crate::agent::ManaAbilityOption],
         tappable: &[CardId], _untappable: &[CardId], _pool: &crate::mana::ManaPool)
         -> crate::agent::ManaCostAction {
+            if NESTED_ABILITY_FIXTURE.with(|v|v.get()) > 0 {
+                if _card_name == "Nested Source" { return crate::agent::ManaCostAction::Pay {auto:false}; }
+                if NESTED_ABILITY_FIXTURE.with(|v| {let n=v.get(); if n==1 {v.set(2); true} else {false}}) {
+                    assert!(!tappable.is_empty(), "no mana source; card={_card_name}, options={_options:?}");
+                    return crate::agent::ManaCostAction::TapForMana {card_id:tappable[0],mana_ability_index:Some(0),express_choice:None};
+                }
+                return if NESTED_ABILITY_FINISH.with(|v|v.get()) { crate::agent::ManaCostAction::Pay {auto:false} } else { crate::agent::ManaCostAction::AttemptedAndFailed };
+            }
             if CONVOKE_FIXTURE.with(|v| v.get()) {
                 if _can_confirm { return crate::agent::ManaCostAction::Pay {auto:false}; }
                 return crate::agent::ManaCostAction::TapForMana {card_id:*tappable.last().expect("convoke creature"), mana_ability_index:Some(usize::MAX), express_choice:None};
@@ -3100,6 +3108,28 @@ impl PlayerAgent for AutoAgent {
             assert!(game.stack.peek().unwrap().spell_ability.paying_mana.is_empty());
         }
         }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn activated_cost_cancel_preserves_completed_nested_mana() {
+      std::thread::Builder::new().stack_size(32*1024*1024).spawn(|| {
+        for finish in [false, true] {
+        let mut game=GameState::new(&["A","B"],40); let player=PlayerId(0);
+        let outer=parse_card_script("Name:Outer Land\nTypes:Land\nA:AB$ Draw | Cost$ T 3 PayLife<1> | NumCards$ 1").unwrap();
+        let nested=parse_card_script("Name:Nested Source\nTypes:Land\nA:AB$ Mana | Cost$ T | Produced$ W | SubAbility$ DBDraw\nSVar:DBDraw:DB$ Draw | Defined$ You | NumCards$ 1").unwrap();
+        let outer_id=game.create_card(Card::from_rules(&outer,player)); game.move_card(outer_id,ZoneType::Battlefield,player);
+        let inner_id=game.create_card(Card::from_rules(&nested,player)); game.move_card(inner_id,ZoneType::Battlefield,player);
+        assert!(game.card(inner_id).activated_abilities.iter().any(|a|a.is_mana_ability), "{:?}",game.card(inner_id).activated_abilities);
+        let filler=parse_card_script("Name:Drawn\nTypes:Creature Human\nPT:1/1").unwrap();
+        let drawn=game.create_card(Card::from_rules(&filler,player)); game.move_card(drawn,ZoneType::Library,player);
+        let mut agents:Vec<Box<dyn PlayerAgent>>=(0..2).map(|_|Box::new(AutoAgent(true,false)) as Box<dyn PlayerAgent>).collect();
+        let mut gl=GameLoop::new(2); gl.pool_mut(player).add(forge_foundation::mana::ManaAtom::COLORLESS,2);
+        NESTED_ABILITY_FIXTURE.with(|v|v.set(1)); NESTED_ABILITY_FINISH.with(|v|v.set(finish));
+        let paid=gl.pay_ability_cost(&mut game,&mut agents,player,outer_id,&crate::cost::parse_cost("T 3 PayLife<1>"),None,false,crate::game_loop::cost_payment::CostPaymentContext::ActivatedAbility,None);
+        assert_eq!(paid,finish); assert_eq!(game.card(outer_id).tapped,finish); assert!(game.card(inner_id).tapped);
+        assert_eq!(game.player(player).life,if finish {39} else {40}); assert_eq!(gl.pool(player).total_mana(),if finish {0} else {3}); assert_eq!(game.card(drawn).zone,ZoneType::Hand);
+        }
+      }).unwrap().join().unwrap();
     }
 
     #[test]
