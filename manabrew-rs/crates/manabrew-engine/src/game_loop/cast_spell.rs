@@ -1580,6 +1580,13 @@ impl GameLoop {
         } else {
             None
         };
+        // Improvise may tap artifacts during cost adjustment. Record actual
+        // changes, rather than assuming every spell with the keyword used it.
+        let improvise_untapped: Vec<_> = if game.card(card_id).has_keyword("Improvise") {
+            game.cards_in_zone(ZoneType::Battlefield, player).iter().copied()
+                .filter(|&id| game.card(id).type_line.is_artifact() && !game.card(id).tapped)
+                .collect()
+        } else { Vec::new() };
         let mut total_unpaid = ManaCostBeingPaid::from_mana_cost(&payable_base_cost);
         if !crate::cost::cost_adjustment::adjust(
             game,
@@ -1595,6 +1602,9 @@ impl GameLoop {
         ) {
             rollback_cast!();
         }
+        let improvise_mutated = improvise_untapped.iter().any(|&id| {
+            game.card(id).zone != ZoneType::Battlefield || game.card(id).tapped
+        });
         let total_cost = crate::mana::apply_player_life_payment_keywords(
             game,
             player,
@@ -1913,7 +1923,7 @@ impl GameLoop {
                     // corrupted game when they are present.
                     let card = game.card(card_id);
                     let mutated_reduction = card.has_keyword("Delve") || (card.has_keyword("Convoke") && (!sa.convoke_tapped.is_empty() || mana_payment.convoke_used))
-                        || card.has_keyword("Improvise") || card.get_offering_type().is_some()
+                        || improvise_mutated || mana_payment.convoke_used || card.get_offering_type().is_some()
                         || sa.alt_cost == Some(crate::spellability::AlternativeCost::Emerge);
                     if !sa.is_spell || mutated_reduction || game.card_current_zone(card_id) != ZoneType::Stack {
                         panic!("unsupported irreversible mana rollback with mutating cost reduction or moved pending spell");
@@ -2789,7 +2799,7 @@ mod actual_mana_spend_regression {
                     static DELTA_AVAILABLE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
                     static DELTA_GOAD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
                     static DELTA_GOAD_LEGAL: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
-    thread_local! { static CONVOKE_FIXTURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+    thread_local! { static CONVOKE_FIXTURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; static IMPROVISE_FIXTURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
     struct AutoAgent(bool, bool);
 impl PlayerAgent for AutoAgent {
     fn choose_targets_for(
@@ -2905,6 +2915,9 @@ impl PlayerAgent for AutoAgent {
     }
 
     fn choose_land_or_spell(&mut self, _player: PlayerId) -> Option<bool> { None }
+    fn choose_improvise(&mut self, _player: PlayerId, artifacts: &[CardId], _cost: &forge_foundation::ManaCost, _source: Option<CardId>) -> Vec<CardId> {
+        if IMPROVISE_FIXTURE.with(|v| v.get()) { artifacts.first().copied().into_iter().collect() } else { Vec::new() }
+    }
     fn choose_kicker(&mut self, _player: PlayerId, _cost: &str, _source: Option<CardId>) -> bool { let yes=DELTA_EXTRA.with(|v| v.get()); if yes { DELTA_SELECTED.with(|v| v.set(true)); } yes }
     fn choose_multikicker(&mut self, _player: PlayerId, _cost: &str, max: u32, _source: Option<CardId>) -> u32 { if DELTA_EXTRA.with(|v| v.get()) {max.min(1)} else {0} }
     fn choose_replicate(&mut self, _player: PlayerId, _cost: &str, max: u32, _source: Option<CardId>) -> u32 { if DELTA_EXTRA.with(|v| v.get()) && max>0 {DELTA_SELECTED.with(|v| v.set(true)); 1} else {0} }
@@ -3389,11 +3402,11 @@ impl PlayerAgent for AutoAgent {
     #[test]
     fn delta_irreversible_cancellation_supported_cast_modes() {
       std::thread::Builder::new().stack_size(32*1024*1024).spawn(|| {
-        for mode in ["normal","commander","flashback","phyrexian","kicker","replicate","convoke"] {
+        for mode in ["normal","commander","flashback","phyrexian","kicker","replicate","convoke","improvise"] {
           for effect in ["draw","life","sacdraw"] {
             let mut game=GameState::new(&["A","B"],40); let player=PlayerId(0);
             let mana=if mode=="phyrexian" {"2 G/P"} else {"2 G"};
-            let keyword=match mode {"convoke"=>"K:Convoke\n","flashback"=>"K:Flashback:2 G\n","kicker"=>"K:Kicker:1\n","replicate"=>"K:Replicate:1\n",_=>""};
+            let keyword=match mode {"convoke"=>"K:Convoke\n","improvise"=>"K:Improvise\n","flashback"=>"K:Flashback:2 G\n","kicker"=>"K:Kicker:1\n","replicate"=>"K:Replicate:1\n",_=>""};
             let text=format!("Name:Delta Fixture\nManaCost:{mana}\nTypes:Instant\n{keyword}A:SP$ GainLife | Defined$ You | LifeAmount$ 1");
             let spell=parse_card_script(&text).unwrap(); let id=game.create_card(Card::from_rules(&spell,player));
             let zone=match mode {"commander"=>ZoneType::Command,"flashback"=>ZoneType::Graveyard,_=>ZoneType::Hand};
@@ -3418,6 +3431,25 @@ impl PlayerAgent for AutoAgent {
             assert!(game.stack.iter().all(|entry|entry.spell_ability.source!=Some(id)));
           }
         }
+      }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn improvise_reduction_remains_guarded_after_irreversible_payment() {
+      std::thread::Builder::new().stack_size(32*1024*1024).spawn(|| {
+        let mut game=GameState::new(&["A","B"],40); let player=PlayerId(0);
+        let spell=parse_card_script("Name:Fixture\nManaCost:2 G\nTypes:Instant\nK:Improvise\nA:SP$ GainLife | Defined$ You | LifeAmount$ 1").unwrap();
+        let land=parse_card_script("Name:Draw Land\nTypes:Basic Land Forest\nA:AB$ Mana | Cost$ T | Produced$ G | SubAbility$ DBDraw\nSVar:DBDraw:DB$ Draw | Defined$ You | NumCards$ 1").unwrap();
+        let artifact=parse_card_script("Name:Improvise Artifact\nTypes:Artifact").unwrap();
+        let id=game.create_card(Card::from_rules(&spell,player)); game.move_card(id,ZoneType::Hand,player);
+        let source=game.create_card(Card::from_rules(&land,player)); game.move_card(source,ZoneType::Battlefield,player);
+        let helper=game.create_card(Card::from_rules(&artifact,player)); game.move_card(helper,ZoneType::Battlefield,player);
+        let sa=crate::spellability::build_spell_ability(&game,id,"SP$ GainLife | Defined$ You | LifeAmount$ 1",player);
+        let mut agents: Vec<Box<dyn PlayerAgent>>=(0..2).map(|_|Box::new(AutoAgent(true,false)) as Box<dyn PlayerAgent>).collect();
+        let mut gl=GameLoop::new(2); gl.pool_mut(player).add(forge_foundation::mana::ManaAtom::GREEN,5);
+        IMPROVISE_FIXTURE.with(|v|v.set(true)); CANCEL_MANA.with(|v|v.set(true)); TAP_BEFORE_FAILURE.with(|v|v.set(1));
+        let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||gl.cast_card_spell_ability(&mut game,&mut agents,player,sa,false)));
+        assert!(game.card(helper).tapped); assert!(result.is_err(),"an applied reduction must remain guarded");
       }).unwrap().join().unwrap();
     }
 
