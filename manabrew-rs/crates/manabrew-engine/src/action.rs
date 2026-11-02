@@ -236,13 +236,9 @@ impl GameState {
                 }
                 if let Some(name) = check {
                     let card = &self.cards[card_id.index()];
-                    let sa = crate::spellability::SpellAbility::new_simple(
-                        Some(card_id), dest_owner, "DB$ PutCounter",
-                    );
-                    let value = card.get_s_var(name).map(|expr|
-                        crate::svar::resolve_svar_expression(expr, self, card_id, dest_owner, &sa)
-                    ).unwrap_or(0);
-                    if !crate::parsing::compare::compare_expr(value, comparison) {
+                    if !crate::card::valid_filter::check_svar_requirement(
+                        self, card, card, name, comparison,
+                    ) {
                         continue;
                     }
                 }
