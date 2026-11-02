@@ -3039,6 +3039,32 @@ impl PlayerAgent for AutoAgent {
     }
 
     #[test]
+    fn sevinne_flashback_spends_five_mana_and_exiles_after_resolution() {
+        std::thread::Builder::new().stack_size(32 * 1024 * 1024).spawn(|| {
+            let mut game = GameState::new(&["A", "B"], 40);
+            let p = PlayerId(0);
+            let creature = parse_card_script("Name:Target\nManaCost:1 W\nTypes:Creature\nPT:2/2").unwrap();
+            let target = game.create_card(Card::from_rules(&creature, p));
+            game.move_card(target, ZoneType::Graveyard, p);
+            let rules = parse_card_script("Name:Sevinne's Reclamation\nManaCost:2 W\nTypes:Sorcery\nK:Flashback:4 W\nA:SP$ ChangeZone | Origin$ Graveyard | Destination$ Battlefield | ValidTgts$ Creature.YouCtrl").unwrap();
+            let host = game.create_card(Card::from_rules(&rules, p));
+            game.move_card(host, ZoneType::Graveyard, p);
+            let mut sa = crate::spellability::build_spell_ability(&game, host, &game.card(host).abilities[0], p);
+            sa.alt_cost = Some(crate::spellability::AlternativeCost::Flashback);
+            let mut agents: Vec<Box<dyn PlayerAgent>> = (0..2).map(|_| Box::new(AutoAgent(false, false)) as Box<dyn PlayerAgent>).collect();
+            let mut gl = GameLoop::new(2);
+            gl.pool_mut(p).add(forge_foundation::ManaAtom::WHITE, 5);
+            assert!(gl.cast_card_spell_ability(&mut game, &mut agents, p, sa, false).is_some());
+            assert_eq!(gl.pool(p).total_mana(), 0);
+            assert_eq!(game.card(host).zone, ZoneType::Stack);
+            assert_eq!(game.stack.peek().unwrap().spell_ability.target_chosen.target_card, Some(target));
+            gl.resolve_stack(&mut game, &mut agents);
+            assert_eq!(game.card(target).zone, ZoneType::Battlefield);
+            assert_eq!(game.card(host).zone, ZoneType::Exile);
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
     fn flashback_pays_three_distinct_creatures_and_normal_cast_uses_mana() {
         std::thread::Builder::new().stack_size(32 * 1024 * 1024).spawn(|| {
         for (count, flashback, cancel) in [(3, true, false), (2, true, false), (0, false, false), (3, true, true)] {
