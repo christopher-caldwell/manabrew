@@ -333,6 +333,8 @@ impl GameLoop {
             let alt_cost = entry.spell_ability.alt_cost;
             let player = entry.spell_ability.activating_player;
 
+            // Conditions on resolving instants and sorceries also need cast origin.
+            game.card_mut(card_id).cast_from = entry.cast_from_zone;
             if entry.is_creature_spell || entry.is_permanent_spell {
                 // Permanent spell: move to battlefield
                 let origin = game.card(card_id).zone;
@@ -1054,6 +1056,14 @@ impl GameLoop {
         sa: &SpellAbility,
         parent_target_card: Option<CardId>,
     ) {
+        // A skipped conditional node is not a resolved effect. Check before
+        // emitting telemetry, matching the resolver's own condition gates.
+        let Some(source_id) = sa.source else { return; };
+        if !effects::condition::check_condition(game, sa)
+            || !effects::condition::check_condition_present(game, sa, sa.activating_player, source_id)
+        {
+            return;
+        }
         let source_name = sa
             .source
             .and_then(|cid| game.cards.get(cid.index()).map(|c| c.card_name.clone()))

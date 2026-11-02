@@ -33,6 +33,11 @@ pub fn build_spell_ability(sa: &mut SpellAbility) {
 #[manabrew_engine_macros::spell_effect(CopySpellAbilityEffect)]
 fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
     let controller = sa.activating_player;
+    if sa.ir.optional && !ctx.agents[controller.index()].confirm_action(
+        controller, Some("OptionalCopy"), "Copy this spell or ability?", &[], sa.source, sa.api,
+    ) {
+        return;
+    }
 
     // Run CopySpell replacement effects before copying.
     let mut event = ReplacementEvent::CopySpell {
@@ -46,6 +51,10 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
 
     let original = if let Some(target) = sa.target_chosen.target_stack_entry {
         ctx.game.stack.iter().find(|entry| entry.id == target)
+            .map(|entry| entry.spell_ability.clone())
+    } else if sa.defined() == Some("Parent") {
+        ctx.game.stack.resolving_entry()
+            .filter(|entry| entry.spell_ability.source == sa.source)
             .map(|entry| entry.spell_ability.clone())
     } else if let Some(defined) = sa.defined() {
         crate::ability::ability_utils::get_defined_spell_abilities(defined, sa, ctx.game)
@@ -64,9 +73,20 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
     }
 
     // Clone the spell ability with same targets using CardFactory parity helper.
-    let copy = crate::card::card_factory::copy_spell_ability_and_possibly_host(
+    let mut copy = crate::card::card_factory::copy_spell_ability_and_possibly_host(
         ctx.game, &original, controller,
     );
+    let params = crate::parsing::Params::from_raw(&sa.ability_text);
+    if params.get("MayChooseTarget").is_some_and(|v| v.eq_ignore_ascii_case("True"))
+        && ctx.agents[controller.index()].confirm_action(
+            controller, Some("CopyRetarget"), "Choose new targets for the copy?", &[], sa.source, sa.api,
+        )
+    {
+        let original_targets = copy.clone();
+        if !copy.setup_targets(ctx.game, ctx.agents, ctx.mana_pools) {
+            copy = original_targets;
+        }
+    }
 
     // Push the copy onto the stack (it will resolve like a normal spell)
     let copy_entry = crate::spellability::StackEntry {

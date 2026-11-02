@@ -979,11 +979,17 @@ impl GameLoop {
             if must_be_instant && !has_flash_permission(card_id) {
                 continue;
             }
-            let available_mana = mana::calculate_available_mana_for_casting_excluding(
-                self.pool(player),
-                game,
-                player,
-                Some(card_id),
+            let payment_ctx = mana::ManaPaymentContext {
+                is_spell: true,
+                payment_card: Some(card_id),
+                type_line: Some(card.type_line.clone()),
+                card_name: Some(card.card_name.clone()),
+                card_color: Some(card.color),
+                chosen_types_by_source: chosen_types_by_source.clone(),
+                ..Default::default()
+            };
+            let available_mana = mana::calculate_available_mana_with_context(
+                self.pool(player), game, player, Some(card_id), &[], Some(&payment_ctx),
             );
             let sp_additional_ok = if let Some(sc) = card.action_spell_cost.as_ref() {
                 crate::cost::can_pay_ignoring_mana_for_spell(sc, game, card_id, player)
@@ -1258,6 +1264,33 @@ mod tests {
             vec![],
             abilities.into_iter().map(str::to_string).collect(),
         )
+    }
+
+    #[test]
+    fn flashback_offer_respects_mana_restrictions() {
+        let player = PlayerId(0);
+        let mut game = GameState::new(&["A", "B"], 40);
+        let mut spell = card("Reclamation", player, "Sorcery", "2 W", ColorSet::WHITE, None, None, vec![]);
+        spell.keywords.add("Flashback:4 W");
+        let spell_id = game.create_card(spell);
+        game.move_card(spell_id, ZoneType::Graveyard, player);
+        for _ in 0..4 {
+            let land = game.create_card(card("Plains", player, "Basic Land - Plains", "", ColorSet::COLORLESS, None, None, vec![]));
+            game.move_card(land, ZoneType::Battlefield, player);
+        }
+        let angel_mana = game.create_card(card("Giada", player, "Creature - Angel", "1 W", ColorSet::WHITE, Some(2), Some(2),
+            vec!["AB$ Mana | Cost$ T | Produced$ W | RestrictValid$ Spell.Angel"]));
+        game.move_card(angel_mana, ZoneType::Battlefield, player);
+        game.card_mut(angel_mana).summoning_sick = false;
+        let gl = GameLoop::new(2);
+        let offered = |g: &GameState| gl.get_playable_cards(g, player, false).iter().any(|p| p.card_id == spell_id && matches!(p.mode, crate::agent::PlayCardMode::Alternative(crate::spellability::AlternativeCost::Flashback)));
+        assert!(!offered(&game), "Angel-only mana cannot pay for a sorcery");
+        game.card_mut(spell_id).type_line = CardTypeLine::parse("Creature - Angel");
+        assert!(offered(&game), "matching Angel spell can use the restricted source");
+        game.card_mut(spell_id).type_line = CardTypeLine::parse("Sorcery");
+        let fifth = game.create_card(card("Plains", player, "Basic Land - Plains", "", ColorSet::COLORLESS, None, None, vec![]));
+        game.move_card(fifth, ZoneType::Battlefield, player);
+        assert!(offered(&game));
     }
 
     #[test]

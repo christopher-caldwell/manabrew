@@ -841,7 +841,17 @@ fn matches_context_predicate(
                 .get_blockers_for(card.id)
                 .contains(&context.source_card.id)
         }),
-        ContextPredicate::WasCastFrom(_) => false,
+        ContextPredicate::WasCastFrom(origin) => {
+            use crate::parsing::CastOrigin;
+            let suffix = match origin {
+                CastOrigin::Hand => "Hand", CastOrigin::YourHand => "YourHand",
+                CastOrigin::YourHandByYou => "YourHandByYou", CastOrigin::TheirHand => "TheirHand",
+                CastOrigin::Exile => "Exile", CastOrigin::Graveyard => "Graveyard",
+                CastOrigin::YourGraveyard => "YourGraveyard",
+                CastOrigin::YourGraveyardByYou => "YourGraveyardByYou", CastOrigin::YourLibrary => "YourLibrary",
+            };
+            matches_was_cast_from(suffix, card, context)
+        },
         ContextPredicate::EnteredThisTurnFrom(zone) => {
             matches_entered_this_turn_from(*zone, card, context)
         }
