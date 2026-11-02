@@ -149,6 +149,10 @@ pub struct GameState {
     // Turn/phase state
     pub turn: TurnState,
 
+    /// Turn number in which a creature most recently died.
+    #[serde(default)]
+    pub creature_died_turn: Option<u32>,
+
     // Player order (for turn sequence)
     pub player_order: Vec<PlayerId>,
 
@@ -258,6 +262,7 @@ impl GameState {
             is_night: false,
             day_night_started: false,
             turn: TurnState::new(player_order[0], player_order.len() as u32),
+            creature_died_turn: None,
             player_order,
             game_over: false,
             winner: None,

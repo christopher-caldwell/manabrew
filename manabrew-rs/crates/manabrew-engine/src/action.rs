@@ -170,13 +170,14 @@ impl GameState {
         apply_move_replacement: bool,
         is_discard: bool,
     ) -> ZoneType {
-        let (src_zone, src_owner, was_permanent, was_land, is_token) = {
+        let (src_zone, src_owner, was_permanent, was_land, was_creature, is_token) = {
             let card = &self.cards[card_id.index()];
             (
                 card.zone,
                 card.controller,
                 card.type_line.is_permanent(),
                 card.is_land(),
+                card.is_creature(),
                 card.is_token,
             )
         };
@@ -341,6 +342,13 @@ impl GameState {
         };
         let host_left_battlefield =
             src_zone == ZoneType::Battlefield && dest_zone != ZoneType::Battlefield;
+        // Replacement-adjusted destinations determine whether the creature died.
+        if src_zone == ZoneType::Battlefield
+            && dest_zone == ZoneType::Graveyard
+            && was_creature
+        {
+            self.creature_died_turn = Some(self.turn.turn_number);
+        }
         if host_left_battlefield && was_permanent {
             self.player_record_permanent_left_battlefield(src_owner);
         }

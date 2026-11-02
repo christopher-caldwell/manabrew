@@ -1461,6 +1461,9 @@ fn evaluate_cost_amount_count_expr(
             .and_then(|s| s.parse::<i32>().ok())
             .unwrap_or(0);
     }
+    if expr.starts_with("Count$Morbid.") {
+        return resolve_count_svar(expr, game, source.id, caster);
+    }
     if let Some(counter_name) = expr.strip_prefix("Count$YourCounters") {
         return crate::player::counter_count(game, source.controller, counter_name);
     }
@@ -1525,6 +1528,23 @@ pub fn resolve_count_svar_for_sa(
         }
     }
     let (body, operators) = expr.split_once('/').unwrap_or((expr, ""));
+    if let Some(rest) = body.strip_prefix("Count$Morbid.") {
+        let mut values = rest.split('.');
+        if let (Some(if_true), Some(if_false), None) =
+            (values.next(), values.next(), values.next())
+        {
+            if let (Ok(if_true), Ok(if_false)) =
+                (if_true.parse::<i32>(), if_false.parse::<i32>())
+            {
+                let value = if game.creature_died_turn == Some(game.turn.turn_number) {
+                    if_true
+                } else {
+                    if_false
+                };
+                return do_x_math(value, operators, game, source_id, controller, sa);
+            }
+        }
+    }
     let count = match body {
         "Count$ResolvedThisTurn" => Some(
             sa.source
@@ -2413,6 +2433,100 @@ mod tests {
             super::resolve_count_svar_for_sa("Count$Kicked.7.3", &game, host, p0, &sa),
             3
         );
+    }
+
+    #[test]
+    fn morbid_count_tracks_any_creature_death_until_turn_changes() {
+        use forge_foundation::ZoneType;
+        let mut game = GameState::new(&["A", "B"], 20);
+        let p0 = PlayerId(0);
+        let p1 = PlayerId(1);
+        let host = game.create_card(Card::new(
+            CardId(0),
+            "Host".into(),
+            p0,
+            CardTypeLine::parse("Creature"),
+            ManaCost::parse(""),
+            ColorSet::COLORLESS,
+            None,
+            None,
+            vec![],
+            vec![],
+        ));
+        let sa = SpellAbility::new_simple(Some(host), p0, "DB$ Draw");
+        let count = |g: &GameState, expression| {
+            super::resolve_count_svar_for_sa(expression, g, host, p0, &sa)
+        };
+        assert_eq!(count(&game, "Count$Morbid.1.0"), 0);
+        assert_eq!(count(&game, "Count$Morbid.5.3"), 3);
+
+        let creature_from_hand = game.create_card(Card::new(
+            CardId(0),
+            "Not a battlefield death".into(),
+            p0,
+            CardTypeLine::parse("Creature"),
+            ManaCost::parse(""),
+            ColorSet::COLORLESS,
+            None,
+            None,
+            vec![],
+            vec![],
+        ));
+        game.move_card(creature_from_hand, ZoneType::Graveyard, p0);
+        assert_eq!(count(&game, "Count$Morbid.1.0"), 0);
+
+        let noncreature = game.create_card(Card::new(
+            CardId(0),
+            "Noncreature".into(),
+            p1,
+            CardTypeLine::parse("Artifact"),
+            ManaCost::parse(""),
+            ColorSet::COLORLESS,
+            None,
+            None,
+            vec![],
+            vec![],
+        ));
+        game.move_card(noncreature, ZoneType::Battlefield, p1);
+        game.move_card(noncreature, ZoneType::Graveyard, p1);
+        assert_eq!(count(&game, "Count$Morbid.1.0"), 0);
+
+        let exiled_creature = game.create_card(Card::new(
+            CardId(0),
+            "Exiled creature".into(),
+            p1,
+            CardTypeLine::parse("Creature"),
+            ManaCost::parse(""),
+            ColorSet::COLORLESS,
+            None,
+            None,
+            vec![],
+            vec![],
+        ));
+        game.move_card(exiled_creature, ZoneType::Battlefield, p1);
+        game.move_card(exiled_creature, ZoneType::Exile, p1);
+        assert_eq!(count(&game, "Count$Morbid.1.0"), 0);
+
+        let creature = game.create_card(Card::new(
+            CardId(0),
+            "Opponent creature".into(),
+            p1,
+            CardTypeLine::parse("Creature"),
+            ManaCost::parse(""),
+            ColorSet::COLORLESS,
+            None,
+            None,
+            vec![],
+            vec![],
+        ));
+        game.move_card(creature, ZoneType::Battlefield, p1);
+        game.move_card(creature, ZoneType::Graveyard, p1);
+        assert_eq!(count(&game, "Count$Morbid.1.0"), 1);
+        assert_eq!(count(&game, "Count$Morbid.5.3"), 5);
+
+        game.turn.turn_number += 1;
+        assert_eq!(count(&game, "Count$Morbid.1.0"), 0);
+        assert_eq!(count(&game, "Count$Morbid.5.3"), 3);
     }
 
     #[test]

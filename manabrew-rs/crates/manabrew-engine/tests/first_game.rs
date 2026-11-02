@@ -1920,4 +1920,11 @@ fn exile_on_death_goes_to_exile_not_graveyard() {
         ZoneType::Graveyard,
         "Creature should not be in Graveyard"
     );
+    assert_ne!(game.creature_died_turn, Some(game.turn.turn_number),
+        "replacement to exile must not satisfy morbid");
+    game.card_mut(bob_id).damage = 2;
+    game.check_state_based_actions();
+    assert_eq!(game.card(bob_id).zone, ZoneType::Graveyard);
+    assert_eq!(game.creature_died_turn, Some(game.turn.turn_number),
+        "ordinary state-based death must satisfy morbid");
 }
