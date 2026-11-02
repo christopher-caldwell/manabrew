@@ -45,7 +45,8 @@ fn make_changeling_outcast(owner: PlayerId) -> CardInstance {
 fn make_lim_duls_vault(owner: PlayerId) -> CardInstance {
     let bytes = forge_cardset_archive::build_test_archive(&[(
         "lim-dûl's vault",
-        include_str!("../../../../../forge/forge-gui/res/cardsfolder/l/lim_duls_vault.txt"),
+        // Forge submodule revision be9e0c8a5b561ae3e909c2f9a8bdac0a7fa2b097.
+        include_str!("../fixtures/lim_duls_vault.txt"),
     )]);
     let bundle = CardDatabase::load_from_archive(&bytes).expect("synthetic archive should load");
     let rules = bundle
