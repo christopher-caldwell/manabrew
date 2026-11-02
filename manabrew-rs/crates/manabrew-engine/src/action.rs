@@ -220,6 +220,32 @@ impl GameState {
                 let counter_type =
                     crate::ability::effects::parse_counter_type(parts.next().unwrap_or_default());
                 let amount_text = parts.next().unwrap_or_default();
+                // The fourth keyword field contains replacement conditions, not
+                // descriptive text. Evaluate them before adding entry counters.
+                let condition = parts.next().unwrap_or_default();
+                let mut check = None;
+                let mut comparison = "GE1";
+                for parameter in condition.split('|') {
+                    if let Some((key, value)) = parameter.split_once('$') {
+                        match key.trim() {
+                            "CheckSVar" => check = Some(value.trim()),
+                            "SVarCompare" => comparison = value.trim(),
+                            _ => {}
+                        }
+                    }
+                }
+                if let Some(name) = check {
+                    let card = &self.cards[card_id.index()];
+                    let sa = crate::spellability::SpellAbility::new_simple(
+                        Some(card_id), dest_owner, "DB$ PutCounter",
+                    );
+                    let value = card.get_s_var(name).map(|expr|
+                        crate::svar::resolve_svar_expression(expr, self, card_id, dest_owner, &sa)
+                    ).unwrap_or(0);
+                    if !crate::parsing::compare::compare_expr(value, comparison) {
+                        continue;
+                    }
+                }
                 let amount = amount_text.parse::<i32>().unwrap_or_else(|_| {
                     let card = &self.cards[card_id.index()];
                     card.svars

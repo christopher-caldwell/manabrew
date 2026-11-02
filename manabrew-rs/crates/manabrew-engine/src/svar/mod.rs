@@ -2534,6 +2534,36 @@ mod tests {
     }
 
     #[test]
+    fn etb_counter_checks_morbid_replacement_condition() {
+        use forge_foundation::ZoneType;
+        use crate::card::CounterType;
+        let mut game = GameState::new(&["A", "B"], 20);
+        let p0 = PlayerId(0);
+        let p1 = PlayerId(1);
+        let enter = |g: &mut GameState, condition: &str| {
+            let card = Card::new(CardId(0), "Conditional".into(), p0,
+                CardTypeLine::parse("Creature"), ManaCost::parse(""), ColorSet::BLACK,
+                Some(2), Some(1), vec![format!("etbCounter:P1P1:1:{condition}:test")], vec![]);
+            let id = g.create_card(card);
+            g.card_mut(id).svars.insert("Morbid".into(), "Count$Morbid.1.0".into());
+            g.move_card(id, ZoneType::Battlefield, p0);
+            g.card(id).counter_count(&CounterType::P1P1)
+        };
+        assert_eq!(enter(&mut game, "CheckSVar$ Morbid"), 0);
+        assert_eq!(enter(&mut game, "CheckSVar$ Morbid | SVarCompare$ EQ0"), 1);
+        let victim = game.create_card(Card::new(CardId(0), "Victim".into(), p1,
+            CardTypeLine::parse("Creature"), ManaCost::parse(""), ColorSet::COLORLESS,
+            Some(1), Some(1), vec![], vec![]));
+        game.move_card(victim, ZoneType::Battlefield, p1);
+        game.move_card(victim, ZoneType::Graveyard, p1);
+        assert_eq!(enter(&mut game, "CheckSVar$ Morbid"), 1);
+        assert_eq!(enter(&mut game, "CheckSVar$ Morbid | SVarCompare$ EQ0"), 0);
+        game.turn.turn_number += 1;
+        assert_eq!(enter(&mut game, "CheckSVar$ Morbid"), 0);
+        assert_eq!(enter(&mut game, "no Condition"), 1);
+    }
+
+    #[test]
     fn resolves_player_count_defined_life_total_twice() {
         let mut game = GameState::new(&["A", "B"], 20);
         let p0 = PlayerId(0);
