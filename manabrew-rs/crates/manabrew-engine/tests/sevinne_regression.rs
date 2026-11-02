@@ -24,6 +24,7 @@ fn creature(game: &mut GameState, player: PlayerId, name: &str) -> CardId {
 
 #[test]
 fn reclamation_parent_copy_obeys_origin_optional_choice_and_new_target() {
+    std::thread::Builder::new().stack_size(32 * 1024 * 1024).spawn(|| {
     const SCRIPT: &str = "Name:Sevinne's Reclamation\nManaCost:2 W\nTypes:Sorcery\nA:SP$ ChangeZone | Origin$ Graveyard | Destination$ Battlefield | ValidTgts$ Permanent.cmcLE3+YouCtrl | SubAbility$ DBCopy\nSVar:DBCopy:DB$ CopySpellAbility | Defined$ Parent | Optional$ True | MayChooseTarget$ True | ConditionDefined$ Self | ConditionPresent$ Card.wasCastFromGraveyard\nK:Flashback:4 W\n";
     for (from, accept, retarget, expect_copy) in [(ZoneType::Hand,true,true,false),(ZoneType::Graveyard,false,true,false),(ZoneType::Graveyard,true,false,true),(ZoneType::Graveyard,true,true,true)] {
         let mut game = GameState::new(&["A","B"], 40); let p = PlayerId(0);
@@ -46,5 +47,6 @@ fn reclamation_parent_copy_obeys_origin_optional_choice_and_new_target() {
             assert_eq!(game.card(second).zone,if retarget {ZoneType::Battlefield} else {ZoneType::Graveyard});
             assert!(game.stack.is_empty());
         }
-    }
+      }
+    }).unwrap().join().unwrap();
 }
