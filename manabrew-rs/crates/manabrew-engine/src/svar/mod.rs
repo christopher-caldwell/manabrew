@@ -2453,11 +2453,14 @@ mod tests {
             vec![],
             vec![],
         ));
+        game.card_mut(host).svars.insert("X".into(), "Count$Morbid.1.0".into());
         let sa = SpellAbility::new_simple(Some(host), p0, "DB$ Draw");
+        let cost_condition = |g: &GameState| super::resolve_cost_amount_svar(g, g.card(host), "X", p0);
         let count = |g: &GameState, expression| {
             super::resolve_count_svar_for_sa(expression, g, host, p0, &sa)
         };
         assert_eq!(count(&game, "Count$Morbid.1.0"), 0);
+        assert_eq!(cost_condition(&game), 0);
         assert_eq!(count(&game, "Count$Morbid.5.3"), 3);
 
         let creature_from_hand = game.create_card(Card::new(
@@ -2522,6 +2525,7 @@ mod tests {
         game.move_card(creature, ZoneType::Battlefield, p1);
         game.move_card(creature, ZoneType::Graveyard, p1);
         assert_eq!(count(&game, "Count$Morbid.1.0"), 1);
+        assert_eq!(cost_condition(&game), 1);
         assert_eq!(count(&game, "Count$Morbid.5.3"), 5);
 
         game.turn.turn_number += 1;
