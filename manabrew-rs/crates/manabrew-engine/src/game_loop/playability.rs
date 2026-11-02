@@ -991,6 +991,11 @@ impl GameLoop {
             let available_mana = mana::calculate_available_mana_with_context(
                 self.pool(player), game, player, Some(card_id), &[], Some(&payment_ctx),
             );
+            let cast_sa = crate::spellability::build_spell_ability_for_card_cast(game, card_id, player);
+            let targets_ok = cast_sa.target_restrictions.as_ref().is_none_or(|tr| {
+                tr.get_min_targets(game, &cast_sa) <= 0
+                    || target_restrictions::has_candidates_in_spell_ability_chain(game, player, &cast_sa)
+            });
             let sp_additional_ok = if let Some(sc) = card.action_spell_cost.as_ref() {
                 crate::cost::can_pay_ignoring_mana_for_spell(sc, game, card_id, player)
             } else {
@@ -1000,6 +1005,7 @@ impl GameLoop {
                 let fb_cost = crate::cost::parse_cost(&fb_cost_str);
                 let fb_mana = Self::mana_from_cost(&fb_cost);
                 available_mana.can_pay(&fb_mana)
+                    && targets_ok
                     && sp_additional_ok
                     && crate::cost::can_pay_ignoring_mana_for_spell(&fb_cost, game, card_id, player)
             } else {
@@ -1012,7 +1018,7 @@ impl GameLoop {
                 } else {
                     harmonize_mana
                 };
-                available_mana.can_pay(&harmonize_base) && sp_additional_ok
+                available_mana.can_pay(&harmonize_base) && targets_ok && sp_additional_ok
             } else {
                 false
             };
@@ -1023,7 +1029,7 @@ impl GameLoop {
                     .iter()
                     .filter(|&&cid| cid != card_id)
                     .count() as i32;
-                available_mana.can_pay(&escape_mc) && other_gy_count >= exile_count
+                available_mana.can_pay(&escape_mc) && targets_ok && other_gy_count >= exile_count
             } else {
                 false
             };
@@ -1264,6 +1270,26 @@ mod tests {
             vec![],
             abilities.into_iter().map(str::to_string).collect(),
         )
+    }
+
+    #[test]
+    fn flashback_offer_requires_legal_targets() {
+        let player = PlayerId(0);
+        let mut game = GameState::new(&["A", "B"], 40);
+        let mut spell = card("Reclamation", player, "Sorcery", "2 W", ColorSet::WHITE, None, None,
+            vec!["SP$ ChangeZone | Origin$ Graveyard | Destination$ Battlefield | ValidTgts$ Creature.YouCtrl"]);
+        spell.keywords.add("Flashback:4 W");
+        let id = game.create_card(spell);
+        game.move_card(id, ZoneType::Graveyard, player);
+        let mut gl = GameLoop::new(2);
+        gl.pool_mut(player).add(forge_foundation::ManaAtom::WHITE, 5);
+        let offered = |g: &GameState| gl.get_playable_cards(g, player, false).iter().any(|p| p.card_id == id && matches!(p.mode, crate::agent::PlayCardMode::Alternative(crate::spellability::AlternativeCost::Flashback)));
+        assert!(!offered(&game), "no legal creature target");
+        let creature = game.create_card(card("Target", player, "Creature", "1 W", ColorSet::WHITE, Some(2), Some(2), vec![]));
+        game.move_card(creature, ZoneType::Graveyard, player);
+        assert!(offered(&game), "legal creature target in graveyard");
+        game.move_card(creature, ZoneType::Exile, player);
+        assert!(!offered(&game), "target left the graveyard");
     }
 
     #[test]
