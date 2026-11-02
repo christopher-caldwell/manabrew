@@ -685,9 +685,11 @@ impl GameLoop {
                                     session.player,
                                     session.card_id,
                                 );
-                                let exclude_source = if matches!(
-                                    context,
-                                    CostPaymentContext::ManaAbility
+                                // A deferred tap is an unpaid part of the outer
+                                // activation. Auto-pay must respect the same
+                                // reservation as the interactive source list.
+                                let exclude_source = if session.exclude_pending_source || matches!(
+                                    context, CostPaymentContext::ManaAbility
                                 ) {
                                     Some(session.card_id)
                                 } else {

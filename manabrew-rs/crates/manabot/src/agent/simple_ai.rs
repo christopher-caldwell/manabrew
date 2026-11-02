@@ -2096,6 +2096,26 @@ impl BotAgent for SimpleAi {
                     self.payment_actions.clear();
                     self.payment_state = Some(state);
                 }
+                // A costed mana ability can recursively ask for the same
+                // generic mana being paid. If a mana ability with no mana
+                // cost is already available, let the engine's normal payment
+                // path use it instead of manually choosing a costed source.
+                let has_mana_ability_without_mana_cost = input.actions.iter().any(|action| {
+                    matches!(
+                        &action.kind,
+                        manabrew_protocol::prompts::common::PaymentActionKind::ActivateManaAbility(info)
+                            if !info.cost.as_deref().is_some_and(|cost| {
+                                cost.split(", ").any(|part| {
+                                    part.split('{').skip(1).any(|symbol| {
+                                        symbol.split_once('}').is_some_and(|(value, _)| {
+                                            !value.is_empty()
+                                                && value.chars().all(|c| c.is_ascii_digit())
+                                        })
+                                    })
+                                })
+                            })
+                    )
+                });
                 let cost_symbols = input.mana_cost.split('{').skip(1)
                     .map(|part| part.split('}').next().unwrap_or(""))
                     .map(|s| s.parse::<i32>().ok().or_else(|| (s == "X").then_some(0)).or_else(|| matches!(s, "W" | "U" | "B" | "R" | "G" | "C").then_some(1)))
@@ -2107,6 +2127,27 @@ impl BotAgent for SimpleAi {
                 let manual_action = input.actions.iter().filter(|action| {
                     if self.payment_actions.contains(&action.id) {
                         return false;
+                    }
+                    if has_mana_ability_without_mana_cost {
+                        if let manabrew_protocol::prompts::common::PaymentActionKind::ActivateManaAbility(info) = &action.kind {
+                            let has_generic_cost = info.cost.as_deref().is_some_and(|cost| cost.split('{').skip(1).any(|part| {
+                                part.split_once('}').is_some_and(|(symbol, _)| !symbol.is_empty() && symbol.chars().all(|c| c.is_ascii_digit()))
+                            }));
+                            // Preserve a filter that supplies a missing color:
+                            // the automatic payer cannot activate costed sources.
+                            let supplies_missing_color = self.pending_mana_color.is_some_and(|needed| {
+                                let this_produces = info.produced_mana.as_ref().is_some_and(|produced| produced.iter().any(|m| m.color == needed && m.amount > 0));
+                                let free_produces = input.actions.iter().any(|other| {
+                                    let manabrew_protocol::prompts::common::PaymentActionKind::ActivateManaAbility(free) = &other.kind else { return false };
+                                    let costed = free.cost.as_deref().is_some_and(|cost| cost.split('{').skip(1).any(|part| {
+                                        part.split_once('}').is_some_and(|(symbol, _)| !symbol.is_empty() && symbol.chars().all(|c| c.is_ascii_digit()))
+                                    }));
+                                    !costed && free.produced_mana.as_ref().is_some_and(|produced| produced.iter().any(|m| m.color == needed && m.amount > 0))
+                                });
+                                this_produces && !free_produces
+                            });
+                            if has_generic_cost && !supplies_missing_color { return false; }
+                        }
                     }
                     matches!(
                         &action.kind,
@@ -2489,6 +2530,86 @@ mod convoke_affordability_regression {
             bot.observe(view);
             let spell=CardDto {mana_cost:"{2}{W}{W}".into(),cmc:4,keywords:vec!["Convoke".into()],..Default::default()};
             assert_eq!(bot.affordable(&spell,"player-0"),expected);
+        }
+    }
+}
+
+#[cfg(test)]
+mod recursive_mana_payment_regression {
+    use super::SimpleAi;
+    use crate::agent::BotAgent;
+    use manabrew_protocol::transport::AgentPrompt;
+    use serde_json::json;
+
+    fn choice_for(cost: &str, extra_cost: &str) -> serde_json::Value {
+        let mut bot = SimpleAi::default();
+        let prompt: AgentPrompt = serde_json::from_value(json!({
+            "promptId": 1, "decidingPlayerId": "player-0",
+            "input": {"type": "payManaCost", "presentation": {"title": "Pay"},
+                "cardId": "spell", "cardName": "Spell", "manaCost": cost, "canConfirmFromPool": false,
+                "actions": [
+                    {"id":"tap:free:0", "type":"activateManaAbility", "cardId":"free", "abilityIndex":0,
+                     "description":"Add colorless", "isManaAbility":true, "cost":"{T}",
+                     "producedMana":[{"amount":1,"color":"C"}]},
+                    {"id":"tap:filter:0:W", "type":"activateManaAbility", "cardId":"filter", "abilityIndex":0,
+                     "description":"Add white", "isManaAbility":true, "cost":extra_cost,
+                     "producedMana":[{"amount":1,"color":"W"}]}
+                ]}
+        })).unwrap();
+        serde_json::to_value(bot.decide(prompt).unwrap()).unwrap()["output"].clone()
+    }
+
+    #[test]
+    fn retains_colored_filter_when_free_sources_cannot_supply_the_color() {
+        assert_eq!(choice_for("{W}", "{1}, {T}")["actionId"], "tap:filter:0:W");
+    }
+
+    #[test]
+    fn retains_life_costed_mana_ability() {
+        assert_eq!(choice_for("{W}", "{T}, Pay 1 life")["actionId"], "tap:filter:0:W");
+    }
+
+    #[test]
+    fn uses_free_mana_options_instead_of_alternating_costed_one_for_one_sources() {
+        let mut bot = SimpleAi::default();
+        for (prompt_id, costed_source) in [(1, "card-69"), (2, "card-68")] {
+            let prompt: AgentPrompt = serde_json::from_value(json!({
+                "promptId": prompt_id,
+                "decidingPlayerId": "player-0",
+                "input": {
+                    "type": "payManaCost",
+                    "presentation": {"title": "Pay"},
+                    "cardId": costed_source,
+                    "cardName": "Filter land",
+                    "manaCost": "{1}",
+                    "canConfirmFromPool": false,
+                    "actions": [
+                        {
+                            "id": "tap:free-land:0",
+                            "type": "activateManaAbility",
+                            "cardId": "free-land",
+                            "abilityIndex": 0,
+                            "description": "Add {C}.",
+                            "isManaAbility": true,
+                            "cost": "{T}",
+                            "producedMana": [{"amount": 1, "color": "C"}]
+                        },
+                        {
+                            "id": format!("tap:{costed_source}:1:W"),
+                            "type": "activateManaAbility",
+                            "cardId": costed_source,
+                            "abilityIndex": 1,
+                            "description": "Add one mana of any color.",
+                            "isManaAbility": true,
+                            "cost": "{1}, {T}",
+                            "producedMana": [{"amount": 1, "color": "W"}]
+                        }
+                    ]
+                }
+            })).unwrap();
+            let response = serde_json::to_value(bot.decide(prompt).unwrap()).unwrap();
+            assert_eq!(response["output"]["type"], "pay");
+            assert_eq!(response["output"]["auto"], true);
         }
     }
 }

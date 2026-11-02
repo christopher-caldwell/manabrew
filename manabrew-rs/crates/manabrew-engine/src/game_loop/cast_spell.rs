@@ -3111,6 +3111,35 @@ impl PlayerAgent for AutoAgent {
     }
 
     #[test]
+    fn auto_payment_reserves_pending_activated_ability_tap() {
+      std::thread::Builder::new().stack_size(32*1024*1024).spawn(|| {
+        for (other_sources, succeeds) in [(3, true), (2, false)] {
+            let mut game = GameState::new(&["A", "B"], 40);
+            let player = PlayerId(0);
+            let outer = parse_card_script("Name:War Room Fixture\nTypes:Land\nA:AB$ Mana | Cost$ T | Produced$ C\nA:AB$ Draw | Cost$ T 3 PayLife<1> | NumCards$ 1").unwrap();
+            let source = game.create_card(Card::from_rules(&outer, player));
+            game.move_card(source, ZoneType::Battlefield, player);
+            let land = parse_card_script("Name:Plains\nTypes:Basic Land Plains\nA:AB$ Mana | Cost$ T | Produced$ W").unwrap();
+            let mut others = Vec::new();
+            for _ in 0..other_sources {
+                let id = game.create_card(Card::from_rules(&land, player));
+                game.move_card(id, ZoneType::Battlefield, player);
+                others.push(id);
+            }
+            let mut agents: Vec<Box<dyn PlayerAgent>> = (0..2).map(|_| Box::new(AutoAgent(true, false)) as Box<dyn PlayerAgent>).collect();
+            let mut gl = GameLoop::new(2);
+            let paid = gl.pay_ability_cost(&mut game, &mut agents, player, source,
+                &crate::cost::parse_cost("T 3 PayLife<1>"), None, false,
+                crate::game_loop::cost_payment::CostPaymentContext::ActivatedAbility, None);
+            assert_eq!(paid, succeeds);
+            assert_eq!(game.card(source).tapped, succeeds);
+            assert_eq!(game.player(player).life, if succeeds { 39 } else { 40 });
+            if succeeds { assert!(others.iter().all(|&id| game.card(id).tapped)); }
+        }
+      }).unwrap().join().unwrap();
+    }
+
+    #[test]
     fn activated_cost_cancel_preserves_completed_nested_mana() {
       std::thread::Builder::new().stack_size(32*1024*1024).spawn(|| {
         for finish in [false, true] {
