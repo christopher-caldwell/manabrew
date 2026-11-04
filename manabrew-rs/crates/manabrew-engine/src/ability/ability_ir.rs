@@ -1201,6 +1201,7 @@ pub enum DefinedRef {
     ReplacedCard,
     #[strum(serialize = "ReplacedCardLKI")]
     ReplacedCardLki,
+    #[strum(serialize = "DirectRemembered")]
     Remembered,
     #[strum(serialize = "RememberedLKI")]
     RememberedLki,

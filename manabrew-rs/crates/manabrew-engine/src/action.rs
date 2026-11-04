@@ -701,6 +701,14 @@ impl GameState {
             }
             _ => {}
         }
+        // A transformed permanent only has its back-face characteristics on
+        // the battlefield. Zone changes create a new object; when that object
+        // is outside the battlefield it uses its front face (CR 712.8).
+        // Preserve the battlefield LKI above, then normalize before the card
+        // is added to its destination and any new-zone abilities are read.
+        if dest_zone != ZoneType::Battlefield && self.card(card_id).is_transformed {
+            self.card_mut(card_id).transform();
+        }
         if src_zone != dest_zone {
             let card = &mut self.cards[card_id.index()];
             card.on_adventure = adventure_exile;
@@ -1814,7 +1822,7 @@ fn can_attachment_remain_attached(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::card::Card;
+    use crate::card::{Card, CardOtherPart};
     use crate::player::RegisteredPlayer;
     use forge_foundation::{CardTypeLine, ColorSet, ManaCost};
 
@@ -1832,6 +1840,32 @@ mod tests {
             vec![],
         );
         game.create_card(card)
+    }
+
+    #[test]
+    fn transformed_permanent_returns_to_front_face_outside_battlefield() {
+        let mut game = GameState::new(&["Alice", "Bob"], 20);
+        let owner = PlayerId(0);
+        let card = Card::new(CardId(0), "Front Sage".into(), owner,
+            CardTypeLine::parse("Creature Human"), ManaCost::parse("1 W U"),
+            ColorSet::from_mask(3), Some(2), Some(2), vec![], vec![]);
+        let mut card = card;
+        card.add_alternate_state(CardOtherPart {
+            name: "Back Spirit".into(), oracle_text: String::new(), is_modal: false,
+            type_line: CardTypeLine::parse("Creature Spirit"), mana_cost: ManaCost::parse(""),
+            color: ColorSet::from_mask(3), base_power: Some(4), base_toughness: Some(4),
+            keywords: Default::default(), abilities: vec![], triggers: vec![], static_abilities: vec![],
+            replacement_effects: vec![], svars: Default::default(),
+        });
+        let id = game.create_card(card);
+        game.move_card(id, ZoneType::Battlefield, owner);
+        game.card_mut(id).transform();
+        assert_eq!(game.card(id).card_name, "Back Spirit");
+
+        game.move_card(id, ZoneType::Command, owner);
+        assert!(!game.card(id).is_transformed);
+        assert_eq!(game.card(id).card_name, "Front Sage");
+        assert_eq!(game.card(id).mana_cost, ManaCost::parse("1 W U"));
     }
 
     #[test]

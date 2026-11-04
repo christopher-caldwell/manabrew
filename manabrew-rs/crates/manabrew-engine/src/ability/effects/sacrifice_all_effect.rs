@@ -36,13 +36,18 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
             | DefinedRef::DelayTriggerRemembered
             | DefinedRef::Remembered,
         ) => {
-            let mut ids = Vec::new();
-            for value in &sa.trigger_remembered {
-                if let AbilityValue::Card(cid) = value {
-                    ids.push(*cid);
+            if matches!(sa.defined_ref(), Some(DefinedRef::Remembered)) {
+                sa.source.map(|source| ctx.game.card(source).remembered_cards.clone()).unwrap_or_default()
+            } else {
+                let mut ids = Vec::new();
+                for value in &sa.trigger_remembered {
+                    if let AbilityValue::Card(cid) = value {
+                        ids.push(*cid);
+                    }
                 }
+                ids
             }
-            Some(ids)
+            .into()
         }
         _ => None,
     }};
@@ -217,7 +222,7 @@ fn can_pay_unless_cost(
 
 #[cfg(test)]
 mod controller_scope_regression {
-    use crate::{ability::AbilityKey, agent::{PassAgent, PlayerAgent}, card::Card,
+    use crate::{ability::{AbilityKey, ability_ir::DefinedRef}, agent::{PassAgent, PlayerAgent}, card::Card,
         game::GameState, game_loop::GameLoop, ids::{CardId, PlayerId},
         spellability::build_spell_ability, zone::magic_stack::StackEntry};
     use forge_foundation::{CardTypeLine, ColorSet, ManaCost, ZoneType};
@@ -258,6 +263,41 @@ mod controller_scope_regression {
                     let expected = if owner == active as usize && index == 2 { ZoneType::Graveyard } else { ZoneType::Battlefield };
                     assert_eq!(game.card(id).zone, expected, "active={active} owner={owner} index={index}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn direct_remembered_sacrifices_only_the_remembered_object_or_nothing() {
+        for remember in [false, true] {
+            let mut game = GameState::new(&["A", "B", "C", "D"], 40);
+            let mut bears = Vec::new();
+            for owner in 0..4 {
+                let player = PlayerId(owner);
+                let id = game.create_card(Card::new(CardId(0), "Bear".into(), player,
+                    CardTypeLine::parse("Creature Bear"), ManaCost::parse("1G"),
+                    ColorSet::GREEN, Some(2), Some(2), vec![], vec![]));
+                game.move_card(id, ZoneType::Battlefield, player);
+                bears.push(id);
+            }
+            let source = game.create_card(Card::new(CardId(0), "Aura".into(), PlayerId(0),
+                CardTypeLine::parse("Enchantment Aura"), ManaCost::parse("1B"),
+                ColorSet::BLACK, None, None, vec![], vec![]));
+            game.move_card(source, ZoneType::Graveyard, PlayerId(0));
+            if remember { game.card_mut(source).add_remembered_card(bears[0]); }
+            let sa = build_spell_ability(&game, source,
+                "DB$ SacrificeAll | Defined$ DirectRemembered", PlayerId(2));
+            assert!(matches!(sa.defined_ref(), Some(DefinedRef::Remembered)));
+            game.stack.push(StackEntry { id: 1, spell_ability: sa, is_creature_spell: false,
+                is_permanent_spell: false, is_pending_cast: false, cast_from_zone: None,
+                optional_trigger_decider: None, optional_trigger_description: None,
+                optional_trigger_source_name: None });
+            let mut agents: Vec<Box<dyn PlayerAgent>> = (0..4)
+                .map(|_| Box::new(PassAgent) as Box<dyn PlayerAgent>).collect();
+            GameLoop::new(4).resolve_stack(&mut game, &mut agents);
+            for (index, &id) in bears.iter().enumerate() {
+                assert_eq!(game.card(id).zone == ZoneType::Graveyard, remember && index == 0,
+                    "remember={remember} index={index}");
             }
         }
     }
