@@ -1790,6 +1790,16 @@ pub fn resolve_count_svar_for_sa(
             return resolve_svar_expression(chosen, game, source_id, controller, sa);
         }
     }
+    if let Some(rest) = expr.strip_prefix("Count$Monarch.") {
+        if let Some((yes, no)) = rest.split_once('.') {
+            let chosen = if game.monarch == Some(controller) {
+                yes
+            } else {
+                no
+            };
+            return resolve_svar_expression(chosen, game, source_id, controller, sa);
+        }
+    }
 
     // Count$Metalcraft.A.B — return A if controller has 3+ artifacts, else B.
     if let Some(rest) = expr.strip_prefix("Count$Metalcraft.") {
@@ -2377,6 +2387,37 @@ mod tests {
         game.player_mut(c).new_turn();
         assert_eq!(count(&game, a, "Count$LifeOppsLostThisTurn"), 0);
         assert_eq!(count(&game, a, "Count$Blessing.0.1"), 0);
+    }
+
+    #[test]
+    fn monarch_count_selects_the_controller_branch_and_updates_on_transfer() {
+        let mut game = GameState::new(&["A", "B", "C", "D"], 40);
+        let a = PlayerId(0);
+        let b = PlayerId(1);
+        let host = game.create_card(Card::new(
+            CardId(0),
+            "Court fixture".into(),
+            a,
+            CardTypeLine::parse("Enchantment"),
+            ManaCost::parse(""),
+            ColorSet::COLORLESS,
+            None,
+            None,
+            vec![],
+            vec![],
+        ));
+        let sa = SpellAbility::new_simple(Some(host), a, "DB$ Draw");
+        let count = |g: &GameState, controller| {
+            super::resolve_count_svar_for_sa("Count$Monarch.1.0", g, host, controller, &sa)
+        };
+
+        assert_eq!(count(&game, a), 0, "no monarch selects the false branch");
+        game.monarch = Some(a);
+        assert_eq!(count(&game, a), 1, "the monarch selects the true branch");
+        assert_eq!(count(&game, b), 0, "another player is not the monarch");
+        game.monarch = Some(b);
+        assert_eq!(count(&game, a), 0, "transfer clears the former monarch branch");
+        assert_eq!(count(&game, b), 1, "transfer selects the new monarch branch");
     }
 
     #[test]
