@@ -36,7 +36,12 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
             | DefinedRef::DelayTriggerRemembered
             | DefinedRef::Remembered,
         ) => {
-            if matches!(sa.defined_ref(), Some(DefinedRef::Remembered)) {
+            // A delayed trigger can carry its own remembered snapshot. The
+            // source's live remembered list may already have been cleared by
+            // another trigger by the time this ability resolves.
+            if matches!(sa.defined_ref(), Some(DefinedRef::Remembered))
+                && !sa.has_triggering_object(crate::ability::AbilityKey::RememberedLKI)
+            {
                 sa.source.map(|source| ctx.game.card(source).remembered_cards.clone()).unwrap_or_default()
             } else {
                 let mut ids = Vec::new();
@@ -137,6 +142,18 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
                     to_sacrifice.push(cid);
                 }
             }
+        }
+    }
+
+    if matches!(sa.defined_ref(), Some(DefinedRef::Remembered
+        | DefinedRef::DelayTriggerRemembered | DefinedRef::DelayTriggerRememberedLki))
+    {
+        let stored = crate::parsing::Params::from_raw(&sa.ability_text);
+        if let Some(objects) = stored.get("StoredRememberedObjects") {
+            to_sacrifice.retain(|&id| {
+                let identity = format!("{}:{}", id.0, ctx.game.card(id).zone_timestamp);
+                objects.split(',').any(|object| object == identity)
+            });
         }
     }
 
@@ -300,5 +317,72 @@ mod controller_scope_regression {
                     "remember={remember} index={index}");
             }
         }
+    }
+
+    #[test]
+    fn delayed_remembered_sacrifice_tracks_zone_identity_not_controller() {
+        for defined in ["DirectRemembered", "DelayTriggerRemembered", "DelayTriggerRememberedLKI"] {
+            for scenario in ["same_object", "changed_controller", "returned_object"] {
+                let mut game = GameState::new(&["A", "B"], 40);
+                let source = game.create_card(Card::new(CardId(0), "Aura".into(), PlayerId(0),
+                    CardTypeLine::parse("Enchantment Aura"), ManaCost::parse("1B"),
+                    ColorSet::BLACK, None, None, vec![], vec![]));
+                let host = game.create_card(Card::new(CardId(0), "Bear".into(), PlayerId(1),
+                    CardTypeLine::parse("Creature Bear"), ManaCost::parse("1G"),
+                    ColorSet::GREEN, Some(2), Some(2), vec![], vec![]));
+                game.move_card(source, ZoneType::Graveyard, PlayerId(0));
+                game.move_card(host, ZoneType::Battlefield, PlayerId(1));
+                let epoch = game.card(host).zone_timestamp;
+                let mut sa = build_spell_ability(&game, source,
+                    &format!("DB$ SacrificeAll | Defined$ {defined} | StoredRememberedObjects$ {}:{epoch}", host.0), PlayerId(0));
+                sa.is_trigger = true;
+                sa.trigger_remembered.push(crate::event::AbilityValue::Card(host));
+                sa.trigger_objects.insert(AbilityKey::RememberedLKI,
+                    crate::event::AbilityValue::Cards(vec![host]));
+                if scenario == "returned_object" {
+                    game.move_card(host, ZoneType::Exile, PlayerId(1));
+                    game.move_card(host, ZoneType::Battlefield, PlayerId(1));
+                } else if scenario == "changed_controller" {
+                    game.card_mut(host).controller = PlayerId(0);
+                }
+                game.stack.push(StackEntry { id: 1, spell_ability: sa, is_creature_spell: false,
+                    is_permanent_spell: false, is_pending_cast: false, cast_from_zone: None,
+                    optional_trigger_decider: None, optional_trigger_description: None,
+                    optional_trigger_source_name: None });
+                let mut agents: Vec<Box<dyn PlayerAgent>> = (0..2)
+                    .map(|_| Box::new(PassAgent) as Box<dyn PlayerAgent>).collect();
+                GameLoop::new(2).resolve_stack(&mut game, &mut agents);
+                assert_eq!(game.card(host).zone,
+                    if scenario == "returned_object" { ZoneType::Battlefield } else { ZoneType::Graveyard },
+                    "{defined}: {scenario}");
+            }
+        }
+    }
+
+    #[test]
+    fn delayed_direct_remembered_uses_trigger_snapshot_after_source_cleanup() {
+        use crate::event::AbilityValue;
+        let mut game = GameState::new(&["A", "B"], 40);
+        let source = game.create_card(Card::new(CardId(0), "Aura".into(), PlayerId(0),
+            CardTypeLine::parse("Enchantment Aura"), ManaCost::parse("1B"),
+            ColorSet::BLACK, None, None, vec![], vec![]));
+        let host = game.create_card(Card::new(CardId(0), "Bear".into(), PlayerId(1),
+            CardTypeLine::parse("Creature Bear"), ManaCost::parse("1G"),
+            ColorSet::GREEN, Some(2), Some(2), vec![], vec![]));
+        game.move_card(source, ZoneType::Graveyard, PlayerId(0));
+        game.move_card(host, ZoneType::Battlefield, PlayerId(1));
+        let mut sa = build_spell_ability(&game, source,
+            "DB$ SacrificeAll | Defined$ DirectRemembered", PlayerId(0));
+        sa.is_trigger = true;
+        sa.trigger_remembered.push(AbilityValue::Card(host));
+        sa.trigger_objects.insert(AbilityKey::RememberedLKI, AbilityValue::Cards(vec![host]));
+        game.stack.push(StackEntry { id: 1, spell_ability: sa, is_creature_spell: false,
+            is_permanent_spell: false, is_pending_cast: false, cast_from_zone: None,
+            optional_trigger_decider: None, optional_trigger_description: None,
+            optional_trigger_source_name: None });
+        let mut agents: Vec<Box<dyn PlayerAgent>> = (0..2)
+            .map(|_| Box::new(PassAgent) as Box<dyn PlayerAgent>).collect();
+        GameLoop::new(2).resolve_stack(&mut game, &mut agents);
+        assert_eq!(game.card(host).zone, ZoneType::Graveyard);
     }
 }

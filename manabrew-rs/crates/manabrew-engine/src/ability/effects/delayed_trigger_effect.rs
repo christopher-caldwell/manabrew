@@ -92,6 +92,16 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
                 ctx.game,
             ));
         }
+        // CR 603.7c: a delayed ability must not reacquire a remembered card
+        // after it leaves and returns as a new object. Keep registration-time
+        // identity in the execution script, as for StoredTransform above;
+        // it then survives trigger creation, stack ordering and source cleanup.
+        let objects = remembered_cards.iter().chain(&remembered_lki_cards)
+            .map(|id| format!("{}:{}", id.0, ctx.game.card(*id).zone_timestamp))
+            .collect::<Vec<_>>()
+            .join(",");
+        execute_svar.push_str(&format!(" | StoredRememberedObjects$ {}",
+            if objects.is_empty() { "none" } else { &objects }));
     }
 
     let delayed = crate::trigger::handler::DelayedTrigger {
