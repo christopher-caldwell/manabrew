@@ -1415,7 +1415,15 @@ impl GameLoop {
                     && game.card(card_id).zone_timestamp == source_epoch
                     && !game.cards.iter().any(|c| matches!(c.zone, ZoneType::Battlefield | ZoneType::Command)
                         && (!c.triggers.is_empty() || !c.replacement_effects.is_empty()));
-                if !simple { panic!("unsupported irreversible nested mana-cost cancellation"); }
+                if !simple {
+                    // Nested mana production may already have caused triggers
+                    // or replacements that a snapshot restore would erase.
+                    // Preserve those effects and report the failed payment to
+                    // the caller so it does not undo them as part of its own
+                    // cancellation path.
+                    self.mark_mana_undo_disqualified();
+                    return AbilityCostOutcome::FailedPreservingManaEffects;
+                }
                 game.card_mut(card_id).tapped = false;
                 self.mark_mana_undo_disqualified();
                 return AbilityCostOutcome::FailedPreservingManaEffects;

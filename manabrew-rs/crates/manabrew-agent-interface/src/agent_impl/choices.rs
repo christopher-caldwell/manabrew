@@ -612,6 +612,15 @@ pub(super) fn choose_color<T: Responder>(
     _player: PlayerId,
     valid_colors: &[String],
 ) -> Option<String> {
+    // A forced choice has no decision for the agent to make. Avoid emitting
+    // an identical prompt for each repeated mana production of that color.
+    if valid_colors.len() == 1 {
+        return valid_colors.first().cloned();
+    }
+    if valid_colors.is_empty() {
+        return None;
+    }
+
     agent.send_prompt(
         PromptInput::ChooseColor(manabrew_protocol::prompts::choose_color::ChooseColorInput {
             presentation: PromptPresentation {
