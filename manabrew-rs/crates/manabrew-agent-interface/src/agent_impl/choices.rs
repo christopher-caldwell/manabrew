@@ -42,6 +42,13 @@ fn send_selection<T: Responder>(
     max: usize,
     source: Option<CardId>,
 ) {
+    // Selection options sent here have unit weight and cannot repeat. The
+    // greatest feasible total is therefore the number of available options.
+    // Clamp both bounds at the protocol boundary so filtered mode lists
+    // (for example, Spree modes with no legal targets) cannot produce an
+    // impossible prompt.
+    let max = max.min(options.len());
+    let min = min.min(max);
     agent.send_prompt(
         PromptInput::ChooseFromSelection(ChooseFromSelectionInput {
             presentation: PromptPresentation {
@@ -64,6 +71,7 @@ fn send_selection<T: Responder>(
         source,
     );
 }
+
 
 fn recv_selection<T: Responder>(agent: &mut PromptAgent<T>) -> Option<Vec<usize>> {
     match agent.recv_action() {
