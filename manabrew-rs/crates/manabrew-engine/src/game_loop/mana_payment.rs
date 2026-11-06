@@ -435,7 +435,7 @@ where
                             // A failed auto payment may follow manual convoke.
                             // Retract it only when the auto activations cannot
                             // observe the tapped creatures or alter their state.
-                            let safe = convoke_reverse_safe && no_active_trigger_or_replacement(game) && auto_trace.iter().all(|action| match action {
+                            let safe = convoke_reverse_safe && auto_trace.iter().all(|action| match action {
                                 ManaCostAction::TapForMana { card_id, mana_ability_index, .. } => {
                                     !convoke_records.iter().any(|(id, _)| id == card_id)
                                         && game.card(*card_id).activated_abilities.iter().any(|ab|
@@ -792,10 +792,12 @@ fn independent_tap_mana_self_damage(game: &GameState, source: CardId, ab: &Activ
 fn independent_mana_draw_only(game: &GameState, source: CardId, ab: &ActivatedAbility) -> bool {
     if !ab.ability_kind.eq_ignore_ascii_case("Mana") || ab.cost.parts.len() != 1
         || !matches!(ab.cost.parts[0], crate::cost::CostPart::Tap) { return false; }
-    if !no_active_trigger_or_replacement(game) { return false; }
     match &ab.sub_ability {
-        None => true,
-        Some(key) => game.card(source).svars.get(key).is_some_and(|raw| {
+        None => !game.cards.iter().filter(|c| matches!(c.zone, ZoneType::Battlefield | ZoneType::Command)).any(|c| {
+            !c.replacement_effects.is_empty() || c.triggers.iter().any(|t| !matches!(t.kind,
+                crate::trigger::TriggerType::ChangesZone | crate::trigger::TriggerType::Drawn | crate::trigger::TriggerType::SpellCast))
+        }),
+        Some(key) => no_active_trigger_or_replacement(game) && game.card(source).svars.get(key).is_some_and(|raw| {
             let p = crate::parsing::Params::from_raw(raw);
             p.get("DB") == Some("Draw") && p.get("Defined") == Some("You")
                 && p.get("NumCards").is_some_and(|n| n.parse::<u32>().is_ok())
