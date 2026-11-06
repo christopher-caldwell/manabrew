@@ -1626,6 +1626,7 @@ impl GameState {
 
     /// Reset per-turn state for all cards and players of a given player.
     pub fn new_turn_for_player(&mut self, player: PlayerId) {
+        self.player_begin_turn_control(player);
         self.player_new_turn(player);
         // Reset turn-scoped player stats for ALL non-active players too.
         // These counters are "this turn" in the global turn sense, not "that

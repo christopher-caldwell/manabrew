@@ -1,5 +1,5 @@
 use crate::ability::ability_utils::resolve_defined_players_with_sa;
-use crate::ability::effects::{evaluate_svar, resolve_defined_player, EffectContext};
+use crate::ability::effects::{evaluate_svar, EffectContext};
 use crate::ability::spell_ability_effect::resolve_defined_cards_for_sa;
 use crate::parsing::Params;
 use crate::spellability::SpellAbility;
@@ -66,13 +66,13 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
         }
     }
 
-    let controller = if let Some(def_player) = sa.ir.delayed_trigger_defined_player_text.as_deref()
-    {
-        resolve_defined_player(def_player, sa.activating_player, ctx.game)
-            .unwrap_or(sa.activating_player)
-    } else {
-        sa.activating_player
-    };
+    // The player whose next turn activates the delayed trigger is not its
+    // controller. Targeted needs this ability's chosen-player context (Emrakul).
+    let controller = sa.activating_player;
+    let delayed_for_player = sa.ir.delayed_trigger_defined_player_text.as_deref()
+        .and_then(|defined| resolve_defined_players_with_sa(
+            defined, sa, controller, ctx.game,
+        ).into_iter().next());
     let mut remembered_lki_cards = Vec::new();
     let mut remembered_cards = Vec::new();
     let mut remembered_players = Vec::new();
@@ -131,7 +131,7 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
             .register_this_turn_delayed_trigger(delayed);
     } else if sa.ir.delayed_trigger_defined_player.is_some() {
         ctx.trigger_handler
-            .register_player_defined_delayed_trigger(controller, delayed);
+            .register_player_defined_delayed_trigger(delayed_for_player.unwrap_or(controller), delayed);
     } else {
         ctx.trigger_handler.register_delayed_trigger(delayed);
     }

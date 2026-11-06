@@ -243,6 +243,37 @@ impl GameState {
         self.player_mut(player).reset_for_restart();
     }
 
+    /// Schedule control at the target's next actual turn, not at spell resolution.
+    /// Skipped turns never call new_turn_for_player and do not consume this effect.
+    pub fn player_schedule_next_turn_control(&mut self, player: PlayerId, controller: PlayerId) {
+        if self.player(player).is_alive() && self.player(controller).is_alive() {
+            self.player_mut(player).next_turn_controllers.push(controller);
+        }
+    }
+
+    pub(crate) fn player_begin_turn_control(&mut self, player: PlayerId) {
+        let pending = std::mem::take(&mut self.player_mut(player).next_turn_controllers);
+        let controller = pending.into_iter().rev().find(|id| self.player(*id).is_alive());
+        if let Some(controller) = controller {
+            let state = self.player_mut(player);
+            state.active_turn_control = Some(crate::player::state::TurnControl {
+                controller,
+                previous_controller: state.controlled_by,
+            });
+            state.controlled_by = Some(controller);
+        }
+    }
+
+    /// Expire only this turn's effect; preserve an independently changed controller.
+    pub(crate) fn player_end_turn_control(&mut self, player: PlayerId) {
+        let state = self.player_mut(player);
+        if let Some(control) = state.active_turn_control.take() {
+            if state.controlled_by == Some(control.controller) {
+                state.controlled_by = control.previous_controller;
+            }
+        }
+    }
+
     pub fn player_set_controlled_by(&mut self, player: PlayerId, controller: Option<PlayerId>) {
         self.player_mut(player).controlled_by = controller;
     }

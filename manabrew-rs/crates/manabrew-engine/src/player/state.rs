@@ -7,6 +7,13 @@ use crate::ids::{CardId, PlayerId};
 use super::player_outcome::PlayerOutcome;
 use super::player_statistics::PlayerStatistics;
 
+/// A next-turn control effect currently active for one player's turn.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TurnControl {
+    pub controller: PlayerId,
+    pub previous_controller: Option<PlayerId>,
+}
+
 /// Mutable game-state for a single player.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerState {
@@ -79,6 +86,11 @@ pub struct PlayerState {
     pub library_searched_this_turn: i32,
 
     pub controlled_by: Option<PlayerId>,
+    /// Resolution order; the most recent surviving controller takes the next turn.
+    #[serde(default)]
+    pub next_turn_controllers: Vec<PlayerId>,
+    #[serde(default)]
+    pub active_turn_control: Option<TurnControl>,
     pub team_number: i32,
     pub unlimited_land_plays: bool,
 
@@ -202,6 +214,8 @@ impl PlayerState {
             sacrificed_this_turn: 0,
             library_searched_this_turn: 0,
             controlled_by: None,
+            next_turn_controllers: Vec::new(),
+            active_turn_control: None,
             team_number: -1,
             unlimited_land_plays: false,
             has_city_blessing: false,
@@ -388,6 +402,8 @@ impl PlayerState {
         self.sacrificed_this_turn = 0;
         self.library_searched_this_turn = 0;
         self.controlled_by = None;
+        self.next_turn_controllers.clear();
+        self.active_turn_control = None;
         self.unlimited_land_plays = false;
         self.has_city_blessing = false;
         self.ring_level = 0;

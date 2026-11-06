@@ -680,6 +680,10 @@ impl GameLoop {
             }
         }
 
+        // A controlled next turn ends after its discard decision, at Cleanup.
+        // This is a typed state transition, not a card-script delayed trigger.
+        game.player_end_turn_control(game.active_player());
+
         // Player-owned cleanup state that expires at end of turn.
         let player_ids = game.player_order.clone();
         for player in player_ids {
