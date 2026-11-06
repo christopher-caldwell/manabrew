@@ -62,7 +62,9 @@ fn resolve_untap_targets(ctx: &EffectContext, sa: &SpellAbility) -> Vec<CardId> 
             .source
             .map(|sid| ctx.game.card(sid).remembered_cards.clone())
             .unwrap_or_default(),
-        _ => Vec::new(),
+        // Every other `Defined$` (for example `Enchanted` on Dance of the Dead's
+        // paid untap) uses the shared resolver, as Java's UntapEffect does.
+        _ => crate::ability::spell_ability_effect::get_target_cards(ctx.game, sa),
     }
 }
 
@@ -209,5 +211,50 @@ mod tests {
         super::UntapEffect::resolve(&mut ctx, &sa);
 
         assert!(!ctx.game.card(c1).tapped);
+    }
+
+    /// Dance of the Dead's paid upkeep untap: `AB$ Untap | Defined$ Enchanted`.
+    #[test]
+    fn untap_effect_untaps_the_enchanted_creature() {
+        let mut game = GameState::new(&["Alice", "Bob"], 20);
+        let p0 = PlayerId(0);
+        let bear = make_creature(&mut game, p0);
+        game.move_card(bear, ZoneType::Battlefield, p0);
+        let other = make_creature(&mut game, p0);
+        game.move_card(other, ZoneType::Battlefield, p0);
+        let aura = make_creature(&mut game, p0);
+        game.move_card(aura, ZoneType::Battlefield, p0);
+        game.attach_to(aura, bear);
+        game.tap(bear);
+        game.tap(other);
+
+        let sa = SpellAbility::new_simple(Some(aura), p0, "AB$ Untap | Cost$ 1 B | Defined$ Enchanted");
+
+        let mut th = TriggerHandler::new();
+        let mut agents: Vec<Box<dyn crate::agent::PlayerAgent>> =
+            vec![Box::new(PassAgent), Box::new(PassAgent)];
+        let mut mp = vec![ManaPool::default(), ManaPool::default()];
+        let templates = HashMap::new();
+        let templates_variants = HashMap::new();
+        let token_fallback = HashMap::new();
+        let edition_dates: HashMap<String, String> = HashMap::new();
+        let mut rng_adapter = crate::game_rng::ThreadRngAdapter;
+        let mut ctx = EffectContext {
+            game: &mut game,
+            combat: None,
+            agents: &mut agents,
+            trigger_handler: &mut th,
+            token_templates: &templates,
+            token_art_variants: &templates_variants,
+            token_fallback: &token_fallback,
+            edition_dates: &edition_dates,
+            mana_pools: &mut mp,
+            parent_target_card: None,
+            rng: &mut rng_adapter,
+        };
+        super::UntapEffect::resolve(&mut ctx, &sa);
+
+        assert!(!ctx.game.card(bear).tapped, "enchanted creature untaps");
+        assert!(ctx.game.card(other).tapped, "only the enchanted creature");
     }
 }
