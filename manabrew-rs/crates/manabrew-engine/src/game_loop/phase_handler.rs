@@ -628,6 +628,10 @@ impl GameLoop {
 
         // --- One-time end-of-turn resets (after the cleanup loop) ---
 
+        // "During that player's next turn" includes priority and choices in
+        // repeated Cleanup steps. Restore control only after the loop ends.
+        game.player_end_turn_control(game.active_player());
+
         // Reset fog flag (issue #22: Fog effect lasts until end of turn).
         game.prevent_all_combat_damage = false;
 
@@ -679,10 +683,6 @@ impl GameLoop {
                 game.change_controller(card_id, original);
             }
         }
-
-        // A controlled next turn ends after its discard decision, at Cleanup.
-        // This is a typed state transition, not a card-script delayed trigger.
-        game.player_end_turn_control(game.active_player());
 
         // Player-owned cleanup state that expires at end of turn.
         let player_ids = game.player_order.clone();
