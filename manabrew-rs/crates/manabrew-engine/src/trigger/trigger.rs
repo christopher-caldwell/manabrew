@@ -587,11 +587,9 @@ impl Trigger {
         match (filter.as_ref(), player_id) {
             (None, _) => true,
             (Some(_), None) => false,
-            (Some(selector), Some(player_id)) => self.matches_compiled_valid(
-                &MatchValidTarget::Player(player_id),
-                selector,
-                Some(self.base.card_trait_base.host_card(game)),
-            ),
+            (Some(selector), Some(player_id)) => {
+                self.matches_valid_player_filter(selector, player_id, game)
+            }
         }
     }
 
@@ -629,10 +627,13 @@ impl Trigger {
         player: PlayerId,
         game: &GameState,
     ) -> bool {
-        self.matches_compiled_valid(
-            &MatchValidTarget::Player(player),
+        let src = self.base.card_trait_base.host_card(game);
+        valid_filter::matches_valid_player_selector_in_game(
             filter,
-            Some(self.base.card_trait_base.host_card(game)),
+            player,
+            self.resolve_source_player(src),
+            game,
+            src.id,
         )
     }
 

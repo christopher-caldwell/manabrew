@@ -1832,4 +1832,98 @@ mod tests {
         assert_eq!(pending[0].entry.spell_ability.get_triggering_player(crate::ability::AbilityKey::Activator), Some(PlayerId(2)));
     }
 
+    fn put_on_battlefield(game: &mut GameState, script: &str, owner: u32, controller: u32) -> crate::ids::CardId {
+        let rules = parse_card_script(script).expect("card script should parse");
+        // `create_card` binds the card's triggers to its assigned ID.
+        let id = game.create_card(Card::from_rules(&rules, PlayerId(owner)));
+        game.move_card(id, forge_foundation::ZoneType::Battlefield, PlayerId(controller));
+        game.card_mut(id).controller = PlayerId(controller);
+        id
+    }
+
+    /// Players whose upkeep, as the active player, activates the single
+    /// registered phase trigger.
+    fn upkeep_players(game: &mut GameState, host: crate::ids::CardId) -> Vec<u32> {
+        let mut handler = TriggerHandler::new();
+        handler.register_active_trigger(game, host);
+        let mut players = Vec::new();
+        for active in 0..4 {
+            game.turn.active_player = PlayerId(active);
+            let params = RunParams {
+                phase: Some(PhaseType::Upkeep),
+                player: Some(PlayerId(active)),
+                ..Default::default()
+            };
+            if !handler.get_active_trigger(game, TriggerType::Phase, &params).is_empty() {
+                players.push(active);
+            }
+        }
+        players
+    }
+
+    fn upkeep_trigger(valid_player: &str) -> String {
+        format!(
+            "Name:Upkeep Fixture\nManaCost:1\nTypes:Enchantment\nT:Mode$ Phase | Phase$ Upkeep | ValidPlayer$ {valid_player} | TriggerZones$ Battlefield | Execute$ TrigLose | TriggerDescription$ At the beginning of a matching player's upkeep, that player loses 1 life.\nSVar:TrigLose:DB$ LoseLife | Defined$ TriggeredPlayer | LifeAmount$ 1"
+        )
+    }
+
+    const BEAR: &str = "Name:Bear Fixture\nManaCost:1 G\nTypes:Creature Bear\nPT:2/2";
+
+    /// DEV-061: Dance of the Dead's untap belongs to the enchanted creature's
+    /// controller's upkeep, including a stolen creature and a later control change.
+    #[test]
+    fn enchanted_controller_upkeep_trigger_follows_the_enchanted_creatures_controller() {
+        let mut game = GameState::new(&["A", "B", "C", "D"], 40);
+        let bear = put_on_battlefield(&mut game, BEAR, 1, 0);
+        let dance = put_on_battlefield(
+            &mut game,
+            "Name:Dance Fixture\nManaCost:1 B\nTypes:Enchantment Aura\nT:Mode$ Phase | Phase$ Upkeep | ValidPlayer$ Player.EnchantedController | TriggerZones$ Battlefield | OptionalDecider$ EnchantedController | Execute$ TrigUntap | TriggerDescription$ At the beginning of the upkeep of enchanted creature's controller, that player may pay {1}{B}. If the player does, untap that creature.\nSVar:TrigUntap:AB$ Untap | Cost$ 1 B | Defined$ Enchanted",
+            0,
+            0,
+        );
+        game.card_mut(dance).attached_to = Some(bear);
+        assert_eq!(upkeep_players(&mut game, dance), vec![0], "stolen creature's controller, not owner or other players");
+        game.card_mut(bear).controller = PlayerId(2);
+        assert_eq!(upkeep_players(&mut game, dance), vec![2], "control change moves the trigger to the new controller");
+        game.card_mut(dance).attached_to = None;
+        assert!(upkeep_players(&mut game, dance).is_empty(), "an unattached Aura has no enchanted creature's controller");
+    }
+
+    /// Neighbors on the same game-dependent player path: curses on a player,
+    /// a chosen player, other players and the non-active player.
+    #[test]
+    fn game_dependent_player_filters_match_only_their_player() {
+        let mut game = GameState::new(&["A", "B", "C", "D"], 40);
+        let curse = put_on_battlefield(&mut game, &upkeep_trigger("Player.EnchantedBy"), 0, 0);
+        game.card_mut(curse).attached_to_player = Some(PlayerId(3));
+        assert_eq!(upkeep_players(&mut game, curse), vec![3], "Player.EnchantedBy");
+        let vise = put_on_battlefield(&mut game, &upkeep_trigger("Player.Chosen"), 0, 0);
+        game.card_mut(vise).chosen_player = Some(PlayerId(1));
+        assert_eq!(upkeep_players(&mut game, vise), vec![1], "Player.Chosen");
+        let other = put_on_battlefield(&mut game, &upkeep_trigger("Player.Other"), 0, 0);
+        assert_eq!(upkeep_players(&mut game, other), vec![1, 2, 3], "Player.Other");
+        let nonactive = put_on_battlefield(&mut game, &upkeep_trigger("Player.Opponent+NonActive"), 0, 0);
+        assert!(upkeep_players(&mut game, nonactive).is_empty(), "the upkeep's player is the active player");
+        let active = put_on_battlefield(&mut game, &upkeep_trigger("Player.Active"), 0, 0);
+        assert_eq!(upkeep_players(&mut game, active), vec![0, 1, 2, 3], "Player.Active");
+        let monarch = put_on_battlefield(&mut game, &upkeep_trigger("Player.isMonarch"), 0, 0);
+        game.monarch = Some(PlayerId(2));
+        assert_eq!(upkeep_players(&mut game, monarch), vec![2], "Player.isMonarch");
+        let enchanted_opponent = put_on_battlefield(&mut game, &upkeep_trigger("Opponent.EnchantedBy"), 0, 0);
+        game.card_mut(enchanted_opponent).attached_to_player = Some(PlayerId(0));
+        assert!(upkeep_players(&mut game, enchanted_opponent).is_empty(), "Opponent.EnchantedBy on its own controller");
+    }
+
+    /// Game-free player filters are unchanged.
+    #[test]
+    fn controller_relative_player_filters_are_unchanged() {
+        let mut game = GameState::new(&["A", "B", "C", "D"], 40);
+        let you = put_on_battlefield(&mut game, &upkeep_trigger("You"), 0, 0);
+        let opponent = put_on_battlefield(&mut game, &upkeep_trigger("Opponent"), 0, 0);
+        let each = put_on_battlefield(&mut game, &upkeep_trigger("Player"), 0, 0);
+        assert_eq!(upkeep_players(&mut game, you), vec![0]);
+        assert_eq!(upkeep_players(&mut game, opponent), vec![1, 2, 3]);
+        assert_eq!(upkeep_players(&mut game, each), vec![0, 1, 2, 3]);
+    }
+
 }

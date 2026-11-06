@@ -2453,6 +2453,67 @@ pub fn matches_valid_player_selector(
     result
 }
 
+/// Match a player selector for a caller that holds the game, such as a
+/// trigger's `ValidPlayer` filter. Player properties that depend on game state
+/// (an Aura's enchanted creature's controller, the enchanted player, the chosen
+/// player, the active player) are decided by `player_has_property`; the
+/// game-free matcher above treats them as permissive. Every other predicate
+/// keeps the game-free semantics.
+pub fn matches_valid_player_selector_in_game(
+    selector: &CompiledSelector,
+    player: PlayerId,
+    source_controller: PlayerId,
+    game: &GameState,
+    source_id: CardId,
+) -> bool {
+    let needs_game = selector
+        .ir
+        .alternatives
+        .iter()
+        .flat_map(|alternative| &alternative.predicates)
+        .any(|predicate| game_player_property(predicate).is_some());
+    if !needs_game {
+        return matches_valid_player_selector(selector, player, source_controller);
+    }
+    let sa = SpellAbility::new_simple(Some(source_id), source_controller, "");
+    selector.ir.alternatives.iter().any(|alternative| {
+        alternative.predicates.iter().all(|predicate| match game_player_property(predicate) {
+            Some(property) => crate::player::player_has_property(
+                player,
+                property,
+                game,
+                source_id,
+                source_controller,
+                &sa,
+            ),
+            None => matches_player_predicate(predicate, player, source_controller),
+        })
+    })
+}
+
+/// Game-dependent player properties that `player_has_property` implements.
+fn game_player_property(predicate: &SelectorPredicate) -> Option<&'static str> {
+    match predicate {
+        SelectorPredicate::Context(ContextPredicate::EnchantedController) => {
+            Some("EnchantedController")
+        }
+        SelectorPredicate::AttachedBy => Some("EnchantedBy"),
+        SelectorPredicate::CardState(CardStateSelector::Chosen) => Some("Chosen"),
+        SelectorPredicate::CardIdentity(CardIdentitySelector::Other) => Some("Other"),
+        // `Player.Active`, `Player.isMonarch` and `Player.NonActive` lower to
+        // subtype names and a negated subtype.
+        SelectorPredicate::CardType(CardSelectorType::Subtype(name)) => {
+            ["Active", "isMonarch"].into_iter().find(|property| name == property)
+        }
+        SelectorPredicate::Not(inner)
+            if matches!(inner.as_ref(), SelectorPredicate::CardType(CardSelectorType::Subtype(name)) if name == "Active") =>
+        {
+            Some("NonActive")
+        }
+        _ => None,
+    }
+}
+
 fn matches_player_selector_ir(
     selector: &Selector,
     player: PlayerId,
