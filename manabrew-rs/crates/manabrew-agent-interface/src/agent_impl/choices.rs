@@ -250,7 +250,20 @@ pub(super) fn choose_mode<T: Responder>(
         max,
         source_card_id,
     );
-    recv_selection(agent).unwrap_or_else(|| (0..min.min(descriptions.len())).collect())
+    recv_selection(agent)
+        .map(|indices| {
+            let mut accepted = Vec::with_capacity(max);
+            for index in indices {
+                if accepted.len() >= max {
+                    break;
+                }
+                if index < descriptions.len() && !accepted.contains(&index) {
+                    accepted.push(index);
+                }
+            }
+            accepted
+        })
+        .unwrap_or_else(|| (0..min.min(descriptions.len())).collect())
 }
 
 pub(super) fn choose_spell_abilities_for_effect<T: Responder>(
