@@ -431,13 +431,41 @@ where
                     if let Some(mut auto_trace) = auto_pay(game, agents, mana_pools, session) {
                         let attempted_and_failed =
                             matches!(auto_trace.last(), Some(ManaCostAction::AttemptedAndFailed));
-                        executed_actions.append(&mut auto_trace);
                         if attempted_and_failed {
+                            // A failed auto payment may follow manual convoke.
+                            // Retract it only when the auto activations cannot
+                            // observe the tapped creatures or alter their state.
+                            let safe = convoke_reverse_safe && no_active_trigger_or_replacement(game) && auto_trace.iter().all(|action| match action {
+                                ManaCostAction::TapForMana { card_id, mana_ability_index, .. } => {
+                                    !convoke_records.iter().any(|(id, _)| id == card_id)
+                                        && game.card(*card_id).activated_abilities.iter().any(|ab|
+                                            mana_ability_index.map_or(true, |i| i == ab.ability_index)
+                                                && independent_mana_draw_only(game, *card_id, ab))
+                                }
+                                ManaCostAction::AttemptedAndFailed => true,
+                                _ => false,
+                            });
+                            if convoke_used && safe {
+                                if convoke_records.iter().all(|&(source, epoch)| {
+                                    let card = game.card(source);
+                                    card.zone == ZoneType::Battlefield && card.zone_timestamp == epoch && card.tapped
+                                        && mana_pools[session.player.index()].mana_entries().iter().any(|m|
+                                            m.convoke_for == Some(session.card_id) && m.convoke_source == Some(source))
+                                }) {
+                                    for &(source, _) in &convoke_records {
+                                        mana_pools[session.player.index()].remove_convoke(session.card_id, source);
+                                        game.card_mut(source).tapped = false;
+                                    }
+                                    convoke_used = false;
+                                }
+                            }
+                            executed_actions.append(&mut auto_trace);
                             notify_mana_payment_resolved(agents, session.player, &executed_actions);
                             // The auto-payer refunded consumed mana objects and
                             // retained its activations; do not restore a stale pool.
                             return ManaPaymentResult::failed_preserving_taps(convoke_used, false);
                         }
+                        executed_actions.append(&mut auto_trace);
                         if mana_pools[session.player.index()].mana_entries().iter().any(|m| m.convoke_for == Some(session.card_id)) {
                             panic!("unsupported unused convoke contribution after auto payment");
                         }

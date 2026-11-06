@@ -1588,6 +1588,11 @@ impl GameLoop {
                 .map(|id| (id, game.card(id).zone_timestamp))
                 .collect()
         } else { Vec::new() };
+        let convoke_untapped: Vec<_> = if game.card(card_id).has_keyword("Convoke") {
+            game.cards_in_zone(ZoneType::Battlefield, player).iter().copied()
+                .filter(|&id| game.card(id).is_creature() && !game.card(id).tapped)
+                .map(|id| (id, game.card(id).zone_timestamp)).collect()
+        } else { Vec::new() };
         let improvise_without_observers = !game.cards.iter().any(|c| matches!(c.zone, ZoneType::Battlefield | ZoneType::Command)
             && (!c.triggers.is_empty() || !c.replacement_effects.is_empty()));
         let mut total_unpaid = ManaCostBeingPaid::from_mana_cost(&payable_base_cost);
@@ -1931,7 +1936,13 @@ impl GameLoop {
                             let c = game.card(id);
                             c.zone == ZoneType::Battlefield && c.zone_timestamp == epoch && c.tapped
                         }));
-                    let mutated_reduction = card.has_keyword("Delve") || (card.has_keyword("Convoke") && (!sa.convoke_tapped.is_empty() || mana_payment.convoke_used))
+                    let safe_convoke = sa.convoke_tapped.is_empty() || (improvise_without_observers
+                        && mana_payment.independent_mana_effects
+                        && sa.convoke_tapped.iter().all(|id| convoke_untapped.iter().any(|&(original, epoch)| {
+                            original == *id && game.card(*id).zone == ZoneType::Battlefield
+                                && game.card(*id).zone_timestamp == epoch && game.card(*id).tapped
+                        })));
+                    let mutated_reduction = card.has_keyword("Delve") || !safe_convoke
                         || !safe_improvise || mana_payment.convoke_used || card.get_offering_type().is_some()
                         || sa.alt_cost == Some(crate::spellability::AlternativeCost::Emerge);
                     if !sa.is_spell || mutated_reduction || game.card_current_zone(card_id) != ZoneType::Stack {
@@ -1940,6 +1951,7 @@ impl GameLoop {
                     // Undo the pending cost without producing an untap event.
                     // Independent completed mana effects remain intact.
                     for (id, _) in improvise_selected { game.card_mut(id).tapped = false; }
+                    for &id in &sa.convoke_tapped { game.card_mut(id).tapped = false; }
                     if let Some(id) = pending_stack_id { game.stack.remove_by_id(id); }
                     let owner = game.card(card_id).owner;
                     // Returning an uncompleted flashback cast is a reversal,
