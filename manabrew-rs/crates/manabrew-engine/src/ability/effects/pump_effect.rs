@@ -149,6 +149,16 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
         keywords.push(format!("CanBlock:{amt}"));
     }
 
+    // Pump also carries bookkeeping-only nodes, e.g. Tainted Pact remembers
+    // the previous imprint before Cleanup clears it for the next library card.
+    // Resolve before mutation so RememberObjects$ Remembered is stable.
+    if let (Some(source), Some(defined)) = (sa.source, sa.ir.remember_objects.as_deref()) {
+        let (players, cards, _) =
+            crate::ability::ability_utils::get_defined_objects(defined, sa, ctx.game);
+        ctx.game.card_mut(source).add_remembered_cards(cards);
+        ctx.game.card_mut(source).add_remembered_players(players);
+    }
+
     let is_perpetual = sa.ir.perpetual_duration;
     let until_lose_control =
         sa.ir.duration == Some(crate::spellability::AbilityDuration::UntilLoseControlOfHost);

@@ -1790,6 +1790,14 @@ pub fn resolve_count_svar_for_sa(
             return resolve_svar_expression(chosen, game, source_id, controller, sa);
         }
     }
+    // Threshold checks the activating controller's graveyard at evaluation time.
+    // Like the other conditional counts, each operand may itself be an SVar.
+    if let Some(rest) = expr.strip_prefix("Count$Threshold.") {
+        if let Some((yes, no)) = rest.split_once('.') {
+            let chosen = if game.player_has_threshold(controller) { yes } else { no };
+            return resolve_svar_expression(chosen, game, source_id, controller, sa);
+        }
+    }
     if let Some(rest) = expr.strip_prefix("Count$Monarch.") {
         if let Some((yes, no)) = rest.split_once('.') {
             let chosen = if game.monarch == Some(controller) {

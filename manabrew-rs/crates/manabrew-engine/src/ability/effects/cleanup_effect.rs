@@ -11,6 +11,11 @@ use super::EffectContext;
 /// `CleanupEffect` class extending `SpellAbilityEffect`.
 #[manabrew_engine_macros::spell_effect(CleanupEffect)]
 fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
+    if sa.ir.clear_imprinted {
+        if let Some(source_id) = sa.source {
+            ctx.game.card_mut(source_id).clear_imprinted_cards();
+        }
+    }
     if sa.ir.clear_remembered {
         if let Some(source_id) = sa.source {
             ctx.game.card_mut(source_id).clear_remembered();
