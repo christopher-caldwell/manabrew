@@ -153,8 +153,12 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
     // the previous imprint before Cleanup clears it for the next library card.
     // Resolve before mutation so RememberObjects$ Remembered is stable.
     if let (Some(source), Some(defined)) = (sa.source, sa.ir.remember_objects.as_deref()) {
-        let (players, cards, _) =
-            crate::ability::ability_utils::get_defined_objects(defined, sa, ctx.game);
+        let cards = crate::ability::spell_ability_effect::resolve_defined_cards_for_sa(
+            ctx.game, sa, defined,
+        );
+        let players = crate::ability::ability_utils::resolve_defined_players_with_sa(
+            defined, sa, sa.activating_player, ctx.game,
+        );
         ctx.game.card_mut(source).add_remembered_cards(cards);
         ctx.game.card_mut(source).add_remembered_players(players);
     }
