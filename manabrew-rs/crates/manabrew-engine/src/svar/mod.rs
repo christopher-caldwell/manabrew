@@ -1528,6 +1528,20 @@ pub fn resolve_count_svar_for_sa(
         }
     }
     let (body, operators) = expr.split_once('/').unwrap_or((expr, ""));
+    if let Some(rest) = body.strip_prefix("Count$Revolt.") {
+        let mut values = rest.split('.');
+        if let (Some(if_true), Some(if_false), None) =
+            (values.next(), values.next(), values.next())
+        {
+            let selected = if game.player_has_revolt(controller) {
+                if_true
+            } else {
+                if_false
+            };
+            let value = resolve_svar_expression(selected, game, source_id, controller, sa);
+            return do_x_math(value, operators, game, source_id, controller, sa);
+        }
+    }
     // Void is global turn history: a nonland permanent left the battlefield,
     // or a spell was cast for its Warp cost. Its operands are amounts, not a
     // mana-value range. Resolve only the selected operand in the SA context.
