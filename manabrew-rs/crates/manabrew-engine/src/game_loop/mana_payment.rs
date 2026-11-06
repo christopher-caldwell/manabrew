@@ -794,10 +794,12 @@ fn independent_mana_draw_only(game: &GameState, source: CardId, ab: &ActivatedAb
         || !matches!(ab.cost.parts[0], crate::cost::CostPart::Tap) { return false; }
     match &ab.sub_ability {
         None => !game.cards.iter().filter(|c| matches!(c.zone, ZoneType::Battlefield | ZoneType::Command)).any(|c| {
-            !c.replacement_effects.is_empty() || c.triggers.iter().any(|t| !matches!(t.kind,
+            c.replacement_effects.iter().any(|r| r.event != crate::replacement::replacement_effect::ReplacementType::Counter) || c.triggers.iter().any(|t| !matches!(t.kind,
                 crate::trigger::TriggerType::ChangesZone | crate::trigger::TriggerType::Drawn | crate::trigger::TriggerType::SpellCast))
         }),
-        Some(key) => no_active_trigger_or_replacement(game) && game.card(source).svars.get(key).is_some_and(|raw| {
+        Some(key) => !game.cards.iter().any(|c| matches!(c.zone, ZoneType::Battlefield | ZoneType::Command)
+            && (!c.triggers.is_empty() || c.replacement_effects.iter().any(|r| r.event != crate::replacement::replacement_effect::ReplacementType::Counter)))
+            && game.card(source).svars.get(key).is_some_and(|raw| {
             let p = crate::parsing::Params::from_raw(raw);
             p.get("DB") == Some("Draw") && p.get("Defined") == Some("You")
                 && p.get("NumCards").is_some_and(|n| n.parse::<u32>().is_ok())
