@@ -794,8 +794,14 @@ fn independent_mana_draw_only(game: &GameState, source: CardId, ab: &ActivatedAb
         || !matches!(ab.cost.parts[0], crate::cost::CostPart::Tap) { return false; }
     match &ab.sub_ability {
         None => !game.cards.iter().filter(|c| matches!(c.zone, ZoneType::Battlefield | ZoneType::Command)).any(|c| {
-            c.replacement_effects.iter().any(|r| r.event != crate::replacement::replacement_effect::ReplacementType::Counter) || c.triggers.iter().any(|t| !matches!(t.kind,
-                crate::trigger::TriggerType::ChangesZone | crate::trigger::TriggerType::Drawn | crate::trigger::TriggerType::SpellCast))
+            c.replacement_effects.iter().any(|r| r.event != crate::replacement::replacement_effect::ReplacementType::Counter) || c.triggers.iter().any(|t| {
+                if matches!(t.kind, crate::trigger::TriggerType::ChangesZone | crate::trigger::TriggerType::Drawn | crate::trigger::TriggerType::SpellCast) { return false; }
+                if t.kind == crate::trigger::TriggerType::TapsForMana {
+                    let params = RunParams { card: Some(source), player: Some(game.card(source).controller), ..Default::default() };
+                    return t.mode.perform_test(t, &params, game);
+                }
+                true
+            })
         }),
         Some(key) => !game.cards.iter().any(|c| matches!(c.zone, ZoneType::Battlefield | ZoneType::Command)
             && (!c.triggers.is_empty() || c.replacement_effects.iter().any(|r| r.event != crate::replacement::replacement_effect::ReplacementType::Counter)))
