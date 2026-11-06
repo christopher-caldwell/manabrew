@@ -54,6 +54,11 @@ pub struct SimpleAi {
     last_tutor_sacrifice_state: Option<String>,
     known_tutor_targets: Option<HashSet<String>>,
     pending_voluntary_cast: Option<String>,
+    /// Double-faced cards seen on their front face with an entry ability.
+    /// An exile-and-return brings such a card back on that face.
+    front_face_entry: HashSet<String>,
+    /// Target chosen for a pending optional exile-and-return, by source card.
+    pending_reuse_target: Option<(String, String)>,
 }
 
 struct Combatant {
@@ -197,6 +202,94 @@ impl SimpleAi {
             })
             .sum::<i32>();
         power * 3 + toughness * 2 + card.cmc + keyword_value
+    }
+
+    /// The card's own entry trigger ("When ~ enters"), not "Whenever another ... enters".
+    fn has_entry_ability(text: &str) -> bool {
+        text.lines().any(|line| {
+            let line = line.trim().to_ascii_lowercase();
+            line.starts_with("when ") && line.contains(" enters")
+        })
+    }
+
+    /// Value of exiling one of the player's own permanents and returning it at
+    /// once. `None` when the re-entry gains nothing: a token (it ceases to
+    /// exist), an opponent's object, or a creature with no entry ability that
+    /// nothing on the stack threatens.
+    fn reentry_value(&self, card: &CardDto, player_id: &str) -> Option<i32> {
+        if card.identity.is_token || card.controller_id != player_id {
+            return None;
+        }
+        let threatened = self.view.as_ref().is_some_and(|view| {
+            view.stack.iter().filter(|item| item.controller_id != player_id).any(|item| {
+                let effect = item.source_ability_text.as_deref().filter(|s| !s.is_empty()).unwrap_or(&item.text).to_ascii_lowercase();
+                let destructive = ["destroy", "exile", "sacrifice", "damage", "return", "-x/-x", "-1/-1"].iter().any(|word| effect.contains(word));
+                let wide = ["all creature", "each creature", "all permanent", "each permanent", "each nonland"].iter().any(|word| effect.contains(word));
+                item.targets.iter().any(|target| target.id == card.id) || (destructive && wide)
+            })
+        });
+        let entry = Self::has_entry_ability(&card.text)
+            || (card.is_double_faced && card.is_transformed && self.front_face_entry.contains(&card.id));
+        if !entry && !threatened {
+            return None;
+        }
+        let mut value = 0;
+        if entry {
+            value += 100 + card.cmc * 10;
+        }
+        if threatened {
+            value += 200;
+        }
+        if card.is_attacking && !threatened {
+            value -= 150;
+        }
+        value -= card.counters.values().sum::<u32>() as i32 * 5;
+        if !card.attachment_ids.is_empty() {
+            value -= 20;
+        }
+        Some(value)
+    }
+
+    /// `{1}{B}`-style cost against the player's untapped sources.
+    fn cost_affordable(&self, cost: &str, player_id: &str) -> bool {
+        let (colors, any, total) = self.mana_sources(player_id);
+        let mut generic = 0;
+        let mut pips = [0i32; 5];
+        for symbol in cost.split('{').filter_map(|part| part.split('}').next()).filter(|s| !s.is_empty()) {
+            if let Ok(amount) = symbol.parse::<i32>() {
+                generic += amount;
+            } else if let Some(i) = "WUBRG".find(symbol) {
+                pips[i] += 1;
+            } else {
+                return false;
+            }
+        }
+        let short: i32 = (0..5).map(|i| (pips[i] - colors[i]).max(0)).sum();
+        generic + pips.iter().sum::<i32>() <= total && short <= any
+    }
+
+    /// Public-information finisher check: a spell making each player lose half
+    /// their life, with an opponent-life-loss doubler on the player's own turn,
+    /// that would leave every remaining opponent at 0 while the player survives.
+    fn mass_life_loss_wins(&self, card: &CardDto, player_id: &str) -> bool {
+        let text = card.text.to_ascii_lowercase();
+        if !text.contains("each player loses half their life") {
+            return false;
+        }
+        let Some(view) = self.view.as_ref() else { return false };
+        let doubled = view.active_player_id == player_id
+            && self.battlefield(player_id).any(|source| {
+                let text = source.text.to_ascii_lowercase();
+                text.contains("if an opponent would lose life during your turn") && text.contains("twice that much")
+            });
+        let half = |life: i32| (life.max(0) + 1) / 2;
+        let opponents: Vec<_> = view.players.iter()
+            .filter(|p| p.id != player_id && p.status == manabrew_protocol::game::PlayerStatus::Playing)
+            .collect();
+        let own = view.players.iter().find(|p| p.id == player_id).map_or(0, |p| p.life);
+        !opponents.is_empty()
+            && opponents.iter().all(|p| half(p.life) * if doubled { 2 } else { 1 } >= p.life)
+            && own - half(own) > 0
     }
 
     fn action_key(action: &AvailableAction) -> String {
@@ -451,7 +544,6 @@ impl SimpleAi {
         };
         let text = card.text.to_ascii_lowercase();
         let own_turn = view.active_player_id == player_id;
-        let stack_empty = view.stack.is_empty();
         let foreign_stack = view
             .stack
             .iter()
@@ -500,7 +592,7 @@ impl SimpleAi {
             return false;
         }
         if roles.contains(Roles::COMBAT_PUMP)
-            && stack_empty
+            && !foreign_stack
             && !card.types.iter().any(|ty| ty == "Creature")
             && !matches!(
                 view.step,
@@ -533,7 +625,8 @@ impl SimpleAi {
                 .iter()
                 .any(|k| k.eq_ignore_ascii_case("flash"))
                 && !card.types.iter().any(|ty| ty == "Creature"));
-        if instant && stack_empty {
+        // The player's own triggers on the stack are not a reason to respond.
+        if instant && !foreign_stack {
             let step = view.step;
             let quiet_own = own_turn && matches!(step, StepKind::Upkeep | StepKind::Draw);
             let quiet_theirs = !own_turn
@@ -643,6 +736,9 @@ impl SimpleAi {
                     250
                 };
                 score += Self::card_value(card) - card.cmc * 8;
+                if self.mass_life_loss_wins(card, player_id) {
+                    score += 5_000;
+                }
                 if self.card_zone(card_id) == Some(ZoneKind::Command) {
                     score += 160;
                 }
@@ -1401,6 +1497,9 @@ impl BotAgent for SimpleAi {
         for (zone_index, zone) in view.zones.iter().enumerate() {
             for (card_index, card) in zone.cards.iter().enumerate() {
                 if let CardView::Visible(card) = card {
+                    if card.is_double_faced && !card.is_transformed && Self::has_entry_ability(&card.text) {
+                        self.front_face_entry.insert(card.id.clone());
+                    }
                     self.card_locations
                         .insert(card.id.clone(), (zone_index, card_index));
                 }
@@ -1704,6 +1803,64 @@ impl BotAgent for SimpleAi {
                     TargetingIntent::Bounce => effect.starts_with("return ") || effect.starts_with("put target "),
                     _ => false,
                 };
+                let voluntary_cast = cancellable && prompt.source_card.as_ref()
+                    .is_some_and(|card| self.pending_voluntary_cast.as_deref() == Some(card.id.as_str()));
+                let required = (min_targets - chosen_targets).max(0) as usize;
+                let own_card = |target: &TargetRef| matches!(target.kind, TargetKind::Card)
+                    && self.card(&target.id).is_some_and(|card| card.controller_id == deciding_player_id);
+                // Exiling the player's own permanent and returning it at once is
+                // reuse, not removal: the engine labels it hostile `Exile`.
+                let self_reuse = matches!(intent, TargetingIntent::Exile)
+                    && effect.contains("return") && effect.contains("to the battlefield")
+                    && !candidates.is_empty() && candidates.iter().all(|target| own_card(target));
+                // "Destroy ... its controller creates two tokens that are copies":
+                // a self-copy effect, which hands opponents two copies if aimed at them.
+                let self_copy = matches!(intent, TargetingIntent::Destroy)
+                    && effect.contains("creates two tokens that are copies");
+                if self_reuse || self_copy {
+                    let mut scored: Vec<_> = candidates.iter().map(|target| {
+                        let card = self.card(&target.id);
+                        let value = card.and_then(|card| self.reentry_value(card, &deciding_player_id));
+                        (value, -card.map_or(0, Self::card_value), target.clone())
+                    }).collect();
+                    scored.sort_by_key(|(value, low, _)| std::cmp::Reverse((value.unwrap_or(i32::MIN), *low)));
+                    let useful = scored.iter().filter(|(value, _, _)| value.is_some_and(|v| v > 0)).count();
+                    if useful == 0 && voluntary_cast {
+                        self.pending_voluntary_cast = None;
+                        return Some(PromptOutput::ChooseBoardTargets(ChooseBoardTargetsOutput::Cancel));
+                    }
+                    if self_reuse || useful > 0 {
+                        let chosen: Vec<_> = scored.into_iter().take(take.min(useful).max(required))
+                            .map(|(_, _, target)| target).collect();
+                        if self_reuse {
+                            self.pending_reuse_target = chosen.first().map(|target| (prompt_source_id.clone(), target.id.clone()));
+                        }
+                        return Some(PromptOutput::ChooseBoardTargets(ChooseBoardTargetsOutput::BoardTargets { chosen }));
+                    }
+                }
+                // Reanimation Auras have no API and arrive labeled hostile; value the
+                // returned creature for its new controller, whoever owns the card.
+                if prompt_card_text.contains("enchant creature card in a graveyard")
+                    && candidates.iter().any(|target| matches!(target.kind, TargetKind::Card)) {
+                    let tribes: Vec<String> = self.battlefield(&deciding_player_id).filter_map(|card| {
+                        let text = card.text.to_ascii_lowercase();
+                        let rest = text.split("whenever another ").nth(1)?;
+                        let tribe = rest.split(" you control enters").next()?;
+                        (!tribe.contains(' ') && tribe != "creature").then(|| tribe.to_string())
+                    }).collect();
+                    let mut scored: Vec<_> = candidates.iter().map(|target| {
+                        let score = self.card(&target.id).map_or(i32::MIN, |card| {
+                            let tribal = card.subtypes.iter().any(|t| tribes.iter().any(|tribe| t.eq_ignore_ascii_case(tribe)));
+                            Self::card_value(card) + if tribal { 25 } else { 0 }
+                                + if card.owner_id == deciding_player_id { 2 } else { 0 }
+                        });
+                        (score, target.clone())
+                    }).collect();
+                    scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+                    return Some(PromptOutput::ChooseBoardTargets(ChooseBoardTargetsOutput::BoardTargets {
+                        chosen: scored.into_iter().take(take).map(|(_, target)| target).collect(),
+                    }));
+                }
                 if voluntary && direct_answer {
                     candidates.retain(|target| {
                         let own_spell = matches!(intent, TargetingIntent::Counter) && matches!(target.kind,TargetKind::Spell)
@@ -1871,7 +2028,37 @@ impl BotAgent for SimpleAi {
                     && (matches!(title.as_str(), "remove counter for mana" | "exile for mana" | "sacrifice for mana")
                         || (title.starts_with("pay cost for ") && self.selected_mana_source.as_deref() == Some(prompt_source_id.as_str()))
                         || ((title == "pay life for mana" || (title.starts_with("pay ") && title.contains("{life}"))) && safe_life_payment));
-                let value = always_accept || mana_cost_confirmation || useful_single_draw || useful_hand_refill || refill_cost || combo_cost || safe_copy_kicker || pay_single_draw_tax || (accept_once && !repeated);
+                // Optional exile-and-return: accept only when its chosen target gains
+                // from re-entry (an entry ability, or escaping a threat on the stack).
+                let useful_reuse = title.contains("you may exile") && title.contains("return") && title.contains("battlefield") && {
+                    let staged = self.view.as_ref().and_then(|view| view.stack.iter().rev()
+                        .find(|item| item.source_id == prompt_source_id)
+                        .and_then(|item| item.targets.iter().find(|target| matches!(target.kind, TargetKind::Card)))
+                        .map(|target| target.id.clone()));
+                    let remembered = self.pending_reuse_target.as_ref()
+                        .filter(|(source, _)| source == &prompt_source_id).map(|(_, target)| target.clone());
+                    staged.or(remembered).and_then(|id| self.card(&id))
+                        .and_then(|card| self.reentry_value(card, &deciding_player_id))
+                        .is_some_and(|value| value > 0)
+                };
+                // "That player may pay {1}{B}. If the player does, untap that creature":
+                // pay on the player's own turn when the enchanted creature is tapped and
+                // the cost is affordable.
+                let useful_untap = title.contains("may pay") && title.contains("untap that creature")
+                    && self.view.as_ref().is_some_and(|view| view.active_player_id == deciding_player_id)
+                    && self.card(&prompt_source_id).and_then(|source| source.attached_to.clone())
+                        .and_then(|id| self.card(&id))
+                        .is_some_and(|creature| creature.tapped && creature.controller_id == deciding_player_id)
+                    && presentation.title.split("may pay ").nth(1).and_then(|rest| rest.split('.').next())
+                        .is_some_and(|cost| self.cost_affordable(cost, &deciding_player_id));
+                // Returning the player's own card from their graveyard, at no other cost.
+                let useful_recursion = title.contains("you may return target") && title.contains("from your graveyard")
+                    && !["pay", "sacrifice", "discard", "exile", "lose"].iter().any(|word| title.contains(word));
+                if useful_reuse || title.contains("you may exile") {
+                    self.pending_reuse_target = None;
+                }
+                let value = always_accept || mana_cost_confirmation || useful_single_draw || useful_hand_refill || refill_cost || combo_cost || safe_copy_kicker || pay_single_draw_tax || (accept_once && !repeated)
+                    || ((useful_reuse || useful_untap || useful_recursion) && !repeated);
                 if useful_hand_refill && prompt_source_id != "none" {
                     self.pending_hand_refill_source = Some(prompt_source_id.clone());
                 }
@@ -2892,5 +3079,220 @@ mod tribal_will_policy_regression {
         assert_eq!(choose("Akroma's Will","Choose Mode",&modes,1,view("Angel",false)),vec![0]);
         assert_eq!(choose("Akroma's Will","Choose Mode",&modes,2,view("Angel",true)),vec![0]);
         assert_eq!(choose("Other","Choose Mode",&modes,2,view("Angel",false)),vec![0]);
+    }
+}
+
+/// Execution-audit policy regressions (Collection Plan DEV-060, DEV-062 and
+/// DEV-063): each rule has positive and contrary controls.
+#[cfg(test)]
+mod execution_audit_policy {
+    use super::SimpleAi;
+    use crate::agent::BotAgent;
+    use manabrew_protocol::game::{CardDto, CardView, GameViewDto, PlayerDto, StackObjectDto, StepKind, ZoneDto, ZoneKind};
+    use manabrew_protocol::transport::AgentPrompt;
+    use serde_json::{json, Value};
+
+    fn player(id: usize, life: i32) -> PlayerDto {
+        serde_json::from_value(json!({"id":format!("player-{id}"),"name":"p","status":"playing","isHuman":false,"life":life,"counters":{},"manaPool":{},"commanderDamage":{},"hasCityBlessing":false,"hasEnduringStory":false,"ringLevel":0,"speed":0})).unwrap()
+    }
+    fn creature(id: &str, controller: usize, pt: (i32, i32), cmc: i32, text: &str) -> CardDto {
+        CardDto { id: id.into(), controller_id: format!("player-{controller}"), owner_id: format!("player-{controller}"), types: vec!["Creature".into()],
+            power: Some(pt.0.to_string()), toughness: Some(pt.1.to_string()), cmc, text: text.into(), ..Default::default() }
+    }
+    fn land(id: &str, controller: usize, subtype: &str) -> CardDto {
+        CardDto { id: id.into(), controller_id: format!("player-{controller}"), owner_id: format!("player-{controller}"), types: vec!["Land".into()], subtypes: vec![subtype.into()], ..Default::default() }
+    }
+    fn view(active: usize, step: StepKind, zones: Vec<(ZoneKind, usize, Vec<CardDto>)>) -> GameViewDto {
+        let mut view = GameViewDto::default();
+        view.active_player_id = format!("player-{active}");
+        view.step = step;
+        for i in 0..4 { view.players.push(player(i, 40)); }
+        for (zone, owner, cards) in zones {
+            view.zones.push(ZoneDto { zone, owner_id: format!("player-{owner}"), count: cards.len(), cards: cards.into_iter().map(CardView::Visible).collect() });
+        }
+        view
+    }
+    fn targets(bot: &mut SimpleAi, source: &str, text: &str, intent: &str, ids: &[&str], min: i32, cancellable: bool) -> Value {
+        let candidates: Vec<_> = ids.iter().map(|id| json!({"id":id,"kind":"card"})).collect();
+        let prompt: AgentPrompt = serde_json::from_value(json!({"promptId":1,"decidingPlayerId":"player-0","sourceCard":{"id":source,"text":text},
+            "sourceAbilityText":text,"input":{"type":"chooseBoardTargets","presentation":{"title":"Exile","targets":[]},"candidates":candidates,
+            "hostile":true,"intent":intent,"minTargets":min,"maxTargets":1,"chosenTargets":0,"cancellable":cancellable}})).unwrap();
+        serde_json::to_value(bot.decide(prompt).unwrap()).unwrap()["output"].clone()
+    }
+    fn confirm(bot: &mut SimpleAi, source: &str, title: &str) -> bool {
+        let prompt: AgentPrompt = serde_json::from_value(json!({"promptId":2,"decidingPlayerId":"player-0","sourceCard":{"id":source},
+            "input":{"type":"chooseBoolean","confirmLabel":"Accept","denyLabel":"Decline","presentation":{"title":title,"targets":[]}}})).unwrap();
+        serde_json::to_value(bot.decide(prompt).unwrap()).unwrap()["output"]["value"].as_bool().unwrap()
+    }
+    const BLINK: &str = "Exile target creature you control, then return that card to the battlefield under its owner's control.";
+    const ANGEL: &str = "When CARDNAME enters, you may exile target non-Angel creature you control, then return that creature to the battlefield under your control.";
+    const AANG: &str = "Flying\nWhen Aang enters, look at the top five cards of your library.";
+
+    fn board() -> Vec<CardDto> {
+        let mut token = creature("card-3", 0, (1, 1), 0, "When this creature enters, draw a card.");
+        token.identity.is_token = true;
+        vec![creature("card-1", 0, (3, 3), 5, AANG), creature("card-2", 0, (0, 1), 1, "{T}: Add {W}."), token]
+    }
+
+    #[test]
+    fn reuse_targets_the_best_entry_creature_and_skips_tokens() {
+        let mut bot = SimpleAi::default();
+        bot.observe(view(0, StepKind::Main1, vec![(ZoneKind::Battlefield, 0, board())]));
+        assert_eq!(targets(&mut bot, "card-9", BLINK, "exile", &["card-2", "card-3", "card-1"], 1, false)["chosen"][0]["id"], "card-1");
+        // No useful target: a voluntary blink spell is not wasted; a mandatory target stays harmless.
+        let mut bot = SimpleAi::default();
+        bot.observe(view(0, StepKind::Main1, vec![(ZoneKind::Battlefield, 0, board()[1..].to_vec())]));
+        bot.pending_voluntary_cast = Some("card-9".into());
+        assert_eq!(targets(&mut bot, "card-9", BLINK, "exile", &["card-2", "card-3"], 1, true)["type"], "cancel");
+        bot.pending_voluntary_cast = None;
+        assert_eq!(targets(&mut bot, "card-9", BLINK, "exile", &["card-2", "card-3"], 1, false)["chosen"][0]["id"], "card-2");
+        // "Up to one": no useful target means no target.
+        assert_eq!(targets(&mut bot, "card-9", BLINK, "exile", &["card-2", "card-3"], 0, false)["chosen"], json!([]));
+    }
+
+    #[test]
+    fn optional_reuse_is_accepted_only_for_a_useful_target() {
+        for (target, attacking, threat, expected) in [("card-1", false, false, true), ("card-3", false, false, false), ("card-2", false, false, false),
+            ("card-1", true, false, false), ("card-2", false, true, true)] {
+            let mut cards = board();
+            cards[0].is_attacking = attacking;
+            let mut view = view(0, StepKind::Main1, vec![(ZoneKind::Battlefield, 0, cards)]);
+            view.stack.push(StackObjectDto { id: "stack-1".into(), source_id: "card-8".into(), controller_id: "player-0".into(),
+                targets: serde_json::from_value(json!([{"id":target,"kind":"card"}])).unwrap(), ..Default::default() });
+            if threat {
+                view.stack.push(StackObjectDto { id: "stack-2".into(), source_id: "card-20".into(), controller_id: "player-1".into(),
+                    text: "Destroy target creature.".into(), targets: serde_json::from_value(json!([{"id":target,"kind":"card"}])).unwrap(), ..Default::default() });
+            }
+            let mut bot = SimpleAi::default();
+            bot.observe(view);
+            assert_eq!(confirm(&mut bot, "card-8", ANGEL), expected, "target {target} attacking {attacking} threat {threat}");
+        }
+        // Without a visible stack target, the remembered chosen target decides.
+        let mut bot = SimpleAi::default();
+        bot.observe(view(0, StepKind::EndOfTurn, vec![(ZoneKind::Battlefield, 0, board())]));
+        targets(&mut bot, "card-8", BLINK, "exile", &["card-1", "card-2"], 1, false);
+        assert!(confirm(&mut bot, "card-8", "At the beginning of your end step, you may exile another target creature you control, then return it to the battlefield under its owner's control."));
+    }
+
+    #[test]
+    fn transformed_front_face_entry_is_remembered() {
+        let mut bot = SimpleAi::default();
+        let mut aang = board()[0].clone();
+        aang.is_double_faced = true;
+        bot.observe(view(0, StepKind::Main1, vec![(ZoneKind::Battlefield, 0, vec![aang.clone()])]));
+        aang.is_transformed = true;
+        aang.text = "Flying\nLand creatures you control have vigilance.".into();
+        bot.observe(view(0, StepKind::Main1, vec![(ZoneKind::Battlefield, 0, vec![aang, board()[1].clone()])]));
+        assert_eq!(targets(&mut bot, "card-9", BLINK, "exile", &["card-2", "card-1"], 1, false)["chosen"][0]["id"], "card-1");
+    }
+
+    #[test]
+    fn untap_payment_requires_own_turn_tapped_creature_and_mana() {
+        const DANCE: &str = "At the beginning of the upkeep of enchanted creature's controller, that player may pay {1}{B}. If the player does, untap that creature.";
+        for (active, tapped, lands, expected) in [(0, true, vec!["Swamp", "Swamp"], true), (1, true, vec!["Swamp", "Swamp"], false),
+            (0, false, vec!["Swamp", "Swamp"], false), (0, true, vec!["Swamp"], false), (0, true, vec!["Plains", "Plains"], false)] {
+            let mut dance = CardDto { id: "card-10".into(), controller_id: "player-0".into(), types: vec!["Enchantment".into()], attached_to: Some("card-11".into()), ..Default::default() };
+            dance.subtypes = vec!["Aura".into()];
+            let mut demon = creature("card-11", 0, (6, 6), 6, "Flying");
+            demon.tapped = tapped;
+            let mut cards = vec![dance, demon];
+            cards.extend(lands.iter().enumerate().map(|(i, subtype)| land(&format!("card-{}", 20 + i), 0, subtype)));
+            let mut bot = SimpleAi::default();
+            bot.observe(view(active, StepKind::Upkeep, vec![(ZoneKind::Battlefield, 0, cards)]));
+            assert_eq!(confirm(&mut bot, "card-10", DANCE), expected, "active {active} tapped {tapped} lands {lands:?}");
+        }
+    }
+
+    #[test]
+    fn own_graveyard_return_is_accepted_without_an_extra_cost() {
+        let mut bot = SimpleAi::default();
+        bot.observe(view(0, StepKind::Main1, vec![]));
+        assert!(confirm(&mut bot, "card-5", "Landfall — Whenever a land you control enters, you may return target nonland permanent card from your graveyard to your hand."));
+        assert!(!confirm(&mut bot, "card-6", "At the beginning of your upkeep, you may pay 2 life. If you do, you may return target creature card from your graveyard to your hand."));
+    }
+
+    #[test]
+    fn reanimation_auras_value_the_creature_for_its_new_controller() {
+        let aura = "Enchant creature card in a graveyard\nWhen Animate Dead enters, return enchanted creature card to the battlefield under your control.";
+        let mut razaketh = creature("card-30", 0, (8, 8), 7, "Flying, trample");
+        razaketh.keywords = vec!["Flying".into(), "Trample".into()];
+        let mut ruins = creature("card-31", 1, (5, 7), 7, "Flying");
+        ruins.keywords = vec!["Flying".into()];
+        let mut bot = SimpleAi::default();
+        bot.observe(view(0, StepKind::Main1, vec![(ZoneKind::Graveyard, 0, vec![razaketh]), (ZoneKind::Graveyard, 1, vec![ruins.clone()])]));
+        assert_eq!(targets(&mut bot, "card-40", aura, "hostile", &["card-31", "card-30"], 1, true)["chosen"][0]["id"], "card-30");
+        // A stronger opponent creature is still worth stealing.
+        let mut lyra = creature("card-32", 1, (5, 5), 5, "Flying, first strike, lifelink");
+        lyra.keywords = vec!["Flying".into(), "First strike".into(), "Lifelink".into()];
+        let mut shepherd = creature("card-33", 0, (4, 4), 4, "Flying");
+        shepherd.keywords = vec!["Flying".into()];
+        let mut bot = SimpleAi::default();
+        bot.observe(view(0, StepKind::Main1, vec![(ZoneKind::Graveyard, 0, vec![shepherd.clone()]), (ZoneKind::Graveyard, 1, vec![lyra])]));
+        assert_eq!(targets(&mut bot, "card-40", aura, "hostile", &["card-33", "card-32"], 1, true)["chosen"][0]["id"], "card-32");
+        // A tribal entry payoff tips a close choice toward the matching creature.
+        let mut demon = shepherd.clone();
+        demon.subtypes = vec!["Demon".into()];
+        let mut flier = creature("card-34", 1, (4, 5), 4, "Flying");
+        flier.keywords = vec!["Flying".into()];
+        let payoff = creature("card-35", 0, (6, 5), 6, "Whenever another Demon you control enters, it deals damage equal to its power to any target.");
+        let mut bot = SimpleAi::default();
+        bot.observe(view(0, StepKind::Main1, vec![(ZoneKind::Battlefield, 0, vec![payoff]), (ZoneKind::Graveyard, 0, vec![demon]), (ZoneKind::Graveyard, 1, vec![flier])]));
+        assert_eq!(targets(&mut bot, "card-40", aura, "hostile", &["card-34", "card-33"], 1, true)["chosen"][0]["id"], "card-33");
+    }
+
+    #[test]
+    fn self_copy_destroy_targets_own_entry_creature_or_is_not_cast() {
+        let saw = "Destroy target creature. If that creature dies this way, its controller creates two tokens that are copies of that creature, except their base power is half that creature's power.";
+        let own = creature("card-50", 0, (6, 5), 6, "Flying\nWhen Be'lakor enters, you draw X cards and you lose X life.");
+        let enemy = creature("card-51", 1, (4, 4), 4, "When Fire Lord Azula enters, deal damage.");
+        let mut bot = SimpleAi::default();
+        bot.observe(view(0, StepKind::Main1, vec![(ZoneKind::Battlefield, 0, vec![own]), (ZoneKind::Battlefield, 1, vec![enemy.clone()])]));
+        bot.pending_voluntary_cast = Some("card-52".into());
+        assert_eq!(targets(&mut bot, "card-52", saw, "destroy", &["card-51", "card-50"], 1, true)["chosen"][0]["id"], "card-50");
+        let mut bot = SimpleAi::default();
+        bot.observe(view(0, StepKind::Main1, vec![(ZoneKind::Battlefield, 1, vec![enemy])]));
+        bot.pending_voluntary_cast = Some("card-52".into());
+        assert_eq!(targets(&mut bot, "card-52", saw, "destroy", &["card-51"], 1, true)["type"], "cancel");
+    }
+
+    fn act(bot: &mut SimpleAi, actions: Value) -> Value {
+        let prompt: AgentPrompt = serde_json::from_value(json!({"promptId":3,"decidingPlayerId":"player-0","input":{"type":"chooseAction","actions":actions}})).unwrap();
+        serde_json::to_value(bot.decide(prompt).unwrap()).unwrap()["output"].clone()
+    }
+
+    #[test]
+    fn instants_are_not_cast_in_response_to_the_players_own_upkeep_trigger() {
+        for (foreign, expected) in [(false, "pass"), (true, "act")] {
+            let will = CardDto { id: "card-60".into(), controller_id: "player-0".into(), types: vec!["Instant".into()], mana_cost: "{2}{W}".into(), cmc: 3,
+                text: "Choose one. Creatures you control gain flying, vigilance and double strike until end of turn.".into(), ..Default::default() };
+            let lands: Vec<_> = (0..3).map(|i| land(&format!("card-{}", 61 + i), 0, "Plains")).collect();
+            let mut view = view(0, StepKind::Upkeep, vec![(ZoneKind::Battlefield, 0, lands), (ZoneKind::Hand, 0, vec![will])]);
+            view.stack.push(StackObjectDto { id: "stack-1".into(), controller_id: if foreign { "player-1" } else { "player-0" }.into(),
+                text: "At the beginning of your upkeep, lose 1 life.".into(), ..Default::default() });
+            let mut bot = SimpleAi::default();
+            bot.observe(view);
+            assert_eq!(act(&mut bot, json!([{"type":"cast","id":"cast:card-60:normal","cardId":"card-60","mode":{"type":"normal"},"label":"Cast normally"}]))["type"], expected);
+        }
+    }
+
+    #[test]
+    fn a_lethal_mass_life_loss_spell_outranks_development() {
+        let fraying = CardDto { id: "card-70".into(), controller_id: "player-0".into(), types: vec!["Sorcery".into()], mana_cost: "{4}{B}{B}".into(), cmc: 6,
+            text: "Each player loses half their life, rounded up. Then each player sacrifices half the creatures they control, rounded up.".into(), ..Default::default() };
+        let bowmasters = CardDto { id: "card-71".into(), controller_id: "player-0".into(), types: vec!["Creature".into()], mana_cost: "{1}{B}".into(), cmc: 2,
+            power: Some("1".into()), toughness: Some("1".into()), text: "Flash".into(), ..Default::default() };
+        let bloodletter = creature("card-72", 0, (2, 4), 4, "Flying\nIf an opponent would lose life during your turn, they lose twice that much life instead.");
+        for (doubler, lives, expected) in [(true, [33, 40, 25, 40], "cast:card-70:normal"), (false, [33, 40, 25, 40], "cast:card-71:normal"),
+            (false, [33, 1, 1, 1], "cast:card-70:normal"), (false, [33, 2, 1, 1], "cast:card-71:normal"), (true, [1, 40, 25, 40], "cast:card-71:normal")] {
+            let mut battlefield: Vec<_> = (0..6).map(|i| land(&format!("card-{}", 80 + i), 0, "Swamp")).collect();
+            if doubler { battlefield.push(bloodletter.clone()); }
+            let mut view = view(0, StepKind::Main1, vec![(ZoneKind::Battlefield, 0, battlefield), (ZoneKind::Hand, 0, vec![fraying.clone(), bowmasters.clone()])]);
+            for (player, life) in view.players.iter_mut().zip(lives) { player.life = life; }
+            let mut bot = SimpleAi::default();
+            bot.observe(view);
+            let actions = json!([{"type":"cast","id":"cast:card-70:normal","cardId":"card-70","mode":{"type":"normal"},"label":"Cast normally"},
+                {"type":"cast","id":"cast:card-71:normal","cardId":"card-71","mode":{"type":"normal"},"label":"Cast normally"}]);
+            assert_eq!(act(&mut bot, actions)["actionId"], expected, "doubler {doubler} lives {lives:?}");
+        }
     }
 }
