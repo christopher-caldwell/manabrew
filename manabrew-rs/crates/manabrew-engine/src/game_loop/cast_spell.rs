@@ -2411,6 +2411,9 @@ impl GameLoop {
         }
 
         {
+            if is_warp {
+                game.void_turn = Some(game.turn.turn_number);
+            }
             game.player_record_spell_cast(player, card_id);
         }
         // Track spell cast on the stack (storm count, etc.)
@@ -2797,6 +2800,34 @@ mod actual_mana_spend_regression {
     use crate::combat::DefenderId;
     use crate::mana::ManaPool;
     use forge_carddb::parse_card_script;
+
+    #[test]
+    fn void_records_only_successful_warp_casts_and_survives_stack_departure() {
+        std::thread::Builder::new().stack_size(32 * 1024 * 1024).spawn(|| {
+            for (warp, cost, accepted) in [(false, "0", true), (true, "0", true), (true, "1", false)] {
+                let mut game = GameState::new(&["A", "B", "C", "D"], 40);
+                let player = PlayerId(2);
+                let rules = parse_card_script(&format!(
+                    "Name:Warp fixture\nManaCost:0\nTypes:Creature - Elf\nPT:1/1\nK:Warp:{cost}"
+                )).unwrap();
+                let id = game.create_card(Card::from_rules(&rules, player));
+                game.move_card(id, ZoneType::Hand, player);
+                let mut sa = crate::spellability::build_spell_ability(
+                    &game, id, "SP$ Permanent", player,
+                );
+                if warp { sa.alt_cost = Some(crate::spellability::AlternativeCost::Warp); }
+                let mut agents: Vec<Box<dyn PlayerAgent>> = (0..4)
+                    .map(|_| Box::new(AutoAgent(true, false)) as Box<dyn PlayerAgent>).collect();
+                let mut driver = GameLoop::new(4);
+                assert_eq!(driver.cast_card_spell_ability(&mut game, &mut agents, player, sa, false).is_some(), accepted);
+                assert_eq!(game.void_turn == Some(game.turn.turn_number), warp && accepted);
+                if accepted { game.move_card(id, ZoneType::Exile, player); }
+                assert_eq!(game.void_turn == Some(game.turn.turn_number), warp && accepted);
+                game.turn.turn_number += 1;
+                assert_ne!(game.void_turn, Some(game.turn.turn_number));
+            }
+        }).unwrap().join().unwrap();
+    }
     thread_local! { static TARGET_SELECTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
                     static CANCEL_MANA: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
                     static TAP_BEFORE_FAILURE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };

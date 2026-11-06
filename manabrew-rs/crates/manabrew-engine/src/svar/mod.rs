@@ -1528,6 +1528,23 @@ pub fn resolve_count_svar_for_sa(
         }
     }
     let (body, operators) = expr.split_once('/').unwrap_or((expr, ""));
+    // Void is global turn history: a nonland permanent left the battlefield,
+    // or a spell was cast for its Warp cost. Its operands are amounts, not a
+    // mana-value range. Resolve only the selected operand in the SA context.
+    if let Some(rest) = body.strip_prefix("Count$Void.") {
+        let mut values = rest.split('.');
+        if let (Some(if_true), Some(if_false), None) =
+            (values.next(), values.next(), values.next())
+        {
+            let selected = if game.void_turn == Some(game.turn.turn_number) {
+                if_true
+            } else {
+                if_false
+            };
+            let value = resolve_svar_expression(selected, game, source_id, controller, sa);
+            return do_x_math(value, operators, game, source_id, controller, sa);
+        }
+    }
     if let Some(rest) = body.strip_prefix("Count$Morbid.") {
         let mut values = rest.split('.');
         if let (Some(if_true), Some(if_false), None) =
@@ -1559,6 +1576,38 @@ pub fn resolve_count_svar_for_sa(
     };
     if let Some(count) = count {
         return do_x_math(count, operators, game, source_id, controller, sa);
+    }
+
+    if let Some(valid) = body.strip_prefix("Count$MostProminentCreatureType ") {
+        use crate::card::valid_filter::{matches_valid_card_selector_with_context, MatchContext};
+        let selector = crate::parsing::cached_compiled_selector(valid);
+        let context = MatchContext::from_source(game.card(source_id))
+            .with_game(game)
+            .with_spell_ability(sa)
+            .with_source_controller(controller);
+        let mut counts = std::collections::HashMap::new();
+        let mut changelings = 0;
+        for card in &game.cards {
+            if card.zone != ZoneType::Battlefield || card.phased_out
+                || !matches_valid_card_selector_with_context(&selector, card, context)
+            {
+                continue;
+            }
+            if card.has_keyword("Changeling") {
+                changelings += 1;
+                continue;
+            }
+            // A multitype card contributes once to each creature subtype;
+            // unrelated subtypes such as Forest or Equipment never count.
+            let mut seen = std::collections::HashSet::new();
+            for subtype in &card.type_line.subtypes {
+                if crate::game::TypeRegistry::is_creature_type(subtype) && seen.insert(subtype) {
+                    *counts.entry(subtype.as_str()).or_insert(0) += 1;
+                }
+            }
+        }
+        let value = counts.values().copied().max().unwrap_or(0) + changelings;
+        return do_x_math(value, operators, game, source_id, controller, sa);
     }
 
     // MostCardName counts the largest same-name group among matching, present

@@ -373,6 +373,9 @@ impl GameState {
         }
         if host_left_battlefield && was_permanent {
             self.player_record_permanent_left_battlefield(src_owner);
+            if !was_land {
+                self.void_turn = Some(self.turn.turn_number);
+            }
         }
         if host_left_battlefield {
             if self.card(card_id).is_room() {

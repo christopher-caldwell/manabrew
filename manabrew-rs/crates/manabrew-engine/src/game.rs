@@ -153,6 +153,11 @@ pub struct GameState {
     #[serde(default)]
     pub creature_died_turn: Option<u32>,
 
+    /// Most recent turn with a nonland battlefield departure or a Warp cast.
+    /// Record the event, rather than inspecting mutable cards later (Void).
+    #[serde(default)]
+    pub void_turn: Option<u32>,
+
     // Player order (for turn sequence)
     pub player_order: Vec<PlayerId>,
 
@@ -263,6 +268,7 @@ impl GameState {
             day_night_started: false,
             turn: TurnState::new(player_order[0], player_order.len() as u32),
             creature_died_turn: None,
+            void_turn: None,
             player_order,
             game_over: false,
             winner: None,
