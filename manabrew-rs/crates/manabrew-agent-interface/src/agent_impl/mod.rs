@@ -30,6 +30,8 @@ mod combat;
 mod costs;
 mod library;
 mod targeting;
+mod turn_control;
+pub use turn_control::TurnControlResponder;
 
 /// Match a mana symbol letter (e.g. "U") or a full color name (e.g. "Blue")
 /// against a list of color strings.  Handles the Blue/U mismatch where the
@@ -72,6 +74,9 @@ pub(crate) fn parse_express_mana_choice(color: Option<&str>) -> Option<u16> {
 /// Answers the prompts a `PromptAgent` builds.
 ///
 pub trait Responder {
+    /// The seat whose legal actions/resources this decision uses, which may
+    /// differ from the responder's owner during player control.
+    fn decision_player(&mut self, _player: PlayerId) {}
     fn observe_engine(&mut self, _game: &GameState, _mana_pools: &[ManaPool]) {}
     fn notify_engine(&mut self, _event: &GameNotification) {}
     fn respond(&mut self, prompt: AgentPrompt) -> ClientToServerMessage;
