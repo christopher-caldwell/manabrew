@@ -1480,6 +1480,7 @@ fn legacy_matches_card_atom(raw: &str, card: &Card, context: MatchContext<'_>) -
         "colorlesssource" => card.color.is_colorless(),
         "chosencolorsource" => matches_chosen_color_source(card, context),
         "attacking" => matches_context_predicate(&ContextPredicate::Attacking(None), card, context),
+        "attackingyouoryourpwlki" => card.attacking_player == Some(context.source_controller),
         "attackingyou" => matches_context_predicate(
             &ContextPredicate::Attacking(Some(TargetRef::Source)),
             card,
@@ -2195,6 +2196,7 @@ fn matches_type_and_qualifier_parts(
                 }
                 "attacking"
                 | "attackingyou"
+                | "attackingyouoryourpwlki"
                 | "chosencolorsource"
                 | "blocking"
                 | "blocked"

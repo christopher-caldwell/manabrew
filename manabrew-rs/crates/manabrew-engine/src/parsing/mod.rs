@@ -1081,7 +1081,7 @@ fn lower_selector_part(value: &str, is_first_part: bool) -> SelectorPredicate {
         "colorlesssource" => SelectorPredicate::SourceColorless,
         "chosencolorsource" => SelectorPredicate::ChosenColorSource,
         "attacking" => SelectorPredicate::Context(ContextPredicate::Attacking(None)),
-        "attackingyou" => {
+        "attackingyou" | "attackingyouoryourpwlki" => {
             SelectorPredicate::Context(ContextPredicate::Attacking(Some(TargetRef::Source)))
         }
         "blocking" => SelectorPredicate::Context(ContextPredicate::Blocking(None)),

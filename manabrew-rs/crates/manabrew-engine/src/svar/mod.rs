@@ -2011,7 +2011,7 @@ pub fn resolve_count_svar_for_sa(
         let restrictions = parts.next().unwrap_or("").trim();
         let (restrictions, aggregator) = restrictions.split_once('$').unwrap_or((restrictions, ""));
         if !restrictions.is_empty() {
-            let zones: Vec<ZoneType> = if zone_part.is_empty() {
+            let zones: Vec<ZoneType> = if zone_part.is_empty() || zone_part.eq_ignore_ascii_case("All") {
                 vec![ZoneType::Battlefield]
             } else {
                 zone_part
@@ -2149,32 +2149,38 @@ pub fn resolve_count_svar_for_sa(
         }
     }
 
-    // Count$Devotion.COLOR — count mana symbols of a color among permanents you control.
-    if let Some(color_str) = expr.strip_prefix("Count$Devotion.") {
-        let selected = if color_str.eq_ignore_ascii_case("Chosen") {
-            game.card(source_id).chosen_colors.first().map(String::as_str).unwrap_or("")
-        } else { color_str };
-        let color_mask: u16 = match selected.to_uppercase().as_str() {
-            "W" | "WHITE" => forge_foundation::ManaAtom::WHITE,
-            "U" | "BLUE" => forge_foundation::ManaAtom::BLUE,
-            "B" | "BLACK" => forge_foundation::ManaAtom::BLACK,
-            "R" | "RED" => forge_foundation::ManaAtom::RED,
-            "G" | "GREEN" => forge_foundation::ManaAtom::GREEN,
-            _ => 0,
-        };
-        if color_mask != 0 {
-            let battlefield = game.cards_in_zone(ZoneType::Battlefield, controller);
-            let mut count = 0i32;
-            for &cid in battlefield {
-                let card = game.card(cid);
-                if card.phased_out { continue; }
-                for shard in card.mana_cost.shards() {
-                    if (shard.shard() & color_mask) != 0 {
-                        count += 1;
-                    }
-                }
+    // A hybrid symbol contributes once to devotion to either of two colors.
+    let devotion = expr.strip_prefix("Count$DevotionDual.").map(|s| (s, true))
+        .or_else(|| expr.strip_prefix("Count$Devotion.").map(|s| (s, false)));
+    if let Some((colors, dual)) = devotion {
+        let (colors, operators) = colors.split_once('/').unwrap_or((colors, ""));
+        let parts: Vec<_> = colors.split('.').collect();
+        if parts.len() == if dual { 2 } else { 1 } {
+            let mut mask = 0;
+            let mut valid = true;
+            for color in parts {
+                let selected = if color.eq_ignore_ascii_case("Chosen") {
+                    game.card(source_id).chosen_colors.first().map(String::as_str).unwrap_or("")
+                } else { color };
+                let color_mask = match selected.to_uppercase().as_str() {
+                    "W" | "WHITE" => forge_foundation::ManaAtom::WHITE,
+                    "U" | "BLUE" => forge_foundation::ManaAtom::BLUE,
+                    "B" | "BLACK" => forge_foundation::ManaAtom::BLACK,
+                    "R" | "RED" => forge_foundation::ManaAtom::RED,
+                    "G" | "GREEN" => forge_foundation::ManaAtom::GREEN,
+                    _ => 0,
+                };
+                valid &= color_mask != 0;
+                mask |= color_mask;
             }
-            return count;
+            if valid {
+                let count = game.cards_in_zone(ZoneType::Battlefield, controller).iter()
+                    .map(|&id| game.card(id))
+                    .filter(|card| !card.phased_out)
+                    .map(|card| card.mana_cost.shards().iter().filter(|shard| shard.shard() & mask != 0).count() as i32)
+                    .sum();
+                return do_x_math(count, operators, game, source_id, controller, sa);
+            }
         }
     }
 
