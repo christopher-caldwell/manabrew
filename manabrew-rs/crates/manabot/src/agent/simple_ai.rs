@@ -59,6 +59,9 @@ pub struct SimpleAi {
     front_face_entry: HashSet<String>,
     /// Target chosen for a pending optional exile-and-return, by source card.
     pending_reuse_target: Option<(String, String)>,
+    /// Source whose repeated "pay any amount of life" round this player has
+    /// already paid into during the current resolution.
+    paid_life_round: Option<String>,
 }
 
 struct Combatant {
@@ -1493,6 +1496,9 @@ impl BotAgent for SimpleAi {
             self.recent_prompts.clear();
             self.failed_attack_targets.clear();
         }
+        if self.paid_life_round.as_ref().is_some_and(|source| !view.stack.iter().any(|item| &item.source_id == source)) {
+            self.paid_life_round = None;
+        }
         self.card_locations.clear();
         for (zone_index, zone) in view.zones.iter().enumerate() {
             for (card_index, card) in zone.cards.iter().enumerate() {
@@ -2197,9 +2203,23 @@ impl BotAgent for SimpleAi {
             }
             PromptInput::ChooseNumber(manabrew_protocol::prompts::choose_number::ChooseNumberInput { presentation, min, max }) => {
                 let x_cost = presentation.title.to_ascii_lowercase().ends_with("for x");
+                let life_round = prompt.source_card.as_ref()
+                    .filter(|card| card.text.to_ascii_lowercase().contains("pay any amount of life"))
+                    .map(|card| card.id.clone());
                 let chosen = if x_cost {
                     let fixed = prompt.source_card.as_ref().map_or(0, |card| card.cmc);
                     (self.available_mana(&deciding_player_id) - fixed).clamp(min.max(1).min(max), max)
+                } else if let Some(source) = life_round {
+                    // Repeats until no one pays: pay once, keeping a 20-life cushion.
+                    if self.paid_life_round.as_ref() == Some(&source) {
+                        min
+                    } else {
+                        self.paid_life_round = Some(source);
+                        let life = self.view.as_ref()
+                            .and_then(|v| v.players.iter().find(|p| p.id == deciding_player_id))
+                            .map_or(0, |p| p.life);
+                        ((life - 20) / 2).clamp(min, max)
+                    }
                 } else {
                     min.max(1).min(max)
                 };
@@ -3132,6 +3152,25 @@ mod execution_audit_policy {
         let mut token = creature("card-3", 0, (1, 1), 0, "When this creature enters, draw a card.");
         token.identity.is_token = true;
         vec![creature("card-1", 0, (3, 3), 5, AANG), creature("card-2", 0, (0, 1), 1, "{T}: Add {W}."), token]
+    }
+
+    fn number(bot: &mut SimpleAi, text: &str, max: i32) -> i64 {
+        let prompt: AgentPrompt = serde_json::from_value(json!({"promptId":3,"decidingPlayerId":"player-0","sourceCard":{"id":"card-9","text":text},
+            "input":{"type":"chooseNumber","presentation":{"title":"Choose a number","targets":[]},"min":0,"max":max}})).unwrap();
+        serde_json::to_value(bot.decide(prompt).unwrap()).unwrap()["output"]["chosenNumber"].as_i64().unwrap()
+    }
+
+    /// Plague of Vermin repeats until no one pays, so paying 1 every round loops.
+    #[test]
+    fn repeated_life_payment_pays_once_with_a_cushion() {
+        const PLAGUE: &str = "Starting with you, each player may pay any amount of life. Repeat this process until no one pays life.";
+        let mut bot = SimpleAi::default();
+        bot.observe(view(0, StepKind::Main1, vec![]));
+        assert_eq!(number(&mut bot, PLAGUE, 40), 10, "first round keeps 20 life plus half the excess");
+        assert_eq!(number(&mut bot, PLAGUE, 30), 0, "later rounds of the same resolution pay nothing");
+        let mut other = SimpleAi::default();
+        other.observe(view(0, StepKind::Main1, vec![]));
+        assert_eq!(number(&mut other, "Choose a number.", 5), 1, "other number prompts are unchanged");
     }
 
     #[test]
