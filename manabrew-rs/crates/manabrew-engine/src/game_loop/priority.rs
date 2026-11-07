@@ -45,8 +45,7 @@ impl GameLoop {
         let mut priority_player = game.active_player();
         let mut last_notified_priority: Option<PlayerId> = None;
         let mut passed_count = 0;
-        let num_players = game.players.len();
-        while passed_count < num_players {
+        while passed_count < game.players.iter().filter(|player| player.is_alive()).count() {
             if game.game_over {
                 return;
             }
