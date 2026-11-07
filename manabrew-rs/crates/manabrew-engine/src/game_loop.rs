@@ -57,6 +57,8 @@ pub struct GameLoop {
     /// Default: ThreadRngAdapter (non-deterministic). For parity testing,
     /// replace with a JavaRandom-backed implementation.
     pub game_rng: Box<dyn GameRng>,
+    /// When set, this player goes first instead of the d20 roll (for balanced experiments).
+    pub starting_player: Option<PlayerId>,
     /// Enables Java-parity snapshot rollback support (`stash_game_state` / `restore_game_state`).
     pub experimental_restore_snapshot: bool,
     /// Last stashed snapshot used by rollback flows.
@@ -165,6 +167,7 @@ impl GameLoop {
             token_fallback: HashMap::new(),
             edition_dates: HashMap::new(),
             game_rng: Box::new(ThreadRngAdapter),
+            starting_player: None,
             experimental_restore_snapshot: false,
             previous_game_state: None,
             checkpoints: VecDeque::new(),
@@ -409,7 +412,19 @@ impl GameLoop {
         agents: &mut [Box<dyn PlayerAgent>],
         rng: &mut impl rand::Rng,
     ) {
-        self.roll_for_first_player(game, agents, rng);
+        match self.starting_player {
+            Some(first) if game.player_order.contains(&first) => {
+                let name = game.player(first).name.clone();
+                self.game_log.log(
+                    GameLogEntryType::Info,
+                    0,
+                    format!("{name} goes first (fixed)"),
+                );
+                game.turn.active_player = first;
+                game.turn.priority_player = first;
+            }
+            _ => self.roll_for_first_player(game, agents, rng),
+        }
 
         for &pid in &game.player_order.clone() {
             game.shuffle_library(pid, rng);
@@ -1454,5 +1469,37 @@ mod tests {
         assert_eq!(game.card(card_id).zone, ZoneType::Hand);
         assert!(game.cards_in_zone(ZoneType::Hand, p0).contains(&card_id));
         let _ = p1;
+    }
+
+    /// A configured starting player goes first in every seed; without one the d20 roll decides.
+    #[test]
+    fn a_configured_starting_player_goes_first_without_a_roll() {
+        use rand::SeedableRng;
+        let mut first_by_roll = std::collections::BTreeSet::new();
+        for seed in 0..12u64 {
+            for fixed in [Some(PlayerId(2)), None] {
+                let mut game = GameState::new(&["A", "B", "C", "D"], 40);
+                let mut game_loop = GameLoop::new(4);
+                game_loop.starting_player = fixed;
+                let mut agents: Vec<Box<dyn PlayerAgent>> = (0..4)
+                    .map(|_| Box::new(crate::agent::PassAgent) as Box<dyn PlayerAgent>)
+                    .collect();
+                let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+                game_loop.setup(&mut game, &mut agents, &mut rng);
+                match fixed {
+                    Some(p) => {
+                        assert_eq!(game.turn.active_player, p);
+                        assert_eq!(game.turn.priority_player, p);
+                    }
+                    None => {
+                        first_by_roll.insert(game.turn.active_player);
+                    }
+                }
+            }
+        }
+        assert!(
+            first_by_roll.len() > 1,
+            "the roll still varies: {first_by_roll:?}"
+        );
     }
 }

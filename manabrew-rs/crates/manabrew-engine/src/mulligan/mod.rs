@@ -8,6 +8,7 @@
 //! mulligan.  On a mulligan the hand is shuffled back and a fresh 7 cards
 //! are drawn.  When a player finally keeps, they put N cards from hand on
 //! the bottom of their library, where N is the number of mulligans taken.
+//! In a multiplayer game the first mulligan is free (CR 103.5c): N is one less.
 //!
 //! ## Java parity divergence
 //!
@@ -126,11 +127,13 @@ fn run_put_back_phase(
         count: usize,
     }
 
+    // CR 103.5c: in a multiplayer game the first mulligan doesn't count toward the put-back.
+    let free = usize::from(ordered.len() > 2);
     let jobs: Vec<PutBackJob> = ordered
         .iter()
         .enumerate()
         .filter_map(|(i, &pid)| {
-            let count = mulligan_count[i] as usize;
+            let count = (mulligan_count[i] as usize).saturating_sub(free);
             if count == 0 {
                 return None;
             }
@@ -343,20 +346,61 @@ mod tests {
     }
 
     fn setup_game_with_libraries(deck_size: usize) -> (GameState, rand::rngs::StdRng) {
-        let mut game = GameState::new(&["Alice", "Bob"], 20);
-        let p0 = PlayerId(0);
-        let p1 = PlayerId(1);
-        for _ in 0..deck_size {
-            let c0 = game.create_card(filler_card(p0));
-            game.add_card_to_zone(ZoneType::Library, p0, c0);
-            game.cards[c0.index()].zone = ZoneType::Library;
+        setup_players(&["Alice", "Bob"], deck_size)
+    }
 
-            let c1 = game.create_card(filler_card(p1));
-            game.add_card_to_zone(ZoneType::Library, p1, c1);
-            game.cards[c1.index()].zone = ZoneType::Library;
+    fn setup_players(names: &[&str], deck_size: usize) -> (GameState, rand::rngs::StdRng) {
+        let mut game = GameState::new(names, 20);
+        for p in 0..names.len() {
+            let pid = PlayerId(p as _);
+            for _ in 0..deck_size {
+                let c = game.create_card(filler_card(pid));
+                game.add_card_to_zone(ZoneType::Library, pid, c);
+                game.cards[c.index()].zone = ZoneType::Library;
+            }
         }
         let rng = rand::rngs::StdRng::seed_from_u64(42);
         (game, rng)
+    }
+
+    /// CR 103.5c: four players; the first mulligan is free, later ones still cost a card.
+    #[test]
+    fn multiplayer_first_mulligan_is_free() {
+        let (mut game, mut rng) = setup_players(&["A", "B", "C", "D"], 40);
+        let players: Vec<PlayerId> = (0..4).map(|p| PlayerId(p as _)).collect();
+        for &p in &players {
+            game.shuffle_library(p, &mut rng);
+            game.draw_cards(p, 7);
+        }
+        let mut agents: Vec<Box<dyn PlayerAgent>> = vec![
+            Box::new(TestAgent::keep()),
+            Box::new(TestAgent::mulligan(1)),
+            Box::new(TestAgent::mulligan(2)),
+            Box::new(TestAgent::mulligan(3)),
+        ];
+        let pools = vec![
+            ManaPool::new(),
+            ManaPool::new(),
+            ManaPool::new(),
+            ManaPool::new(),
+        ];
+        let log = GameLog::new();
+
+        run_london_mulligans(&mut game, &mut agents, &mut rng, players[0], &pools, &log);
+
+        let sizes: Vec<usize> = players
+            .iter()
+            .map(|&p| game.cards_in_zone(ZoneType::Hand, p).len())
+            .collect();
+        assert_eq!(sizes, vec![7, 7, 6, 5]);
+        for &p in &players {
+            assert_eq!(
+                game.cards_in_zone(ZoneType::Hand, p).len()
+                    + game.cards_in_zone(ZoneType::Library, p).len(),
+                40,
+                "no card is lost or created"
+            );
+        }
     }
 
     #[test]
