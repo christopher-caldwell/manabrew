@@ -441,6 +441,7 @@ impl GameState {
             return 0;
         }
         self.player_mut(player).gain_life(amount);
+        self.journal_push(crate::journal::JournalEvent::LifeGained { player, amount });
         amount
     }
 
@@ -453,6 +454,7 @@ impl GameState {
             return 0;
         }
         self.player_mut(player).lose_life(amount);
+        self.journal_push(crate::journal::JournalEvent::LifeLost { player, amount });
         amount
     }
 
@@ -503,7 +505,11 @@ impl GameState {
     }
 
     pub fn player_set_life(&mut self, player: PlayerId, amount: i32) -> i32 {
-        self.player_mut(player).set_life(amount)
+        let change = self.player_mut(player).set_life(amount);
+        if change != 0 {
+            self.journal_push(crate::journal::JournalEvent::LifeSet { player, change });
+        }
+        change
     }
 
     pub fn player_exchange_life_totals(&mut self, a: PlayerId, b: PlayerId) {

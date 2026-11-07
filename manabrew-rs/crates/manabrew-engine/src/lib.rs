@@ -38,6 +38,7 @@ pub mod game_rng;
 pub mod game_runtime;
 pub mod game_snapshot;
 pub mod ids;
+pub mod journal;
 pub mod keyword;
 pub mod lki;
 pub mod mana;

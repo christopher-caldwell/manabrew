@@ -160,7 +160,28 @@ impl GameState {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn move_card_internal(
+        &mut self,
+        card_id: CardId,
+        dest_zone: ZoneType,
+        dest_owner: PlayerId,
+        agents: Option<&mut [Box<dyn PlayerAgent>]>,
+        trigger_handler: Option<&mut TriggerHandler>,
+        apply_move_replacement: bool,
+        is_discard: bool,
+    ) -> ZoneType {
+        let from = self.cards[card_id.index()].zone;
+        let to = self.move_card_unjournaled(card_id, dest_zone, dest_owner, agents, trigger_handler, apply_move_replacement, is_discard);
+        if self.journal.is_some() {
+            let controller = self.cards[card_id.index()].controller;
+            self.journal_push(crate::journal::JournalEvent::ZoneChange { card: card_id, from, to, controller });
+        }
+        to
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn move_card_unjournaled(
         &mut self,
         card_id: CardId,
         dest_zone: ZoneType,
@@ -825,6 +846,7 @@ impl GameState {
         if final_amount <= 0 { return 0; }
         let dealt = self.cards[target.index()].add_damage_after_prevention(final_amount);
         if dealt > 0 {
+            self.journal_push(crate::journal::JournalEvent::DamageToCard { source, target, amount: dealt, combat: is_combat });
             let mut event = ReplacementEvent::DealtDamage { target, amount: dealt, source };
             apply_replacements(self, &mut event);
         }
@@ -882,7 +904,11 @@ impl GameState {
     ) -> i32 {
         if crate::staticability::static_ability_cant_gain_lose_pay_life::cant_lose_life(self, target) { return 0; }
         let amount = self.damage_to_player_after_prevention(target, amount, source, is_combat, agents);
-        if amount > 0 { self.player_deal_damage(target, amount) } else { 0 }
+        let dealt = if amount > 0 { self.player_deal_damage(target, amount) } else { 0 };
+        if dealt > 0 {
+            self.journal_push(crate::journal::JournalEvent::DamageToPlayer { source, target, amount: dealt, combat: is_combat });
+        }
+        dealt
     }
 
     /// Apply player damage replacements and prevention before life or poison.

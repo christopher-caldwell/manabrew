@@ -127,6 +127,9 @@ pub struct GameState {
     // Arenas
     pub cards: Vec<Card>,
     pub players: Vec<PlayerState>,
+    /// Opt-in rules-event record for observers; see `crate::journal`.
+    #[serde(skip)]
+    pub journal: Option<Vec<crate::journal::JournalEvent>>,
     #[serde(default)]
     pub token_cosmetics: BTreeMap<PlayerId, BTreeMap<String, TokenCosmeticBinding>>,
 
@@ -260,6 +263,7 @@ impl GameState {
         GameState {
             cards: Vec::new(),
             players,
+            journal: None,
             token_cosmetics: BTreeMap::new(),
             zones,
             stack: MagicStack::new(),
