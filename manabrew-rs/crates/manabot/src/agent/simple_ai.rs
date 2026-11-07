@@ -59,8 +59,8 @@ pub struct SimpleAi {
     front_face_entry: HashSet<String>,
     /// Target chosen for a pending optional exile-and-return, by source card.
     pending_reuse_target: Option<(String, String)>,
-    /// Source whose repeated "pay any amount of life" round this player has
-    /// already paid into during the current resolution.
+    /// Source whose repeated "pay any amount of life" rounds this player has
+    /// already paid into this turn. Views may not refresh between rounds.
     paid_life_round: Option<String>,
 }
 
@@ -1495,8 +1495,6 @@ impl BotAgent for SimpleAi {
             self.payment_state = None;
             self.recent_prompts.clear();
             self.failed_attack_targets.clear();
-        }
-        if self.paid_life_round.as_ref().is_some_and(|source| !view.stack.iter().any(|item| &item.source_id == source)) {
             self.paid_life_round = None;
         }
         self.card_locations.clear();
