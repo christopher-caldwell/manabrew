@@ -2854,6 +2854,7 @@ mod actual_mana_spend_regression {
                     static DELTA_AVAILABLE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
                     static DELTA_GOAD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
                     static DELTA_GOAD_LEGAL: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+    thread_local! { static AUTO_ATTACK_TAX: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
     thread_local! { static CONVOKE_FIXTURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; static IMPROVISE_FIXTURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; static NESTED_ABILITY_FIXTURE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) }; static NESTED_ABILITY_FINISH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
     struct AutoAgent(bool, bool);
 impl PlayerAgent for AutoAgent {
@@ -2909,6 +2910,7 @@ impl PlayerAgent for AutoAgent {
     fn pay_combat_cost(&mut self, _player: PlayerId, _attacker: CardId, _cost: i32, _description: &str,
         _options: &[crate::agent::ManaAbilityOption], _tappable: &[CardId], _untappable: &[CardId], _pool: i32)
         -> crate::agent::CombatCostAction {
+        if AUTO_ATTACK_TAX.with(|v| v.get()) { return crate::agent::CombatCostAction::AutoPay; }
         let n = TAX_PROMPTS.with(|v| { let n=v.get(); v.set(n+1); n });
         if n < if self.0 { 2 } else { 1 } {
             crate::agent::CombatCostAction::TapLand { card_id: _tappable[0], mana_ability_index: None, express_choice: None }
@@ -3367,6 +3369,30 @@ impl PlayerAgent for AutoAgent {
         let restored = game.card(source).zone == ZoneType::Battlefield && !game.card(source).tapped;
         let spent = game.card(source).zone == ZoneType::Graveyard && game_loop.pool(player).total_mana() == 1;
         assert!(restored && game_loop.pool(player).total_mana() == 0 || spent, "source zone {:?}, tapped {}, pool {}", game.card(source).zone, game.card(source).tapped, game_loop.pool(player).total_mana());
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn automatic_attack_tax_uses_available_mana() {
+        std::thread::Builder::new().stack_size(32 * 1024 * 1024).spawn(|| {
+            for lands in [1, 2] {
+                let mut game = GameState::new(&["A", "B"], 40);
+                let player = PlayerId(0); let defender = PlayerId(1);
+                let creature = parse_card_script("Name:Attacker\nTypes:Creature Human\nPT:2/2").unwrap();
+                let tax = parse_card_script("Name:Tax\nTypes:Enchantment\nS:Mode$ CantAttackUnless | ValidCard$ Creature | Target$ You | Cost$ 2").unwrap();
+                let forest = parse_card_script("Name:Forest\nTypes:Basic Land Forest\nA:AB$ Mana | Cost$ T | Produced$ G").unwrap();
+                let a = game.create_card(Card::from_rules(&creature, player));
+                game.move_card(a, ZoneType::Battlefield, player); game.card_mut(a).set_summoning_sick(false);
+                let t = game.create_card(Card::from_rules(&tax, defender)); game.move_card(t, ZoneType::Battlefield, defender);
+                for _ in 0..lands { let id = game.create_card(Card::from_rules(&forest, player)); game.move_card(id, ZoneType::Battlefield, player); }
+                let mut agents: Vec<Box<dyn PlayerAgent>> = vec![Box::new(AutoAgent(true, false)), Box::new(AutoAgent(false, false))];
+                let mut gl = GameLoop::new(2);
+                ATTACK_FIXTURE.with(|v| v.set(true)); AUTO_ATTACK_TAX.with(|v| v.set(true));
+                gl.step_combat(&mut game, &mut agents);
+                AUTO_ATTACK_TAX.with(|v| v.set(false)); ATTACK_FIXTURE.with(|v| v.set(false));
+                assert_eq!(game.player(defender).life, if lands == 2 { 38 } else { 40 });
+                assert_eq!(game.card(a).tapped, lands == 2);
+            }
         }).unwrap().join().unwrap();
     }
 

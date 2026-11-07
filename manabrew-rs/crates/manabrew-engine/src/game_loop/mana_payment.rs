@@ -196,7 +196,13 @@ where
             mana::collect_mana_payment_sources(game, session.player, session.reserved_sacrifices);
         let lands: Vec<_> = mana_sources.source_cards.iter().copied()
             .filter(|&id| !session.exclude_pending_source || id != session.card_id).collect();
-        let convoke_sources = convoke_payment_sources(game, session.player, session.card_id);
+        let convoke_sources: Vec<_> = convoke_payment_sources(game, session.player, session.card_id)
+            .into_iter().filter(|&source| {
+                let atom = convoke_atom(game, source, session.mana_cost);
+                let existing = mana_pools[session.player.index()].mana_entries().iter()
+                    .filter(|m| m.convoke_for == Some(session.card_id)).map(|m| m.color);
+                convoke_fits_cost(session.mana_cost, existing.chain(std::iter::once(atom)))
+            }).collect();
         let mut tappable_lands = lands.clone();
         tappable_lands.extend(convoke_sources.iter().copied());
         let mut mana_ability_options = mana_sources.mana_ability_options;
@@ -824,6 +830,20 @@ fn convoke_payment_sources(game: &GameState, player: PlayerId, spell: CardId) ->
         .collect()
 }
 
+// Convoke can pay colored or generic shards, but never {C} or snow.
+fn convoke_fits_cost(cost: &ManaCost, atoms: impl Iterator<Item = u16>) -> bool {
+    let mut unpaid = crate::mana::mana_cost_being_paid::ManaCostBeingPaid::from_mana_cost(cost);
+    for atom in atoms {
+        if atom == forge_foundation::ManaAtom::COLORLESS {
+            if unpaid.get_generic_mana_amount() == 0 { return false; }
+            unpaid.decrease_generic_mana(1);
+        } else if unpaid.try_pay_mana(atom, atom as u8).is_none() {
+            return false;
+        }
+    }
+    true
+}
+
 fn convoke_atom(game: &GameState, source: CardId, cost: &ManaCost) -> u16 {
     let card = game.card(source);
     if !card.is_creature() {
@@ -843,6 +863,18 @@ mod cancellation_guard_tests {
     use super::*;
     use crate::card::Card;
     use forge_carddb::parse_card_script;
+
+    #[test]
+    fn convoke_must_cover_a_shard_of_the_cost() {
+        use forge_foundation::ManaAtom;
+        let cost = ManaCost::parse("G G G");
+        assert!(!convoke_fits_cost(&cost, [ManaAtom::WHITE].into_iter()));
+        assert!(convoke_fits_cost(&cost, [ManaAtom::GREEN].into_iter()));
+        let with_generic = ManaCost::parse("1 G G G");
+        assert!(convoke_fits_cost(&with_generic, [ManaAtom::WHITE].into_iter()));
+        assert!(!convoke_fits_cost(&with_generic, [ManaAtom::WHITE, ManaAtom::WHITE].into_iter()));
+        assert!(!convoke_fits_cost(&ManaCost::parse("C"), [ManaAtom::COLORLESS].into_iter()));
+    }
 
     #[test]
     fn pain_mana_cancellation_accepts_only_noninterfering_context() {

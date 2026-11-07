@@ -276,7 +276,8 @@ pub(super) fn pay_combat_cost<T: Responder>(
         PromptOutput::PayManaCost(PayManaCostOutput::Act { action_id }) => {
             parse_combat_cost_action(&action_id)
         }
-        PromptOutput::PayManaCost(PayManaCostOutput::Pay { .. }) => CombatCostAction::Pay,
+        PromptOutput::PayManaCost(PayManaCostOutput::Pay { auto: true }) => CombatCostAction::AutoPay,
+        PromptOutput::PayManaCost(PayManaCostOutput::Pay { auto: false }) => CombatCostAction::Pay,
         _ => CombatCostAction::Decline,
     }
 }

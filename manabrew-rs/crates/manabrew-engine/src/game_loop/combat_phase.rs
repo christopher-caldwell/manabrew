@@ -508,6 +508,27 @@ impl GameLoop {
                                 }
                                 self.undo_mana_action(game, controller, land_id);
                             }
+                            CombatCostAction::AutoPay => {
+                                self.invalidate_mana_undo_for_player(controller);
+                                let game_ptr: *mut GameState = game;
+                                let trigger_ptr = std::ptr::from_mut(&mut self.trigger_handler);
+                                let mut callback = Self::make_mana_payment_callback(
+                                    trigger_ptr, game_ptr, agents, controller, attacker_id,
+                                );
+                                let result = crate::mana::pay_mana_cost_auto_with_callback(
+                                    game, self.pool_mut(controller), controller,
+                                    &forge_foundation::ManaCost::generic(cost), None, 0,
+                                    &crate::mana::ManaPaymentContext::default(), false, &mut callback,
+                                );
+                                drop(callback);
+                                if let Some(result) = result {
+                                    self.resolve_auto_tapped_mana_sub_abilities(game, agents, controller, &result.choices);
+                                    if result.cancelled { cost_failures.push(attacker_id); }
+                                } else {
+                                    cost_failures.push(attacker_id);
+                                }
+                                break;
+                            }
                             CombatCostAction::Pay => {
                                 self.invalidate_mana_undo_for_player(controller);
                                 let pool = &mut self.mana_pools[controller.index()];

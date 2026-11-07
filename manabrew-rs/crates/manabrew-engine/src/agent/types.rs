@@ -129,6 +129,8 @@ pub enum CombatCostAction {
     UntapLand(CardId),
     /// Pay the cost from the mana pool.
     Pay,
+    /// Automatically produce and pay the required mana.
+    AutoPay,
     /// Decline to pay — remove this attacker.
     Decline,
 }

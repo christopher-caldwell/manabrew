@@ -505,31 +505,35 @@ impl ManaPool {
             }
 
             let mut paid_index: Option<(usize, u16)> = None;
-            for &color in &[
-                ManaAtom::WHITE,
-                ManaAtom::BLUE,
-                ManaAtom::BLACK,
-                ManaAtom::RED,
-                ManaAtom::GREEN,
-                ManaAtom::COLORLESS,
-            ] {
-                let Some(idx) = self
-                    .mana
-                    .iter()
-                    .position(|m| m.color == color && mana_matches_context(m, ctx))
-                else {
-                    continue;
-                };
-                let payment_color = if any_color && color != ManaAtom::COLORLESS {
-                    ManaAtom::COLORS_SUPERPOSITION
-                } else {
-                    color
-                };
-                if unpaid
-                    .try_pay_mana(payment_color, payment_color as u8)
-                    .is_some()
-                {
-                    paid_index = Some((idx, color));
+            // A selected convoke contribution must be used before floating mana
+            // when either can cover the same part of the spell's cost.
+            for prefer_convoke in [true, false] {
+                for &color in &[
+                    ManaAtom::WHITE,
+                    ManaAtom::BLUE,
+                    ManaAtom::BLACK,
+                    ManaAtom::RED,
+                    ManaAtom::GREEN,
+                    ManaAtom::COLORLESS,
+                ] {
+                    let Some(idx) = self.mana.iter().position(|m| {
+                        m.color == color
+                            && m.convoke_for.is_some() == prefer_convoke
+                            && mana_matches_context(m, ctx)
+                    }) else {
+                        continue;
+                    };
+                    let payment_color = if any_color && color != ManaAtom::COLORLESS {
+                        ManaAtom::COLORS_SUPERPOSITION
+                    } else {
+                        color
+                    };
+                    if unpaid.try_pay_mana(payment_color, payment_color as u8).is_some() {
+                        paid_index = Some((idx, color));
+                        break;
+                    }
+                }
+                if paid_index.is_some() {
                     break;
                 }
             }
@@ -1387,6 +1391,26 @@ impl ManaPool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn incremental_payment_uses_convoke_before_other_colors() {
+        use super::*;
+        use forge_foundation::{mana::ManaAtom, ManaCost};
+        let spell = CardId(3);
+        let mut pool = ManaPool::new();
+        pool.add(ManaAtom::WHITE, 1);
+        let mut contribution = Mana::simple(ManaAtom::GREEN);
+        contribution.convoke_for = Some(spell);
+        contribution.convoke_source = Some(CardId(4));
+        pool.add_convoke_contribution(contribution);
+        let ctx = ManaPaymentContext { is_spell: true, payment_card: Some(spell), ..Default::default() };
+        let mut unpaid = ManaCostBeingPaid::from_mana_cost(&ManaCost::parse("1"));
+        let outcome = pool.pay_unpaid_for_spell_incremental(&mut unpaid, &ctx, false);
+        assert!(unpaid.is_paid());
+        assert!(outcome.paying_mana.is_empty());
+        assert_eq!(pool.mana_entries().len(), 1);
+        assert_eq!(pool.mana_entries()[0].color, ManaAtom::WHITE);
+    }
+
     #[test]
     fn convoke_commit_is_not_reported_as_mana_spent() {
         use super::*;
