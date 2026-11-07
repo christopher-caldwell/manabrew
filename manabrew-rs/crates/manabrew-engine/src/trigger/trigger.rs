@@ -1020,6 +1020,8 @@ impl Trigger {
             )
         };
         sa.is_trigger = true;
+        // A triggered ability is never a spell, even if its Execute text is `SP$`.
+        sa.is_spell = false;
         sa.trigger_source = Some(host_card);
         sa.trigger_source_zone_timestamp = Some(game.card(host_card).zone_timestamp);
         sa.source_trigger_id = Some(self.id);

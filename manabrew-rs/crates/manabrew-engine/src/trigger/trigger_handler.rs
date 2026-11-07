@@ -1832,6 +1832,25 @@ mod tests {
         assert_eq!(pending[0].entry.spell_ability.get_triggering_player(crate::ability::AbilityKey::Activator), Some(PlayerId(2)));
     }
 
+    /// DEV-065: keyword-generated modal triggers (Riot, Modular) are abilities,
+    /// not spells, so they are never counted as casts.
+    #[test]
+    fn keyword_modal_triggers_are_not_spells() {
+        for (keyword, pt) in [("Riot", "PT:3/2"), ("Modular:1", "PT:0/0")] {
+            let mut game = GameState::new(&["A", "B", "C", "D"], 40);
+            let script = format!("Name:Keyword Fixture\nManaCost:1 R\nTypes:Artifact Creature Construct\n{pt}\nK:{keyword}");
+            let host = put_on_battlefield(&mut game, &script, 0, 0);
+            let card = game.card(host);
+            let (index, trigger) = card.triggers.iter().enumerate()
+                .find(|(_, t)| t.execute.starts_with("Trig"))
+                .expect("keyword trigger");
+            let sa = trigger.build_triggered_spell_ability(&game, host, PlayerId(0), index, &RunParams::default());
+            assert_eq!(sa.api, Some(crate::ability::api_type::ApiType::Charm), "{keyword}");
+            assert!(sa.is_trigger, "{keyword}");
+            assert!(!sa.is_spell, "{keyword} trigger must not be a spell");
+        }
+    }
+
     fn put_on_battlefield(game: &mut GameState, script: &str, owner: u32, controller: u32) -> crate::ids::CardId {
         let rules = parse_card_script(script).expect("card script should parse");
         // `create_card` binds the card's triggers to its assigned ID.

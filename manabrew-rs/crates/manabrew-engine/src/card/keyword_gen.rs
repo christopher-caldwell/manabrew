@@ -634,7 +634,7 @@ impl Card {
                 }
                 self.svars
                     .entry("TrigModular".to_string())
-                    .or_insert_with(|| "SP$ Charm | Choices$ ModularMove".to_string());
+                    .or_insert_with(|| "DB$ Charm | Choices$ ModularMove".to_string());
                 self.svars
                     .entry("ModularMove".to_string())
                     .or_insert_with(|| {
@@ -727,7 +727,7 @@ impl Card {
             }
             self.svars
                 .entry("TrigRiot".to_string())
-                .or_insert_with(|| "SP$ Charm | Choices$ RiotCounter,RiotHaste".to_string());
+                .or_insert_with(|| "DB$ Charm | Choices$ RiotCounter,RiotHaste".to_string());
             self.svars
                 .entry("RiotCounter".to_string())
                 .or_insert_with(|| {
