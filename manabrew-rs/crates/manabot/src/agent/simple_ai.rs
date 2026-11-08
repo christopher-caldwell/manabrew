@@ -2495,26 +2495,30 @@ impl BotAgent for SimpleAi {
                 use manabrew_protocol::game::ManaColor;
                 let colors = [("W", ManaColor::White), ("U", ManaColor::Blue), ("B", ManaColor::Black),
                     ("R", ManaColor::Red), ("G", ManaColor::Green), ("C", ManaColor::Colorless)];
+                let mut produced_by_source: std::collections::BTreeMap<&str, std::collections::BTreeSet<ManaColor>> = Default::default();
+                for action in &input.actions {
+                    if let manabrew_protocol::prompts::common::PaymentActionKind::ActivateManaAbility(info) = &action.kind {
+                        let made = produced_by_source.entry(info.card_id.as_str()).or_default();
+                        for mana in info.produced_mana.iter().flatten().filter(|m| m.amount > 0) { made.insert(mana.color); }
+                    }
+                }
                 let deficits: Vec<_> = colors.iter().map(|(symbol, color)| {
                     let required = input.mana_cost.split('{').skip(1)
                         .filter(|part| part.split('}').next() == Some(*symbol)).count() as i32;
                     let floating = pool.and_then(|p| p.get(color)).copied().unwrap_or(0) as i32;
                     // Only sources that make nothing else can be counted on for this
-                    // color; a flexible source (Mana Confluence) must go to the color
-                    // the fixed sources cannot cover, or the last shard is unpayable.
-                    let fixed_sources = input.actions.iter().filter(|action| matches!(
-                        &action.kind,
-                        manabrew_protocol::prompts::common::PaymentActionKind::ActivateManaAbility(info)
-                            if info.produced_mana.as_ref().is_some_and(|produced| {
-                                produced.iter().any(|m| m.amount > 0)
-                                    && produced.iter().all(|m| m.amount == 0 || m.color == *color)
-                            })
-                    )).count() as i32;
-                    (symbol, color, required, floating, floating + fixed_sources)
-                }).filter_map(|(_, color, required, floating, source_count)| {
-                    (required > floating).then_some((*color, (required - source_count).max(0), required - floating))
+                    // color; a flexible source (Mana Confluence, a filter land) must go to
+                    // the color the fixed sources cannot cover, or the last shard is
+                    // unpayable. A source is judged by every color its actions make.
+                    let fixed_sources = produced_by_source.values()
+                        .filter(|made| made.len() == 1 && made.contains(color)).count() as i32;
+                    // Between colors equally short, the one fewer sources can make comes first.
+                    let capable = produced_by_source.values().filter(|made| made.contains(color)).count() as i32;
+                    (symbol, color, required, floating, floating + fixed_sources, capable)
+                }).filter_map(|(_, color, required, floating, source_count, capable)| {
+                    (required > floating).then_some((*color, (required - source_count).max(0), std::cmp::Reverse(capable), required - floating))
                 }).collect();
-                self.pending_mana_color = deficits.into_iter().max_by_key(|(_, scarce, unpaid)| (*scarce, *unpaid)).map(|(color, _, _)| color);
+                self.pending_mana_color = deficits.into_iter().max_by_key(|(_, scarce, capable, unpaid)| (*scarce, *capable, *unpaid)).map(|(color, _, _, _)| color);
                 self.awaiting_mana_color = false;
                 let state = serde_json::to_string(&(&input, pool)).unwrap();
                 if self.payment_state.as_deref() != Some(state.as_str()) {
@@ -2992,6 +2996,51 @@ mod recursive_mana_payment_regression {
     #[test]
     fn retains_life_costed_mana_ability() {
         assert_eq!(choice_for("{W}", "{T}, Pay 1 life")["actionId"], "tap:filter:0:W");
+    }
+
+    /// DEV-072: Kaalia's {1}{R}{W}{B}: the fixed sources make R and B, so the flexible Mana
+    /// Confluence is spent on the W only it can make.
+    #[test]
+    fn a_flexible_source_goes_to_the_color_no_fixed_source_makes() {
+        let tap = |card: &str, index: i32, suffix: &str, cost: &str, color: &str| json!({
+            "id": format!("tap:{card}:{index}{suffix}"), "type": "activateManaAbility", "cardId": card, "abilityIndex": index,
+            "description": "Add mana", "isManaAbility": true, "cost": cost, "producedMana": [{"amount": 1, "color": color}]});
+        let mut actions = vec![tap("card-289", 0, "", "{T}", "B"), tap("card-280", 0, "", "{T}", "C"),
+            tap("card-280", 1, ":B", "{T}", "B"), tap("card-280", 1, ":R", "{T}", "R"), tap("card-301", 0, "", "{T}", "R")];
+        for color in ["W", "U", "B", "R", "G"] {
+            actions.push(tap("card-269", 0, &format!(":{color}"), "{T}, Pay 1 life", color));
+        }
+        let mut bot = SimpleAi::default();
+        let prompt: AgentPrompt = serde_json::from_value(json!({
+            "promptId": 1, "decidingPlayerId": "player-0",
+            "input": {"type": "payManaCost", "presentation": {"title": "Pay"}, "cardId": "card-202", "cardName": "Kaalia of the Vast",
+                "manaCost": "{1}{R}{W}{B}", "canConfirmFromPool": false, "actions": actions}
+        })).unwrap();
+        let out = serde_json::to_value(bot.decide(prompt).unwrap()).unwrap()["output"].clone();
+        assert_eq!(out["actionId"], "tap:card-269:0:W");
+    }
+
+    /// DEV-072: when R and W are both short of fixed sources, the flexible Confluence goes to W,
+    /// the color only it can make, and the filter lands cover R.
+    #[test]
+    fn the_color_fewer_sources_can_make_is_chosen_first() {
+        let tap = |card: &str, index: i32, suffix: &str, cost: &str, color: &str| json!({
+            "id": format!("tap:{card}:{index}{suffix}"), "type": "activateManaAbility", "cardId": card, "abilityIndex": index,
+            "description": "Add mana", "isManaAbility": true, "cost": cost, "producedMana": [{"amount": 1, "color": color}]});
+        let mut actions = vec![tap("card-188", 0, "", "{T}", "B"), tap("card-189", 0, "", "{T}", "B"),
+            tap("card-184", 1, ":B", "{T}", "B"), tap("card-184", 1, ":R", "{T}", "R"),
+            tap("card-181", 0, ":B", "{T}", "B"), tap("card-181", 0, ":R", "{T}", "R")];
+        for color in ["W", "U", "B", "R", "G"] {
+            actions.push(tap("card-168", 0, &format!(":{color}"), "{T}, Pay 1 life", color));
+        }
+        let mut bot = SimpleAi::default();
+        let prompt: AgentPrompt = serde_json::from_value(json!({
+            "promptId": 1, "decidingPlayerId": "player-0",
+            "input": {"type": "payManaCost", "presentation": {"title": "Pay"}, "cardId": "card-101", "cardName": "Kaalia of the Vast",
+                "manaCost": "{1}{R}{W}{B}", "canConfirmFromPool": false, "actions": actions}
+        })).unwrap();
+        let out = serde_json::to_value(bot.decide(prompt).unwrap()).unwrap()["output"].clone();
+        assert_eq!(out["actionId"], "tap:card-168:0:W");
     }
 
     #[test]
