@@ -409,7 +409,6 @@ impl GameLoop {
         crate::ability::activated::ActivatedAbility,
         crate::spellability::SpellAbility,
     )> {
-        let available_mana = mana::calculate_available_mana(self.pool(player), game, player);
         let card = game.card(card_id);
         if card.face_down {
             return None;
@@ -482,6 +481,7 @@ impl GameLoop {
                 }
             }
 
+            let available_mana = std::cell::OnceCell::new();
             let entry = crate::staticability::static_ability_alternative_cost::alternative_costs(
                 game,
                 &game.cards,
@@ -499,7 +499,9 @@ impl GameLoop {
                 crate::cost::can_pay_with_ability(
                     &entry.cost,
                     game,
-                    &available_mana,
+                    available_mana.get_or_init(|| {
+                        mana::calculate_available_mana(self.pool(player), game, player)
+                    }),
                     card_id,
                     player,
                     Some(&alt_sa),

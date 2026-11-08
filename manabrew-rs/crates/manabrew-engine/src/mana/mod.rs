@@ -891,6 +891,11 @@ pub fn add_produced_mana_to_pool(
     );
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static AVAILABLE_MANA_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Calculate available mana from the current pool plus untapped lands and non-land mana sources.
 ///
 /// Colors are tracked OPTIMISTICALLY: each source adds 1 per color it could produce,
@@ -899,6 +904,8 @@ pub fn add_produced_mana_to_pool(
 /// total mana check in `can_pay` prevents dual/multi-color lands from being
 /// double-counted (e.g. Breeding Pool counts as 1 mana, not 2).
 pub fn calculate_available_mana(pool: &ManaPool, game: &GameState, player: PlayerId) -> ManaPool {
+    #[cfg(test)]
+    AVAILABLE_MANA_CALLS.with(|calls| calls.set(calls.get() + 1));
     calculate_available_mana_excluding_with_reserved(pool, game, player, None, &[])
 }
 

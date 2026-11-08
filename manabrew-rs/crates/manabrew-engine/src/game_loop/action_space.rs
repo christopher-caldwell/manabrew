@@ -264,6 +264,23 @@ mod tests {
     }
 
     #[test]
+    fn treasure_heavy_board_does_not_recalculate_mana_for_each_permanent() {
+        let player = PlayerId(0);
+        let mut game = GameState::new(&["P1", "P2"], 20);
+        for _ in 0..100 {
+            let id = game.create_card(make_card(0, player, "Treasure", "Artifact", vec![
+                "AB$ Mana | Cost$ T Sac<1/CARDNAME> | Produced$ Any",
+            ]));
+            game.add_card_to_zone(ZoneType::Battlefield, player, id);
+            game.card_mut(id).zone = ZoneType::Battlefield;
+        }
+        crate::mana::AVAILABLE_MANA_CALLS.with(|calls| calls.set(0));
+        let actions = GameLoop::new(2).get_activatable_abilities(&game, player, true);
+        assert!(actions.is_empty());
+        crate::mana::AVAILABLE_MANA_CALLS.with(|calls| assert_eq!(calls.get(), 1));
+    }
+
+    #[test]
     fn activated_offer_respects_spell_only_mana() {
         let player = PlayerId(0);
         let mut game = GameState::new(&["P1", "P2"], 20);
