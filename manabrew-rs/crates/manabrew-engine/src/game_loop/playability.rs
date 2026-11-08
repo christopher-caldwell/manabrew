@@ -731,6 +731,17 @@ impl GameLoop {
                     // activated abilities (e.g. Walking Bulwark) become incorrectly
                     // uncastable when no valid AB$ target exists.
                     let all_valid = card.action_spell_specs.iter().all(|spec| {
+                        // A modal spell is castable only if enough of its modes have legal
+                        // targets; the cast itself fails otherwise (the same check, made
+                        // before offering it rather than after the player chose it).
+                        if card.abilities.get(spec.ability_index).is_some_and(|ab| {
+                            ab.contains("SP$ Charm")
+                                && !crate::ability::effects::charm_effect::can_make_choices_precast(
+                                    game, player, card_id, ab,
+                                )
+                        }) {
+                            return false;
+                        }
                         let dynamic_target_count = spec
                             .target_chain
                             .iter()
@@ -1290,6 +1301,29 @@ mod tests {
         assert!(offered(&game), "legal creature target in graveyard");
         game.move_card(creature, ZoneType::Exile, player);
         assert!(!offered(&game), "target left the graveyard");
+    }
+
+    /// DEV-046: a modal spell is not offered when none of its modes has a legal target; it
+    /// would be started and fail ("Card play failed").
+    #[test]
+    fn a_modal_spell_is_offered_only_when_a_mode_has_a_legal_target() {
+        let player = PlayerId(0);
+        let mut game = GameState::new(&["A", "B"], 40);
+        let mut spell = card("Blast", player, "Instant", "R", ColorSet::RED, None, None,
+            vec!["SP$ Charm | Choices$ DBCounter,DBDestroy"]);
+        spell.svars.insert("DBCounter".into(), "DB$ Counter | TargetType$ Spell | ValidTgts$ Card.Blue | TgtPrompt$ Select target blue spell".into());
+        spell.svars.insert("DBDestroy".into(), "DB$ Destroy | ValidTgts$ Permanent.Blue | TgtPrompt$ Select target blue permanent".into());
+        let id = game.create_card(spell);
+        game.move_card(id, ZoneType::Hand, player);
+        let mountain = game.create_card(card("Mountain", player, "Basic Land - Mountain", "", ColorSet::COLORLESS, None, None, vec![]));
+        game.move_card(mountain, ZoneType::Battlefield, player);
+        let mut gl = GameLoop::new(2);
+        gl.pool_mut(player).add(forge_foundation::ManaAtom::RED, 1);
+        let offered = |g: &GameState| gl.get_playable_cards(g, player, false).iter().any(|p| p.card_id == id);
+        assert!(!offered(&game), "no blue spell or permanent to take");
+        let blue = game.create_card(card("Blue creature", PlayerId(1), "Creature", "1 U", ColorSet::BLUE, Some(2), Some(2), vec![]));
+        game.move_card(blue, ZoneType::Battlefield, PlayerId(1));
+        assert!(offered(&game), "a blue permanent can be destroyed");
     }
 
     #[test]

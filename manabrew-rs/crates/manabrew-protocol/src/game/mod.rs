@@ -472,6 +472,8 @@ pub struct StackObjectDto {
     #[ts(optional)]
     pub source_ability_text: Option<String>,
     pub is_permanent_spell: bool,
+    /// A spell on the stack, as opposed to a triggered or activated ability.
+    pub is_spell: bool,
     pub is_casting: bool,
     /// An estimate for a directly targeted damage effect when its amount is known.
     /// Absence means unknown, not zero or guaranteed prevention.

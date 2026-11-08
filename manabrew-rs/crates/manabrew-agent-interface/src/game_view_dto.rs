@@ -1152,6 +1152,9 @@ impl GameViewDtoExt for GameViewDto {
                     source_ability_text: visible_source
                         .and_then(|_| stack_source_ability_text(game, &entry.spell_ability)),
                     is_permanent_spell: entry.is_creature_spell || entry.is_permanent_spell,
+                    is_spell: entry.spell_ability.is_spell
+                        && !entry.spell_ability.is_trigger
+                        && !entry.spell_ability.is_activated,
                     is_casting: entry.is_pending_cast,
                     known_damage: if entry.optional_trigger_decider.is_none() { known_pending_damage(game, &entry.spell_ability) } else { None },
                     targets: collect_stack_targets(&entry.spell_ability),

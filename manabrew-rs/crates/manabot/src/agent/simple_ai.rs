@@ -62,7 +62,15 @@ pub struct SimpleAi {
     /// Source whose repeated "pay any amount of life" rounds this player has
     /// already paid into this turn. Views may not refresh between rounds.
     paid_life_round: Option<String>,
+    /// Plays the bot started and then cancelled at target selection, by card, with the
+    /// board they were judged against. The same cast is not started again until it changes.
+    cancelled_plays: std::collections::BTreeMap<String, u64>,
+    /// The cast the bot last chose, with the stack size then. If that card is still in hand at
+    /// the next action prompt with nothing added to the stack, the play failed.
+    last_cast_pick: Option<(String, usize)>,
 }
+
+const KNOWN_TYPES: [&str; 8] = ["creature", "instant", "sorcery", "enchantment", "artifact", "planeswalker", "land", "battle"];
 
 struct Combatant {
     id: String,
@@ -521,6 +529,81 @@ impl SimpleAi {
             .count()
     }
 
+    /// A fingerprint of what a cast's targets are chosen from: every permanent and stack object.
+    fn board_signature(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        if let Some(view) = &self.view {
+            for zone in &view.zones {
+                if zone.zone == ZoneKind::Battlefield {
+                    for card in &zone.cards {
+                        if let CardView::Visible(card) = card {
+                            card.id.hash(&mut hasher);
+                        }
+                    }
+                }
+            }
+            for item in &view.stack {
+                item.id.hash(&mut hasher);
+            }
+        }
+        hasher.finish()
+    }
+
+    /// The bot started `source`'s play and cancelled it at target selection.
+    fn note_cancelled_play(&mut self, source_id: &str) {
+        let signature = self.board_signature();
+        self.cancelled_plays.insert(source_id.to_string(), signature);
+    }
+
+    /// An opposing spell that "counter target ..." text could legally take and that no answer
+    /// of ours already covers. Without one, a counterspell would be started and cancelled.
+    fn counterable_spell_exists(&self, text: &str, player_id: &str) -> bool {
+        let Some(view) = &self.view else { return true };
+        view.stack.iter().any(|item| {
+            if item.controller_id == player_id || item.is_casting || !item.is_spell {
+                return false;
+            }
+            let types: Vec<String> = item.source_card.as_ref().map(|card| card.types.clone()).unwrap_or_default();
+            if !Self::counter_clause_allows(text, &types) {
+                return false;
+            }
+            let target = TargetRef { kind: TargetKind::Spell, id: item.id.clone(), intent: None, oracle: None };
+            !self.covered_by_friendly_answer(&target, player_id)
+        })
+    }
+
+    /// Whether "counter target <qualifier> spell" can take a spell with these card types.
+    /// An unrecognized qualifier is allowed: the target prompt decides.
+    fn counter_clause_allows(text: &str, types: &[String]) -> bool {
+        let Some(after) = text.split("counter target ").nth(1) else { return true };
+        let qualifier = after.split(" spell").next().unwrap_or("").trim();
+        let has = |ty: &str| types.iter().any(|t| t.eq_ignore_ascii_case(ty));
+        if qualifier.is_empty() {
+            return true;
+        }
+        if let Some(excluded) = qualifier.strip_prefix("non") {
+            let excluded = excluded.trim_start_matches('-');
+            return !(KNOWN_TYPES.contains(&excluded) && has(excluded));
+        }
+        let wanted: Vec<&str> = qualifier
+            .split([',', ' '])
+            .map(str::trim)
+            .filter(|word| !word.is_empty() && *word != "or" && *word != "and")
+            .collect();
+        if wanted.iter().all(|word| KNOWN_TYPES.contains(word)) {
+            return wanted.iter().any(|word| has(word));
+        }
+        true
+    }
+
+    /// A permanent of ours that exiling and returning improves, for a blink spell.
+    fn reuse_target_exists(&self, player_id: &str, creatures_only: bool) -> bool {
+        self.battlefield(player_id)
+            .filter(|card| !creatures_only || card.types.iter().any(|ty| ty == "Creature"))
+            .any(|card| self.reentry_value(card, player_id).is_some_and(|value| value > 0))
+    }
+
     fn sane(&self, action: &AvailableAction, player_id: &str) -> bool {
         let AvailableActionKind::Cast { card_id, mode, .. } = &action.kind else {
             return true;
@@ -577,9 +660,12 @@ impl SimpleAi {
             // normal main-two selection remains available.
             return false;
         }
-        let creature_removal = text.contains("destroy target creature")
+        // "Exile target creature you control, then return it" is a blink, not removal.
+        let own_target = text.contains("target creature you control");
+        let creature_removal = (text.contains("destroy target creature")
             || text.contains("exile target creature")
-            || (text.contains("damage to target creature") && !text.contains("player"));
+            || (text.contains("damage to target creature") && !text.contains("player")))
+            && !own_target;
         if creature_removal && opponents.is_empty() {
             return false;
         }
@@ -592,6 +678,34 @@ impl SimpleAi {
         if (roles.contains(Roles::COUNTERSPELL) || text.starts_with("counter target"))
             && !foreign_stack
         {
+            return false;
+        }
+        // A counterspell that names a spell needs an opposing spell it can take: an ability
+        // on the stack, our own spell, or a spell already answered would only be started and
+        // cancelled. Free and alternative-cost counters (Force of Will) put the clause after
+        // their cost text, so look for it anywhere.
+        if text.contains("counter target")
+            && text.contains("spell")
+            && !text.contains("ability")
+            && !self.counterable_spell_exists(&text, player_id)
+        {
+            return false;
+        }
+        // A blink spell is worth casting only for a permanent that gains from re-entering
+        // (an entry ability, or a threat to save it). Otherwise its target prompt would be
+        // cancelled.
+        if card.types.iter().any(|ty| ty == "Instant" || ty == "Sorcery")
+            && text.contains("exile")
+            && text.contains("target creature")
+            && text.contains("you control")
+            && text.contains("return")
+            && text.contains("to the battlefield")
+            && !self.reuse_target_exists(player_id, true)
+        {
+            return false;
+        }
+        // The same cast was cancelled at target selection against this very board.
+        if self.cancelled_plays.get(card_id.as_str()) == Some(&self.board_signature()) {
             return false;
         }
         if roles.contains(Roles::COMBAT_PUMP)
@@ -1571,6 +1685,17 @@ impl BotAgent for SimpleAi {
                 self.pending_mana_color = None;
                 self.auto_payment_active = false;
                 self.selected_mana_source = None;
+                // The cast chosen last time never reached the stack: the engine could not
+                // start it. Do not start it again against this same board.
+                if let Some((card_id, stack_before)) = self.last_cast_pick.take() {
+                    let failed = self.view.as_ref().is_some_and(|view| view.stack.len() <= stack_before)
+                        && self.card(&card_id).is_some_and(|card| {
+                            card.zone == Some(ZoneKind::Hand) && card.controller_id == deciding_player_id
+                        });
+                    if failed {
+                        self.note_cancelled_play(&card_id);
+                    }
+                }
                 if let Some(target) = self.death_tutor_plan_target(&deciding_player_id) {
                     let state=format!("{}:{:?}:{}:{}", target.id, target.counters,
                         self.view.as_ref().and_then(|v|v.players.iter().find(|p|p.id==deciding_player_id)).map(|p|p.life).unwrap_or(0),
@@ -1613,6 +1738,12 @@ impl BotAgent for SimpleAi {
                 });
                 self.pending_voluntary_cast = pick.and_then(|action| match &action.kind {
                     AvailableActionKind::Cast { card_id, .. } => Some(card_id.clone()),
+                    _ => None,
+                });
+                self.last_cast_pick = pick.and_then(|action| match &action.kind {
+                    AvailableActionKind::Cast { card_id, .. } if !self.is_land_play(action) => {
+                        Some((card_id.clone(), self.view.as_ref().map_or(0, |view| view.stack.len())))
+                    }
                     _ => None,
                 });
                 let pick = pick.map(|action| {
@@ -1831,6 +1962,7 @@ impl BotAgent for SimpleAi {
                     let useful = scored.iter().filter(|(value, _, _)| value.is_some_and(|v| v > 0)).count();
                     if useful == 0 && voluntary_cast {
                         self.pending_voluntary_cast = None;
+                        self.note_cancelled_play(&prompt_source_id);
                         return Some(PromptOutput::ChooseBoardTargets(ChooseBoardTargetsOutput::Cancel));
                     }
                     if self_reuse || useful > 0 {
@@ -1874,6 +2006,7 @@ impl BotAgent for SimpleAi {
                     });
                     if candidates.is_empty() {
                         self.pending_voluntary_cast = None;
+                        self.note_cancelled_play(&prompt_source_id);
                         return Some(PromptOutput::ChooseBoardTargets(ChooseBoardTargetsOutput::Cancel));
                     }
                 }
@@ -1932,7 +2065,22 @@ impl BotAgent for SimpleAi {
                 );
                 let repeated = self.looping_on(signature);
                 let title = presentation.title.to_ascii_lowercase();
-                let always_accept = title.contains("cancel search")
+                // A copy of a damage or removal spell that keeps its original's target only repeats
+                // it: the original fizzles once the copy has killed that target. New targets
+                // are chosen by the same scoring, which already steers around damage that is
+                // covered. A copy of a copy effect is not retargeted: it would copy itself forever.
+                let retarget_copy = title.contains("choose new targets for the copy")
+                    && self.view.as_ref().is_some_and(|view| {
+                        let effect = |item: &manabrew_agent_interface::game_view_dto::StackObjectDto| item.source_ability_text.as_deref()
+                            .filter(|t| !t.is_empty()).unwrap_or(&item.text).to_ascii_lowercase();
+                        // Never while a copy spell is on the stack: retargeting copies of it
+                        // would copy the copy again, without end.
+                        !view.stack.iter().any(|item| item.is_spell && effect(item).contains("copy"))
+                            && view.stack.iter().any(|item| item.is_spell
+                                && ["damage", "destroy", "exile"].iter().any(|word| effect(item).contains(word)))
+                    });
+                let always_accept = retarget_copy
+                    || title.contains("cancel search")
                     || (title.contains("commander")
                         && title.contains("put it into the command zone"));
                 let useful_single_draw = (title == "do you want to draw a card?"
@@ -3295,6 +3443,157 @@ mod execution_audit_policy {
     fn act(bot: &mut SimpleAi, actions: Value) -> Value {
         let prompt: AgentPrompt = serde_json::from_value(json!({"promptId":3,"decidingPlayerId":"player-0","input":{"type":"chooseAction","actions":actions}})).unwrap();
         serde_json::to_value(bot.decide(prompt).unwrap()).unwrap()["output"].clone()
+    }
+
+    fn spell_card(id: &str, mana_cost: &str, cmc: i32, text: &str) -> CardDto {
+        CardDto { id: id.into(), controller_id: "player-0".into(), owner_id: "player-0".into(), types: vec!["Instant".into()],
+            mana_cost: mana_cost.into(), cmc, text: text.into(), ..Default::default() }
+    }
+    fn cast_choice(bot: &mut SimpleAi, card: &str) -> Value {
+        act(bot, json!([{"type":"cast","id":format!("cast:{card}:normal"),"cardId":card,"mode":{"type":"normal"},"label":"Cast normally"}]))["type"].clone()
+    }
+
+    /// DEV-046: a blink spell is started for a permanent that gains from re-entering, and not
+    /// started (then cancelled at its target prompt) when nothing does.
+    #[test]
+    fn a_blink_spell_is_cast_for_an_entry_creature_and_not_for_a_vanilla_one() {
+        const CLOUDSHIFT: &str = "Exile target creature you control, then return that card to the battlefield under your control.";
+        for (battlefield, threatened, expected) in [
+            (creature("card-1", 0, (3, 3), 5, "Flying\nWhen Aang enters, look at the top five cards of your library."), false, "act"),
+            (creature("card-1", 0, (2, 2), 3, "Flying"), false, "pass"),
+            (creature("card-1", 0, (2, 2), 3, "Flying"), true, "act"),
+        ] {
+            let mut lands: Vec<_> = (0..3).map(|i| land(&format!("card-{}", 20 + i), 0, "Plains")).collect();
+            lands.push(battlefield);
+            let hand = vec![spell_card("card-9", "{W}", 1, CLOUDSHIFT)];
+            let mut view = view(0, StepKind::Main1, vec![(ZoneKind::Battlefield, 0, lands), (ZoneKind::Hand, 0, hand)]);
+            if threatened {
+                view.stack.push(StackObjectDto { id: "stack-1".into(), controller_id: "player-1".into(), is_spell: true,
+                    text: "Destroy target creature.".into(),
+                    targets: serde_json::from_value(json!([{"id":"card-1","kind":"card"}])).unwrap(), ..Default::default() });
+            }
+            let mut bot = SimpleAi::default();
+            bot.observe(view);
+            assert_eq!(cast_choice(&mut bot, "card-9"), expected, "{threatened}");
+        }
+    }
+
+    /// The blink target prompt still picks the entry creature, including a commander.
+    #[test]
+    fn a_blink_spell_targets_the_commander_with_an_entry_ability() {
+        const EPHEMERATE: &str = "Exile target creature you control, then return it to the battlefield under its owner's control.";
+        let aang = creature("card-1", 0, (3, 3), 5, "When Aang enters, look at the top five cards of your library.");
+        let vanilla = creature("card-2", 0, (1, 1), 1, "");
+        let mut bot = SimpleAi::default();
+        bot.observe(view(0, StepKind::Main1, vec![(ZoneKind::Battlefield, 0, vec![vanilla, aang])]));
+        bot.pending_voluntary_cast = Some("card-9".into());
+        let out = targets(&mut bot, "card-9", EPHEMERATE, "exile", &["card-2", "card-1"], 1, true);
+        assert_eq!(out["chosen"][0]["id"], "card-1");
+    }
+
+    /// DEV-046: a counterspell needs an opposing spell; an ability on the stack, or only our own
+    /// spell there, is not a target worth starting a cast for.
+    #[test]
+    fn a_counterspell_is_cast_for_an_opposing_spell_only() {
+        for (controller, is_spell, expected) in [("player-1", true, "act"), ("player-1", false, "pass"), ("player-0", true, "pass")] {
+            let islands: Vec<_> = (0..3).map(|i| land(&format!("card-{}", 20 + i), 0, "Island")).collect();
+            let hand = vec![spell_card("card-9", "{U}{U}", 2, "Counter target spell.")];
+            let mut view = view(0, StepKind::Main1, vec![(ZoneKind::Battlefield, 0, islands), (ZoneKind::Hand, 0, hand)]);
+            view.stack.push(StackObjectDto { id: "stack-1".into(), controller_id: controller.into(), is_spell,
+                text: "Draw a card.".into(), source_card: Some(spell_card("card-30", "{1}{U}", 2, "Draw a card.")), ..Default::default() });
+            let mut bot = SimpleAi::default();
+            bot.observe(view);
+            assert_eq!(cast_choice(&mut bot, "card-9"), expected, "{controller} spell={is_spell}");
+        }
+    }
+
+    /// The counter's target prompt takes the opposing spell rather than cancelling.
+    #[test]
+    fn a_counterspell_targets_the_opposing_spell() {
+        let mut view = view(0, StepKind::Main1, vec![]);
+        view.stack.push(StackObjectDto { id: "stack-1".into(), controller_id: "player-1".into(), is_spell: true,
+            text: "Draw a card.".into(), source_card: Some(spell_card("card-30", "{1}{U}", 2, "Draw a card.")), ..Default::default() });
+        let mut bot = SimpleAi::default();
+        bot.observe(view);
+        bot.pending_voluntary_cast = Some("card-9".into());
+        let prompt: AgentPrompt = serde_json::from_value(json!({"promptId":1,"decidingPlayerId":"player-0","sourceCard":{"id":"card-9","text":"Counter target spell."},
+            "sourceAbilityText":"Counter target spell.","input":{"type":"chooseBoardTargets","presentation":{"title":"Counter","targets":[]},
+            "candidates":[{"id":"stack-1","kind":"spell"}],"hostile":true,"intent":"counter","minTargets":1,"maxTargets":1,"chosenTargets":0,"cancellable":true}})).unwrap();
+        let out = serde_json::to_value(bot.decide(prompt).unwrap()).unwrap()["output"].clone();
+        assert_eq!(out["chosen"][0]["id"], "stack-1");
+    }
+
+    /// A removal spell with exactly one legal target (an opposing creature) completes.
+    #[test]
+    fn removal_with_one_legal_target_takes_it() {
+        let mut bot = SimpleAi::default();
+        bot.observe(view(0, StepKind::Main1, vec![(ZoneKind::Battlefield, 1, vec![creature("card-7", 1, (4, 4), 5, "Flying")])]));
+        bot.pending_voluntary_cast = Some("card-9".into());
+        let out = targets(&mut bot, "card-9", "Destroy target creature.", "destroy", &["card-7"], 1, true);
+        assert_eq!(out["chosen"][0]["id"], "card-7");
+    }
+
+    /// A cast cancelled at target selection is not started again against the same board.
+    #[test]
+    fn a_copied_spell_gets_new_targets_instead_of_fizzling_the_original() {
+        let stack_with = |text: &str| {
+            let mut view = view(0, StepKind::Main1, vec![]);
+            view.stack.push(StackObjectDto { id: "stack-1".into(), controller_id: "player-0".into(), is_spell: true,
+                text: text.into(), ..Default::default() });
+            let mut bot = SimpleAi::default();
+            bot.observe(view);
+            bot
+        };
+        let mut damage = stack_with("Firebending Lesson deals 2 damage to target creature.");
+        assert!(confirm(&mut damage, "card-1", "Choose new targets for the copy?"));
+        // Retargeting a copy of Expansion would only copy the copy again, without end.
+        let mut copier = stack_with("Copy target instant or sorcery spell with mana value 4 or less. You may choose new targets for the copy.");
+        copier.view.as_mut().unwrap().stack.push(StackObjectDto { id: "stack-2".into(), controller_id: "player-0".into(), is_spell: true,
+            text: "Lightning Bolt deals 3 damage to any target.".into(), ..Default::default() });
+        assert!(!confirm(&mut copier, "card-1", "Choose new targets for the copy?"));
+    }
+
+    #[test]
+    fn a_counter_clause_names_the_spells_it_can_take() {
+        let types = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        let (creature, instant, enchant) = (types(&["Creature"]), types(&["Instant"]), types(&["Enchantment"]));
+        let allows = SimpleAi::counter_clause_allows;
+        assert!(allows("you may exile a blue card rather than pay. counter target spell.", &creature));
+        assert!(!allows("counter target noncreature spell.", &creature));
+        assert!(allows("counter target noncreature spell.", &instant));
+        assert!(allows("counter target creature spell.", &creature) && !allows("counter target creature spell.", &instant));
+        assert!(allows("counter target enchantment, instant, or sorcery spell.", &enchant));
+        assert!(!allows("counter target enchantment, instant, or sorcery spell.", &creature));
+        assert!(allows("counter target multicolored spell.", &creature), "an unknown qualifier is left to the target prompt");
+    }
+
+    /// A cast the engine could not start (the card is still in hand at the next action prompt)
+    /// is not chosen again against the same board.
+    #[test]
+    fn a_cast_that_never_reached_the_stack_is_not_chosen_again() {
+        let lands: Vec<_> = (0..3).map(|i| land(&format!("card-{}", 20 + i), 0, "Island")).collect();
+        let mut hand_card = spell_card("card-9", "{U}", 1, "Draw a card.");
+        hand_card.zone = Some(ZoneKind::Hand);
+        let mut bot = SimpleAi::default();
+        bot.observe(view(0, StepKind::Main1, vec![(ZoneKind::Battlefield, 0, lands.clone()), (ZoneKind::Hand, 0, vec![hand_card.clone()])]));
+        assert_eq!(cast_choice(&mut bot, "card-9"), "act");
+        // The next action prompt: the card is still in hand and the stack is unchanged.
+        bot.observe(view(0, StepKind::Main1, vec![(ZoneKind::Battlefield, 0, lands), (ZoneKind::Hand, 0, vec![hand_card])]));
+        bot.attempted_actions.clear();
+        assert_eq!(cast_choice(&mut bot, "card-9"), "pass");
+    }
+
+    #[test]
+    fn a_cancelled_play_is_not_restarted_until_the_board_changes() {
+        const BLINK: &str = "Exile target creature you control, then return that card to the battlefield under your control.";
+        let mut bot = SimpleAi::default();
+        bot.observe(view(0, StepKind::Main1, vec![(ZoneKind::Battlefield, 0, vec![creature("card-2", 0, (0, 1), 1, "")])]));
+        bot.pending_voluntary_cast = Some("card-9".into());
+        assert_eq!(targets(&mut bot, "card-9", BLINK, "exile", &["card-2"], 1, true)["type"], "cancel");
+        assert_eq!(bot.cancelled_plays.get("card-9"), Some(&bot.board_signature()));
+        let before = bot.board_signature();
+        bot.observe(view(0, StepKind::Main1, vec![(ZoneKind::Battlefield, 0, vec![creature("card-2", 0, (0, 1), 1, ""), creature("card-3", 0, (1, 1), 1, "")])]));
+        assert_ne!(bot.board_signature(), before, "a new permanent is a new board");
     }
 
     #[test]
