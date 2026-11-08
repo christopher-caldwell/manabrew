@@ -126,7 +126,7 @@ where
     let mut mana_loop_invalid_count = 0u32;
     // A declined activation is not progress. Hide that ability (all colors)
     // until a different successful action changes the payment state.
-    let mut rejected_mana_abilities = std::collections::HashSet::new();
+    let mut rejected_mana_abilities = crate::det::HashSet::default();
     let mut executed_actions: Vec<ManaCostAction> = Vec::new();
     let mut convoke_used = false;
     let mut convoke_records: Vec<(CardId, u64)> = Vec::new();
@@ -194,8 +194,23 @@ where
     loop {
         let mana_sources =
             mana::collect_mana_payment_sources(game, session.player, session.reserved_sacrifices);
+        // Offer only sources whose mana restriction allows this payment (DEV-056): Giada's
+        // Angel-only mana is not a way to pay for an artifact's ability.
+        let payment_ctx = {
+            let card = game.card(session.card_id);
+            mana::ManaPaymentContext {
+                is_spell: !session.is_activated_ability,
+                payment_card: Some(session.card_id),
+                is_activated_ability: session.is_activated_ability,
+                type_line: Some(card.type_line.clone()),
+                card_name: Some(card.card_name.clone()),
+                card_color: Some(card.color),
+                ..Default::default()
+            }
+        };
         let lands: Vec<_> = mana_sources.source_cards.iter().copied()
-            .filter(|&id| !session.exclude_pending_source || id != session.card_id).collect();
+            .filter(|&id| !session.exclude_pending_source || id != session.card_id)
+            .filter(|&id| mana::mana_source_fits_payment(game, id, None, &payment_ctx)).collect();
         let convoke_sources: Vec<_> = convoke_payment_sources(game, session.player, session.card_id)
             .into_iter().filter(|&source| {
                 let atom = convoke_atom(game, source, session.mana_cost);
@@ -207,6 +222,7 @@ where
         tappable_lands.extend(convoke_sources.iter().copied());
         let mut mana_ability_options = mana_sources.mana_ability_options;
         if session.exclude_pending_source { mana_ability_options.retain(|o| o.card_id != session.card_id); }
+        mana_ability_options.retain(|o| mana::mana_source_fits_payment(game, o.card_id, Some(o.ability_index), &payment_ctx));
         // Offer costed mana abilities when their costs can be paid without
         // using the ability's own source.
         for &source in &lands {

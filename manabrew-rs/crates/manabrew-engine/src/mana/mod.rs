@@ -317,6 +317,39 @@ pub fn payment_context_for_sa(game: &GameState, sa: &SpellAbility) -> ManaPaymen
 }
 
 /// Check if a mana with the given restriction can be spent in the given context.
+/// Whether `source` can put mana into the payment `ctx` describes: at least one of its mana
+/// abilities (or just `ability_index`) is unrestricted or its `RestrictValid$` allows the payment.
+/// The prompted payment uses it so a source such as Giada's (`Spell.Angel`) is not offered for an
+/// activated ability, matching what the automatic payer would accept.
+pub(crate) fn mana_source_fits_payment(
+    game: &GameState,
+    source: CardId,
+    ability_index: Option<usize>,
+    ctx: &ManaPaymentContext,
+) -> bool {
+    let card = game.card(source);
+    let mut abilities = card
+        .activated_abilities
+        .iter()
+        .filter(|a| a.is_mana_ability)
+        .filter(|a| ability_index.is_none_or(|i| a.ability_index == i))
+        .peekable();
+    if abilities.peek().is_none() {
+        return true; // not a mana ability we can judge (convoke, hand sources, ...)
+    }
+    abilities.any(|ab| match ab.restrict_valid.as_deref() {
+        None => true,
+        Some(raw) => {
+            let resolved = if raw.contains("ChosenType") {
+                raw.replace("ChosenType", &card.chosen_type.clone().unwrap_or_default())
+            } else {
+                raw.to_string()
+            };
+            mana_meets_restriction(&resolved, ctx)
+        }
+    })
+}
+
 pub fn mana_meets_restriction(restriction: &str, ctx: &ManaPaymentContext) -> bool {
     // Multiple comma-separated restrictions: any match is OK (OR logic)
     for part in restriction.split(',') {
@@ -2035,6 +2068,60 @@ mod tests {
         assert!(pool.can_pay_for_spell(&ManaCost::parse("B"), &ctx));
         assert!(pool.try_pay_for_spell(&ManaCost::parse("B"), &ctx));
         assert_eq!(pool.total_mana(), 0);
+    }
+}
+
+#[cfg(test)]
+mod restricted_source_payment_context {
+    //! DEV-056: a source whose mana is restricted to Angel spells is offered for an Angel spell and
+    //! not for an artifact's activated ability.
+    use super::*;
+    use crate::ability::activated::parse_activated_ability;
+    use crate::card::Card;
+    use forge_foundation::{CardTypeLine, ColorSet, ManaCost, ZoneType};
+
+    fn source(game: &mut GameState, name: &str, ability: &str) -> CardId {
+        let player = PlayerId(0);
+        let mut card = Card::new(
+            CardId(0),
+            name.to_string(),
+            player,
+            CardTypeLine::parse("Legendary Creature Angel"),
+            ManaCost::zero(),
+            ColorSet::COLORLESS,
+            None,
+            None,
+            vec![],
+            vec![],
+        );
+        card.abilities = vec![ability.to_string()];
+        card.activated_abilities = vec![parse_activated_ability(ability, 0).unwrap()];
+        let id = game.create_card(card);
+        game.add_card_to_zone(ZoneType::Battlefield, player, id);
+        game.card_mut(id).zone = ZoneType::Battlefield;
+        id
+    }
+
+    fn payment(is_spell: bool, types: &str) -> ManaPaymentContext {
+        ManaPaymentContext {
+            is_spell,
+            is_activated_ability: !is_spell,
+            type_line: Some(CardTypeLine::parse(types)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn angel_only_mana_is_offered_for_angel_spells_only() {
+        let mut game = GameState::new(&["A", "B"], 40);
+        let giada = source(&mut game, "Giada", "AB$ Mana | Cost$ T | Produced$ W | RestrictValid$ Spell.Angel");
+        let plains = source(&mut game, "Plains", "AB$ Mana | Cost$ T | Produced$ W");
+        assert!(mana_source_fits_payment(&game, giada, None, &payment(true, "Creature Angel")));
+        assert!(!mana_source_fits_payment(&game, giada, None, &payment(true, "Creature Human")));
+        assert!(!mana_source_fits_payment(&game, giada, None, &payment(false, "Artifact")));
+        assert!(!mana_source_fits_payment(&game, giada, Some(0), &payment(false, "Artifact")));
+        // Unrestricted mana fits every payment.
+        assert!(mana_source_fits_payment(&game, plains, None, &payment(false, "Artifact")));
     }
 }
 
