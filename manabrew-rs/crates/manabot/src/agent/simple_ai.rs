@@ -1069,6 +1069,64 @@ impl SimpleAi {
         false
     }
 
+    /// Whether an optional ("you may") effect that benefits only the deciding player is worth
+    /// taking. Gains: search, draw, create, copy. Costs (life, discard) must be worth it.
+    fn accepts_optional_effect(&self, title: &str, source_id: &str, player_id: &str) -> bool {
+        let Some(view) = self.view.as_ref() else { return false; };
+        let paying = title.contains("sacrifice") || title.contains("pay {") || title.contains("discard your hand")
+            || title.contains("lose ");
+        if paying { return false; }
+        let library = self.library_count(player_id);
+        let lands = self.lands_in_play(player_id);
+        let life_cost = Self::life_paid(title);
+        if !self.can_spare_life(player_id, life_cost) { return false; }
+        // Free cast of a spell (Swan Song, Rite of Replication): only for a spell with a use.
+        if title.starts_with("do you want to play ") {
+            let Some(card) = self.card(source_id) else { return true; };
+            let text = card.text.to_ascii_lowercase();
+            if Self::roles(card).contains(Roles::COUNTERSPELL) || text.starts_with("counter target") {
+                return view.stack.iter().any(|item| item.controller_id != player_id);
+            }
+            if text.contains("destroy target creature") || text.contains("exile target creature") {
+                return !self.opponent_creatures(player_id).is_empty();
+            }
+            return true;
+        }
+        let searches = title.contains("search your library") || (title.starts_with("search ") && title.ends_with("'s library?"));
+        if searches { return library > 0; }
+        let draws = title.contains("draw ") || title.starts_with("do you want to draw ");
+        if title.contains("you may discard") && draws {
+            // Discard only what is worth less than the card: a land beyond need, or a dead card.
+            let hand = self.zone_cards(player_id, ZoneKind::Hand);
+            let spare = hand.iter().any(|card| {
+                let land = card.types.iter().any(|t| t == "Land");
+                (land && lands >= 5) || (!land && card.cmc >= lands as i32 + 4)
+            });
+            return spare && library >= 6;
+        }
+        if draws && !title.contains("discard") {
+            // Keep the deck-out guard: never draw down to the last few cards.
+            return library >= 6;
+        }
+        if title.contains("become a copy") {
+            return view.zones.iter().filter(|z| z.zone == ZoneKind::Battlefield).flat_map(|z| &z.cards).any(|card| matches!(card,
+                CardView::Visible(card) if card.types.iter().any(|t| t == "Creature") && card.id != source_id
+                    && card.power.as_deref().and_then(|p| p.parse::<i32>().ok()).unwrap_or(0) >= 2));
+        }
+        if title.contains("create a token that's a copy") || (title.contains("you may create") && !title.contains("exile")) {
+            return true;
+        }
+        // A shock land entering: untapped when this turn needs the mana or life is comfortable.
+        if title.starts_with("pay 2 {life} for ") {
+            let Some(land) = self.card(source_id).filter(|card| card.types.iter().any(|t| t == "Land")) else { return false; };
+            let untapped = self.battlefield(player_id).filter(|c| c.id != land.id && !c.tapped && Self::is_mana_source(c)).count() as i32;
+            let needed = view.active_player_id == player_id && self.zone_cards(player_id, ZoneKind::Hand).iter()
+                .any(|card| !card.types.iter().any(|t| t == "Land") && card.cmc == untapped + 1);
+            return needed || self.life_of(player_id) >= 20;
+        }
+        false
+    }
+
     fn wasted_activation(&self, info: &ActivatableAbilityInfo) -> bool {
         let text = info.description.to_ascii_lowercase();
         if let Some(source) = self.card(&info.card_id) {
@@ -2361,7 +2419,8 @@ impl BotAgent for SimpleAi {
                 if useful_reuse || title.contains("you may exile") {
                     self.pending_reuse_target = None;
                 }
-                let value = always_accept || mana_cost_confirmation || useful_single_draw || useful_hand_refill || refill_cost || combo_cost || safe_copy_kicker || pay_single_draw_tax || (accept_once && !repeated)
+                let optional_gain = !repeated && self.accepts_optional_effect(&title, &prompt_source_id, &deciding_player_id);
+                let value = always_accept || optional_gain || mana_cost_confirmation || useful_single_draw || useful_hand_refill || refill_cost || combo_cost || safe_copy_kicker || pay_single_draw_tax || (accept_once && !repeated)
                     || ((useful_reuse || useful_untap || useful_recursion) && !repeated);
                 if useful_hand_refill && prompt_source_id != "none" {
                     self.pending_hand_refill_source = Some(prompt_source_id.clone());
@@ -3999,6 +4058,52 @@ mod execution_audit_policy {
             let mut bot = SimpleAi::default();
             bot.observe(with_library(view(0, StepKind::Main1, vec![(ZoneKind::Battlefield, 0, battlefield)]), 60));
             assert_eq!(act(&mut bot, ability("card-7", cost, search))["type"], expected);
+        }
+    }
+
+    #[test]
+    fn optional_gains_are_taken_and_costly_ones_weigh_their_cost() {
+        const SEARCH: &str = "When CARDNAME enters, you may search your library for a creature card with mana value 1 or less, reveal it, put it into your hand.";
+        const PAY_DRAW: &str = "Whenever the Ring tempts you, you may pay 2 life. If you do, draw a card.";
+        const PAY_TEN: &str = "At the beginning of your upkeep, you may pay 10 life. If you do, draw a card.";
+        const TOKEN: &str = "Whenever another nontoken creature you control dies, you may exile it. If you do, create a token that's a copy of it.";
+        for (title, library, life, expected) in [(SEARCH, 60, 40, true), (SEARCH, 0, 40, false), (PAY_DRAW, 60, 40, true), (PAY_DRAW, 60, 10, false),
+            (PAY_TEN, 60, 25, false), (TOKEN, 60, 40, true), ("Pay {4}?", 60, 40, false), ("Do you want to draw 2 card(s)?", 60, 40, true),
+            ("Do you want to draw 2 card(s)?", 3, 40, false), ("Search kaalia's library?", 60, 40, true)] {
+            let mut v = with_library(view(0, StepKind::Main1, vec![]), library);
+            v.players[0].life = life;
+            let mut bot = SimpleAi::default();
+            bot.observe(v);
+            assert_eq!(confirm(&mut bot, "card-1", title), expected, "{title} library {library} life {life}");
+        }
+    }
+
+    #[test]
+    fn a_shock_land_enters_untapped_when_the_mana_is_needed_or_life_is_comfortable() {
+        let shock = land("card-20", 0, "Mountain");
+        let mut spell = spell_card("card-21", "{2}{R}", 3, "Draw two cards.");
+        spell.types = vec!["Sorcery".into()];
+        for (own_turn, hand, life, expected) in [(0, true, 30, true), (0, true, 15, true), (0, false, 15, false), (1, true, 15, false), (0, false, 40, true)] {
+            let hand = if hand { vec![spell.clone()] } else { vec![] };
+            let battlefield = vec![shock.clone(), land("card-22", 0, "Mountain"), land("card-23", 0, "Mountain")];
+            let mut v = view(own_turn, StepKind::Main1, vec![(ZoneKind::Battlefield, 0, battlefield), (ZoneKind::Hand, 0, hand)]);
+            v.players[0].life = life;
+            let mut bot = SimpleAi::default();
+            bot.observe(v);
+            assert_eq!(confirm(&mut bot, "card-20", "Pay 2 {LIFE} for Mountain?"), expected, "turn {own_turn} life {life}");
+        }
+    }
+
+    #[test]
+    fn an_optional_discard_draw_needs_a_card_worth_less() {
+        const LOOT: &str = "When CARDNAME enters, you may discard a card. If you do, draw a card.";
+        let lands: Vec<_> = (0..6).map(|i| land(&format!("card-3{i}"), 0, "Island")).collect();
+        let extra_land = land("card-40", 0, "Island");
+        let good_spell = spell_card("card-41", "{2}{U}", 3, "Counter target spell.");
+        for (hand, expected) in [(vec![extra_land], true), (vec![good_spell], false)] {
+            let mut bot = SimpleAi::default();
+            bot.observe(with_library(view(0, StepKind::Main1, vec![(ZoneKind::Battlefield, 0, lands.clone()), (ZoneKind::Hand, 0, hand)]), 60));
+            assert_eq!(confirm(&mut bot, "card-1", LOOT), expected);
         }
     }
 
