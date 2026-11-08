@@ -1448,6 +1448,16 @@ impl SimpleAi {
                 && matches!(t.intent, Some(TargetingIntent::Destroy | TargetingIntent::Exile | TargetingIntent::Bounce))))
     }
 
+    /// Two of our pending objects take, remove or counter the same target, the usual state of a
+    /// spell and its copy: whichever resolves second would fizzle, so the copy picks anew.
+    fn own_targets_overlap(&self, player_id: &str) -> bool {
+        let acts = |t: &TargetRef| matches!(t.intent, Some(TargetingIntent::Damage | TargetingIntent::Destroy
+            | TargetingIntent::Exile | TargetingIntent::Bounce | TargetingIntent::Counter));
+        let items = self.own_pending_items(player_id);
+        items.iter().enumerate().any(|(i, item)| item.targets.iter().filter(|t| acts(t)).any(|t|
+            items[i + 1..].iter().any(|other| other.targets.iter().any(|o| acts(o) && o.id == t.id))))
+    }
+
     /// How many of our pending damage objects aim at this target, whatever they deal.
     fn own_damage_hits(&self, player_id: &str, target_id: &str) -> i32 {
         self.own_pending_items(player_id).iter().filter(|item| item.targets.iter().any(|t|
@@ -2137,8 +2147,9 @@ impl BotAgent for SimpleAi {
                         // Never while a copy spell is on the stack: retargeting copies of it
                         // would copy the copy again, without end.
                         !view.stack.iter().any(|item| item.is_spell && effect(item).contains("copy"))
-                            && view.stack.iter().any(|item| item.is_spell
+                            && (view.stack.iter().any(|item| item.is_spell
                                 && ["damage", "destroy", "exile"].iter().any(|word| effect(item).contains(word)))
+                                || self.own_targets_overlap(&deciding_player_id))
                     });
                 let always_accept = retarget_copy
                     || title.contains("cancel search")
@@ -3737,6 +3748,22 @@ mod execution_audit_policy {
             bot.observe(view);
             assert_eq!(cast_choice(&mut bot, "card-9"), expected, "{own_counters} counters already aimed");
         }
+    }
+
+    /// DEV-071: the copy of a spell that takes the same target as the original (Azula's copy of
+    /// Chaos Warp, which has no damage or destroy words) chooses a new one.
+    #[test]
+    fn a_copy_aimed_where_the_original_aims_gets_new_targets() {
+        let mut view = view(0, StepKind::Main1, vec![]);
+        let mut original = own_item("stack-1", "The owner of target permanent shuffles it into their library.", "card-7", "card", "bounce");
+        original.is_spell = true;
+        let mut copy = own_item("stack-2", "The owner of target permanent shuffles it into their library.", "card-7", "card", "bounce");
+        copy.is_spell = true;
+        view.stack.push(original);
+        view.stack.push(copy);
+        let mut bot = SimpleAi::default();
+        bot.observe(view);
+        assert!(confirm(&mut bot, "card-1", "Choose new targets for the copy?"));
     }
 
     /// A cast cancelled at target selection is not started again against the same board.
