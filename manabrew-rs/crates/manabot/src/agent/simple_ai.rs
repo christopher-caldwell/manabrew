@@ -918,7 +918,11 @@ impl SimpleAi {
             }
             AvailableActionKind::ActivateAbility(info) if !info.is_mana_ability => {
                 let text = info.description.to_ascii_lowercase();
+                let land_search = text.starts_with("search your library for") && text.contains("land")
+                    || ["plains", "island", "swamp", "mountain", "forest"].iter().any(|t| text.starts_with("search your library for a") && text.contains(t));
                 if self.useful_lifelink_activation(info) || self.useful_creature_tutor_sacrifice(info) { 1_000 }
+                // A land fetched before the spells are chosen adds its mana to this turn.
+                else if land_search && info.cost.as_deref().is_some_and(|c| c.contains("CARDNAME")) { 700 }
                 else if text.contains("search your library") {
                     240
                 } else if text.contains("draw") || text.contains("create") {
@@ -987,6 +991,84 @@ impl SimpleAi {
                 .is_some_and(|card| !Self::has_keyword(card, "Lifelink") && card.counters.values().any(|count| *count >= 2))
     }
 
+    fn zone_cards(&self, player_id: &str, kind: ZoneKind) -> Vec<&CardDto> {
+        self.view.iter().flat_map(|view| &view.zones)
+            .filter(|zone| zone.zone == kind && zone.owner_id == player_id)
+            .flat_map(|zone| &zone.cards)
+            .filter_map(|card| match card { CardView::Visible(card) => Some(card), CardView::Hidden { .. } => None })
+            .collect()
+    }
+
+    fn library_count(&self, player_id: &str) -> usize {
+        self.view.iter().flat_map(|view| &view.zones)
+            .find(|zone| zone.zone == ZoneKind::Library && zone.owner_id == player_id)
+            .map_or(0, |zone| zone.count)
+    }
+
+    fn life_of(&self, player_id: &str) -> i32 {
+        self.view.as_ref().and_then(|view| view.players.iter().find(|p| p.id == player_id)).map_or(0, |p| p.life)
+    }
+
+    /// Life paid for an effect: "pay 2 life", "Pay 1 {LIFE}".
+    fn life_paid(text: &str) -> i32 {
+        let text = text.to_ascii_lowercase();
+        text.split("pay ").skip(1).filter_map(|part| {
+            let mut words = part.split_whitespace();
+            let amount = words.next()?.parse::<i32>().ok()?;
+            words.next().filter(|word| word.trim_matches(|c: char| !c.is_alphabetic()) == "life")?;
+            Some(amount)
+        }).max().unwrap_or(0)
+    }
+
+    /// Life that must remain after paying `cost`: the bigger the cost, the more cushion.
+    fn can_spare_life(&self, player_id: &str, cost: i32) -> bool {
+        cost <= 0 || self.life_of(player_id) >= 10 + 2 * cost
+    }
+
+    /// A creature the bot would give up for value: a token or a small, non-legendary body.
+    fn is_fodder(card: &CardDto) -> bool {
+        card.types.iter().any(|t| t == "Creature") && card.commander_tax.is_none()
+            && !card.supertypes.iter().any(|t| t == "Legendary")
+            && (card.identity.is_token || Self::card_value(card) <= 12)
+    }
+
+    /// Whether a sacrifice ability gains more than it gives up. A spent permanent (fetch land,
+    /// Clue, Mind Stone, Sakura-Tribe Elder) is cheap to give up; another permanent must be fodder.
+    fn worthwhile_sacrifice(&self, info: &ActivatableAbilityInfo) -> bool {
+        let (Some(source), Some(view)) = (self.card(&info.card_id), self.view.as_ref()) else { return false; };
+        let me = source.controller_id.as_str();
+        let cost = info.cost.as_deref().unwrap_or("").to_ascii_lowercase();
+        let text = info.description.to_ascii_lowercase();
+        let own_turn = view.active_player_id == me;
+        let quiet = view.stack.is_empty();
+        let main = own_turn && quiet && matches!(view.step, StepKind::Main1 | StepKind::Main2);
+        let idle = quiet && ((own_turn && view.step == StepKind::Main2) || view.step == StepKind::EndOfTurn);
+        if !self.can_spare_life(me, Self::life_paid(&cost)) { return false; }
+        let self_sacrifice = cost.contains("cardname");
+        let searches = text.starts_with("search your library for") && self.library_count(me) > 0;
+        if self_sacrifice {
+            if searches && (text.contains("land") || ["plains", "island", "swamp", "mountain", "forest"].iter().any(|t| text.contains(t))) {
+                return main;
+            }
+            // Cards, not a rock: a mana rock is sacrificed once the lands carry the mana.
+            let rock = Self::is_mana_source(source);
+            if text.starts_with("draw a card") || text.contains("explores") {
+                return idle && (!rock || self.lands_in_play(me) >= 6) && self.library_count(me) >= 6;
+            }
+            if text.contains("gain haste") {
+                let slow: i32 = self.battlefield(me).filter(|c| c.summoning_sick && !c.tapped)
+                    .filter_map(|c| c.power.as_deref().and_then(|p| p.parse::<i32>().ok())).sum();
+                return own_turn && quiet && view.step == StepKind::Main1 && slow >= 4;
+            }
+            return false;
+        }
+        // Another permanent: spend a creature that is fodder, for a tutor.
+        if searches && cost.contains("creature") && !cost.contains("amount: x") {
+            return main && self.battlefield(me).any(|c| c.id != source.id && Self::is_fodder(c));
+        }
+        false
+    }
+
     fn wasted_activation(&self, info: &ActivatableAbilityInfo) -> bool {
         let text = info.description.to_ascii_lowercase();
         if let Some(source) = self.card(&info.card_id) {
@@ -996,10 +1078,8 @@ impl SimpleAi {
             if pending_lifelink && self.life_counter_pinger(&source.controller_id, false).is_some_and(|card| card.id == source.id && !Self::has_keyword(card, "Lifelink")) { return true; }
         }
         if self.useful_lifelink_activation(info) || self.useful_creature_tutor_sacrifice(info) { return false; }
-        if info
-            .cost
-            .as_deref()
-            .is_some_and(|cost| cost.to_ascii_lowercase().contains("sac"))
+        let sacrifices = info.cost.as_deref().is_some_and(|cost| cost.to_ascii_lowercase().contains("sac"));
+        if (sacrifices && !self.worthwhile_sacrifice(info))
             || text.contains("any player may activate")
             || (text.contains(" loses ") && !text.contains("life"))
         {
@@ -3864,4 +3944,62 @@ mod execution_audit_policy {
             assert_eq!(act(&mut bot, actions)["actionId"], expected, "doubler {doubler} lives {lives:?}");
         }
     }
+
+    // ---- Bot fidelity (DEV-075, DEV-076, DEV-077) ----
+
+    fn with_library(mut view: GameViewDto, count: usize) -> GameViewDto {
+        view.zones.push(ZoneDto { zone: ZoneKind::Library, owner_id: "player-0".into(), cards: vec![], count });
+        view
+    }
+    fn ability(card: &str, cost: &str, description: &str) -> Value {
+        json!([{"type":"activateAbility","id":format!("ability:{card}:0"),"cardId":card,"abilityIndex":0,
+            "description":description,"isManaAbility":false,"cost":cost}])
+    }
+    const SAC_SELF: &str = "Sacrifice { amount: Literal(1), type_filter: \"CARDNAME\" }";
+
+    #[test]
+    fn a_fetch_land_is_cracked_on_its_own_turn_and_not_at_low_life() {
+        let fetch = CardDto { id: "card-5".into(), controller_id: "player-0".into(), owner_id: "player-0".into(), types: vec!["Land".into()],
+            text: "{T}, Pay 1 life, Sacrifice this land: Search your library for an Island or Mountain card.".into(), ..Default::default() };
+        let cost = format!("{{T}}, Pay 1 life, {SAC_SELF}");
+        let search = "Search your library for a Island or Mountain card, put it onto the battlefield, then shuffle.";
+        for (step, life, expected) in [(StepKind::Main1, 40, "act"), (StepKind::Main1, 6, "pass"), (StepKind::Upkeep, 40, "pass")] {
+            let mut v = with_library(view(0, step, vec![(ZoneKind::Battlefield, 0, vec![fetch.clone()])]), 60);
+            v.players[0].life = life;
+            let mut bot = SimpleAi::default();
+            bot.observe(v);
+            assert_eq!(act(&mut bot, ability("card-5", &cost, search))["type"], expected, "{step:?} life {life}");
+        }
+    }
+
+    #[test]
+    fn a_clue_is_cracked_with_spare_mana_in_the_second_main_phase_only() {
+        let clue = CardDto { id: "card-6".into(), controller_id: "player-0".into(), owner_id: "player-0".into(), types: vec!["Artifact".into()], ..Default::default() };
+        let cost = format!("{{2}}, {SAC_SELF}");
+        for (step, expected) in [(StepKind::Main2, "act"), (StepKind::Main1, "pass")] {
+            let mut bot = SimpleAi::default();
+            bot.observe(with_library(view(0, step, vec![(ZoneKind::Battlefield, 0, vec![clue.clone()])]), 60));
+            assert_eq!(act(&mut bot, ability("card-6", &cost, "Draw a card."))["type"], expected, "{step:?}");
+        }
+    }
+
+    #[test]
+    fn a_tutor_sacrifices_fodder_and_never_the_commander() {
+        let razaketh = creature("card-7", 0, (5, 5), 8, "Pay 2 life, Sacrifice another creature: Search your library for a card.");
+        let mut commander = creature("card-8", 0, (2, 2), 3, "");
+        commander.supertypes = vec!["Legendary".into()];
+        commander.commander_tax = Some(0);
+        let mut token = creature("card-9", 0, (1, 1), 0, "");
+        token.identity.is_token = true;
+        let cost = "Pay 2 life, Sacrifice { amount: Literal(1), type_filter: \"Creature.Other\" }";
+        let search = "Search your library for a card, put that card into your hand, then shuffle.";
+        for (others, expected) in [(vec![commander.clone()], "pass"), (vec![commander.clone(), token], "act")] {
+            let mut battlefield = vec![razaketh.clone()];
+            battlefield.extend(others);
+            let mut bot = SimpleAi::default();
+            bot.observe(with_library(view(0, StepKind::Main1, vec![(ZoneKind::Battlefield, 0, battlefield)]), 60));
+            assert_eq!(act(&mut bot, ability("card-7", cost, search))["type"], expected);
+        }
+    }
+
 }
