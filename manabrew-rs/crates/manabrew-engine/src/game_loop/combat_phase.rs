@@ -399,15 +399,23 @@ impl GameLoop {
                     let attacker_name = game.card(attacker_id).card_name.clone();
                     let description = format!("Pay {{{cost}}} to attack with {attacker_name}");
 
-                    // Loop: let the agent tap lands / pay / decline
+                    // A declined mana activation is unavailable until another action changes the payment state.
+                    let mut rejected = crate::det::HashSet::default();
+                    let mut invalid_actions = 0;
                     loop {
-                        let tappable_lands = self.get_tappable_lands(game, controller);
+                        let mut tappable_lands = self.get_tappable_lands(game, controller);
                         let pool_snapshot = self.pool(controller).clone();
                         let untappable_lands =
                             self.get_untappable_lands(game, controller, &pool_snapshot);
                         let pool_total = self.pool(controller).total_mana();
-                        let mana_payment_sources =
+                        let mut mana_payment_sources =
                             crate::mana::collect_mana_payment_sources(game, controller, &[]);
+                        mana_payment_sources.mana_ability_options.retain(|option|
+                            !rejected.contains(&(option.card_id, option.ability_index)));
+                        tappable_lands.retain(|id| {
+                            !rejected.iter().any(|(source, _)| source == id)
+                                || mana_payment_sources.mana_ability_options.iter().any(|option| option.card_id == *id)
+                        });
 
                         agents[controller.index()].snapshot_state(game, &self.mana_pools);
                         let action = agents[controller.index()].pay_combat_cost(
@@ -427,7 +435,10 @@ impl GameLoop {
                                 mana_ability_index,
                                 express_choice,
                             } => {
-                                if !tappable_lands.contains(&land_id) {
+                                if !tappable_lands.contains(&land_id)
+                                    || mana_ability_index.is_some_and(|idx| rejected.contains(&(land_id, idx))) {
+                                    invalid_actions += 1;
+                                    if invalid_actions > 3 { cost_failures.push(attacker_id); break; }
                                     continue;
                                 }
                                 let undo_record =
@@ -447,12 +458,12 @@ impl GameLoop {
                                     } else {
                                         c.activated_abilities
                                             .iter()
-                                            .find(|ab| ab.is_mana_ability)
+                                            .find(|ab| ab.is_mana_ability && !rejected.contains(&(land_id, ab.ability_index)))
                                             .cloned()
                                     }
                                 };
                                 if let Some(ab) = mana_ab {
-                                    self.with_shared_state_mutation(
+                                    let resolved = self.with_shared_state_mutation(
                                         game,
                                         agents,
                                         |this, game, agents| {
@@ -463,9 +474,15 @@ impl GameLoop {
                                                 land_id,
                                                 &ab,
                                                 express_choice,
-                                            );
+                                            )
                                         },
                                     );
+                                    if resolved {
+                                        rejected.clear();
+                                        invalid_actions = 0;
+                                    } else {
+                                        rejected.insert((land_id, ab.ability_index));
+                                    }
                                 } else {
                                     let atom_opt = {
                                         let c = game.card(land_id);
@@ -476,6 +493,8 @@ impl GameLoop {
                                         }
                                     };
                                     if let Some(atom) = atom_opt {
+                                        rejected.clear();
+                                        invalid_actions = 0;
                                         game.tap(land_id);
                                         self.pool_mut(controller).add(atom, 1);
                                         self.trigger_handler.run_trigger(
@@ -506,7 +525,10 @@ impl GameLoop {
                                 if !untappable_lands.contains(&land_id) {
                                     continue;
                                 }
-                                self.undo_mana_action(game, controller, land_id);
+                                if self.undo_mana_action(game, controller, land_id) {
+                                    rejected.clear();
+                                    invalid_actions = 0;
+                                }
                             }
                             CombatCostAction::AutoPay => {
                                 self.invalidate_mana_undo_for_player(controller);
@@ -1293,5 +1315,64 @@ mod large_joint_regression {
             assert_eq!(maximum_joint_required(&required,&legal,&[defender],&[],Some(1),&game.cards),Ok(Some(0)),"count={count}");
             assert_eq!(maximum_joint_required(&required,&legal,&[defender],&[],Some(2),&game.cards),Ok(Some(1)),"count={count}");
         }
+    }
+}
+
+#[cfg(test)]
+mod declined_attack_mana_regression {
+    use super::*;
+    use crate::agent::{ManaAbilityOption, PriorityActionSpace, TargetChoice, PassAgent};
+    use crate::player::actions::PlayerAction;
+    use crate::spellability::SpellAbility;
+    use forge_foundation::ZoneType;
+    use std::{cell::Cell, rc::Rc};
+
+    struct Agent { attacker: CardId, land: CardId, prompts: Rc<Cell<usize>> }
+    impl PlayerAgent for Agent {
+        fn choose_land_or_spell(&mut self, _: PlayerId) -> Option<bool> { None }
+        fn mulligan_decision(&mut self, _: PlayerId, _: &[CardId], _: u32) -> bool { true }
+        fn choose_action(&mut self, _: PlayerId, _: Option<&PriorityActionSpace>, _: &mut dyn FnMut() -> PriorityActionSpace) -> PlayerAction { PlayerAction::PassPriority }
+        fn choose_attackers(&mut self, _: PlayerId, _: &[CardId], _: &[combat::DefenderId]) -> Vec<(CardId, combat::DefenderId)> { vec![(self.attacker, combat::DefenderId::Player(PlayerId(1)))] }
+        fn choose_blockers(&mut self, _: PlayerId, _: &[CardId], _: &[CardId], _: Option<usize>) -> Vec<(CardId, CardId)> { vec![] }
+        fn choose_targets_for(&mut self, sa: &mut SpellAbility, game: &GameState, pools: &[ManaPool]) -> bool { crate::spellability::choose_targets_by_kind(self, sa, game, pools) }
+        fn choose_target_player(&mut self, _: PlayerId, valid: &[PlayerId], _: Option<&SpellAbility>) -> Option<PlayerId> { valid.first().copied() }
+        fn choose_target_card(&mut self, _: PlayerId, valid: &[CardId], _: Option<&SpellAbility>) -> Option<CardId> { valid.first().copied() }
+        fn choose_target_any(&mut self, _: PlayerId, _: &[PlayerId], _: &[CardId], _: Option<&SpellAbility>) -> TargetChoice { TargetChoice::None }
+        fn confirm_payment(&mut self, _: PlayerId, _: &str, _: &str, _: Option<CardId>, _: Option<crate::ability::api_type::ApiType>) -> bool { false }
+        fn pay_combat_cost(&mut self, _: PlayerId, _: CardId, _: i32, _: &str, options: &[ManaAbilityOption], lands: &[CardId], _: &[CardId], _: i32) -> CombatCostAction {
+            let count = self.prompts.get(); self.prompts.set(count + 1);
+            assert!(count < 3, "declined mana ability was repeatedly offered");
+            if count == 0 {
+                assert!(options.iter().any(|o| o.card_id == self.land));
+                CombatCostAction::TapLand { card_id: self.land, mana_ability_index: Some(0), express_choice: None }
+            } else {
+                assert!(!options.iter().any(|o| o.card_id == self.land));
+                assert!(!lands.contains(&self.land));
+                CombatCostAction::Decline
+            }
+        }
+    }
+
+    #[test]
+    fn declined_life_mana_is_not_reoffered_for_attack_tax() {
+        std::thread::Builder::new().stack_size(32 * 1024 * 1024).spawn(|| {
+        let mut game = GameState::new(&["A", "B"], 40);
+        let add = |game: &mut GameState, script: &str, owner| {
+            let rules = forge_carddb::parse_card_script(script).unwrap();
+            let id = game.create_card(crate::card::Card::from_rules(&rules, owner));
+            game.move_card(id, ZoneType::Battlefield, owner); id
+        };
+        let attacker = add(&mut game, "Name:Attacker\nTypes:Creature Human\nPT:2/2", PlayerId(0));
+        game.card_mut(attacker).set_summoning_sick(false);
+        let land = add(&mut game, "Name:Mana Confluence\nTypes:Land\nA:AB$ Mana | Cost$ T PayLife<1> | Produced$ Any", PlayerId(0));
+        add(&mut game, "Name:Tax\nTypes:Enchantment\nS:Mode$ CantAttackUnless | ValidCard$ Creature | Target$ You | Cost$ 1", PlayerId(1));
+        let prompts = Rc::new(Cell::new(0));
+        let mut agents: Vec<Box<dyn PlayerAgent>> = vec![Box::new(Agent { attacker, land, prompts: prompts.clone() }), Box::new(PassAgent)];
+        GameLoop::new(2).step_combat(&mut game, &mut agents);
+        assert_eq!(prompts.get(), 2);
+        assert!(!game.card(land).tapped);
+        assert_eq!(game.player(PlayerId(0)).life, 40);
+        assert_eq!(game.player(PlayerId(1)).life, 40);
+        }).unwrap().join().unwrap();
     }
 }
