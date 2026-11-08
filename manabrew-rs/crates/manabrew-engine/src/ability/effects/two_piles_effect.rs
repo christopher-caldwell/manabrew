@@ -4,9 +4,9 @@ use super::{emit_zone_trigger, resolve_numeric_svar, EffectContext};
 use crate::ids::CardId;
 use crate::parsing::keys;
 
-/// `SP$ TwoPiles` — divide cards into two piles and an opponent chooses one.
+/// `SP$ TwoPiles` — an opponent divides cards into two piles and the controller chooses one.
 ///
-/// Mirrors Java's `TwoPilesEffect.java` (simplified — auto-divides).
+/// Mirrors Java's `TwoPilesEffect.java`: an opponent separates, the controller chooses.
 /// - `NumCards$` — number of cards to reveal from library (default 5).
 /// - `Zone1$` — destination for the chosen pile (default Hand).
 /// - `Zone2$` — destination for the unchosen pile (default Graveyard).
@@ -44,37 +44,45 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
         return;
     }
 
-    // Controller divides into two piles — simplified: they choose cards for pile 1
-    // via choose_cards_for_effect (min 0, max count-1 to ensure both piles have at least 1 if count>1)
+    // An opponent separates the revealed cards into two piles and the controller
+    // chooses one. The separator is offered every revealed card, so it can weigh them.
+    let opponent = ctx.game.opponent_of(controller);
     let min_pile1 = if count > 1 { 1 } else { 0 };
     let max_pile1 = if count > 1 { count - 1 } else { count };
 
-    let pile1: Vec<CardId> = ctx.agents[controller.index()]
-        .choose_cards_for_effect(controller, &revealed, min_pile1, max_pile1);
+    let pile1: Vec<CardId> = ctx.agents[opponent.index()]
+        .choose_cards_for_zone_change(
+            ctx.game,
+            opponent,
+            &revealed,
+            min_pile1,
+            max_pile1,
+            "Separate the cards into two piles: choose the cards for pile 1",
+        )
+        .into_iter()
+        .filter(|c| revealed.contains(c))
+        .collect();
     let pile2: Vec<CardId> = revealed
         .iter()
         .filter(|c| !pile1.contains(c))
         .copied()
         .collect();
 
-    // Opponent chooses which pile goes to zone1
-    let opponent = ctx.game.opponent_of(controller);
-    let pile1_names: Vec<String> = pile1
-        .iter()
-        .map(|&cid| ctx.game.card(cid).card_name.clone())
-        .collect();
-    let pile2_names: Vec<String> = pile2
-        .iter()
-        .map(|&cid| ctx.game.card(cid).card_name.clone())
-        .collect();
-
+    // The controller names one card of the pile to take. The offered cards list pile 1
+    // first, then pile 2; the prompt says how many belong to pile 1.
+    let offered: Vec<CardId> = pile1.iter().chain(pile2.iter()).copied().collect();
     let prompt = format!(
-        "Choose a pile: Pile 1 ({}) or Pile 2 ({})?",
-        pile1_names.join(", "),
-        pile2_names.join(", "),
+        "Choose a pile: the first {} cards are Pile 1 and the rest are Pile 2. Select one card from the pile you take",
+        pile1.len(),
     );
-    let choose_pile1 =
-        ctx.agents[opponent.index()].choose_optional_trigger(opponent, &prompt, sa.source, sa.api);
+    let pick = ctx.agents[controller.index()]
+        .choose_cards_for_zone_change(ctx.game, controller, &offered, 1, 1, &prompt)
+        .into_iter()
+        .next();
+    let choose_pile1 = match pick {
+        Some(card) => pile1.contains(&card),
+        None => pile2.is_empty(),
+    };
 
     let (chosen_pile, unchosen_pile) = if choose_pile1 {
         (pile1, pile2)

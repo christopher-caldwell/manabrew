@@ -1127,6 +1127,34 @@ impl SimpleAi {
         false
     }
 
+    /// The caster's pile: the one with more value, by the revealed cards' values. Cards are
+    /// listed pile 1 first, then pile 2; `split` is how many belong to pile 1.
+    fn better_pile_card(cards: &[CardDto], split: usize) -> Option<String> {
+        let value = |card: &CardDto| if card.types.iter().any(|t| t == "Land") { 4 } else { Self::card_value(card).max(5) };
+        let (first, second) = cards.split_at(split.min(cards.len()));
+        let pile_value = |pile: &[CardDto]| pile.iter().map(value).sum::<i32>();
+        let pile = if pile_value(first) >= pile_value(second) { first } else { second };
+        pile.iter().max_by_key(|card| value(card)).map(|card| card.id.clone())
+    }
+
+    /// The separator's piles: the split that leaves the caster the least, i.e. the lowest
+    /// value in the bigger-valued pile, found over every division of the cards.
+    fn pile_one_cards(cards: &[CardDto], min: usize, max: usize) -> Vec<String> {
+        let value = |card: &CardDto| if card.types.iter().any(|t| t == "Land") { 4 } else { Self::card_value(card).max(5) };
+        let values: Vec<i32> = cards.iter().map(value).collect();
+        let total: i32 = values.iter().sum();
+        let n = cards.len().min(16);
+        let mut best: Option<(i32, u32)> = None;
+        for mask in 1u32..(1 << n) {
+            let size = mask.count_ones() as usize;
+            if size < min || size > max { continue; }
+            let one: i32 = (0..n).filter(|i| mask & (1 << i) != 0).map(|i| values[i]).sum();
+            let worst = one.max(total - one);
+            if best.is_none_or(|(w, _)| worst < w) { best = Some((worst, mask)); }
+        }
+        best.map(|(_, mask)| (0..n).filter(|i| mask & (1 << i) != 0).map(|i| cards[i].id.clone()).collect()).unwrap_or_default()
+    }
+
     fn wasted_activation(&self, info: &ActivatableAbilityInfo) -> bool {
         let text = info.description.to_ascii_lowercase();
         if let Some(source) = self.card(&info.card_id) {
@@ -2811,6 +2839,16 @@ impl BotAgent for SimpleAi {
                 max,
             }) => {
                 let title = presentation.title.to_ascii_lowercase();
+                if title.starts_with("separate the cards into two piles") {
+                    return Some(PromptOutput::ChooseCards(ChooseCardsOutput::ChooseCardsDecision {
+                        chosen_card_ids: Self::pile_one_cards(&cards, min, max),
+                    }));
+                }
+                if let Some(split) = title.strip_prefix("choose a pile: the first ").and_then(|rest| rest.split_whitespace().next()).and_then(|n| n.parse::<usize>().ok()) {
+                    return Some(PromptOutput::ChooseCards(ChooseCardsOutput::ChooseCardsDecision {
+                        chosen_card_ids: Self::better_pile_card(&cards, split).into_iter().collect(),
+                    }));
+                }
                 let discard = title.contains("discard");
                 let hand_reorder = prompt_source_text.contains("from your hand on top")
                     || prompt_source_text.contains("from your hand on the bottom");
@@ -4107,4 +4145,15 @@ mod execution_audit_policy {
         }
     }
 
+    #[test]
+    fn a_pile_split_is_balanced_and_the_caster_takes_the_better_pile() {
+        let big = creature("card-50", 1, (6, 6), 6, "");
+        let mut cards = vec![big.clone()];
+        cards.extend((51..55).map(|i| land(&format!("card-{i}"), 1, "Swamp")));
+        let one = SimpleAi::pile_one_cards(&cards, 1, 4);
+        assert!((1..=4).contains(&one.len()), "never 0 and 5: {one:?}");
+        let order: Vec<_> = cards.iter().filter(|c| one.contains(&c.id)).chain(cards.iter().filter(|c| !one.contains(&c.id))).cloned().collect();
+        let pick = SimpleAi::better_pile_card(&order, one.len()).unwrap();
+        assert_eq!(pick, "card-50", "the caster names the pile with the big creature");
+    }
 }
