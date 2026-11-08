@@ -35,17 +35,39 @@ pub trait GameRng {
     }
 }
 
-/// Default RNG using `rand::thread_rng()` — non-deterministic, for normal gameplay.
+thread_local! {
+    static SEEDED: std::cell::RefCell<Option<rand::rngs::StdRng>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Seeds this thread's effect RNG. Every effect that shuffles or rolls through
+/// [`ThreadRngAdapter`], [`with_effect_rng`] or `CardLists::shuffle` then draws from one seeded
+/// stream, so the same seed and the same decisions replay the same game. Until it is called,
+/// the RNG is the system's thread-local one.
+pub fn seed_effect_rng(seed: u64) {
+    use rand::SeedableRng;
+    SEEDED.with(|rng| *rng.borrow_mut() = Some(rand::rngs::StdRng::seed_from_u64(seed)));
+}
+
+/// Runs `f` with this thread's seeded effect RNG, or the system thread RNG if none was seeded.
+pub fn with_effect_rng<T>(f: impl FnOnce(&mut dyn rand::RngCore) -> T) -> T {
+    SEEDED.with(|rng| match rng.borrow_mut().as_mut() {
+        Some(seeded) => f(seeded),
+        None => f(&mut rand::thread_rng()),
+    })
+}
+
+/// Default effect RNG: the seeded stream if [`seed_effect_rng`] was called on this thread,
+/// otherwise `rand::thread_rng()` (non-deterministic).
 pub struct ThreadRngAdapter;
 
 impl GameRng for ThreadRngAdapter {
     fn shuffle_cards(&mut self, cards: &mut [CardId]) {
         use rand::seq::SliceRandom;
-        cards.shuffle(&mut rand::thread_rng());
+        with_effect_rng(|rng| cards.shuffle(rng));
     }
 
     fn next_int(&mut self, bound: i32) -> i32 {
         use rand::Rng;
-        rand::thread_rng().gen_range(0..bound)
+        with_effect_rng(|rng| rng.gen_range(0..bound))
     }
 }

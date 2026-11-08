@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use super::attack_requirement::{self, AttackRequirement};
 use super::attack_restriction::{self, AttackRestrictionType};
@@ -27,7 +27,7 @@ pub struct AttackConstraints {
 #[derive(Debug, Clone)]
 pub struct AttackRestriction {
     pub attacker: CardId,
-    pub types: std::collections::HashSet<AttackRestrictionType>,
+    pub types: crate::det::HashSet<AttackRestrictionType>,
     pub cant_attack: bool,
     pub cant_attack_defenders: Vec<DefenderId>,
 }
@@ -91,8 +91,8 @@ impl AttackRestriction {
         &self,
         attackers: &[(CardId, DefenderId)],
         cards: &[Card],
-    ) -> std::collections::HashSet<AttackRestrictionType> {
-        let mut violations = std::collections::HashSet::new();
+    ) -> crate::det::HashSet<AttackRestrictionType> {
+        let mut violations = crate::det::HashSet::default();
         let n = attackers.len();
 
         if self.types.contains(&AttackRestrictionType::OnlyAlone) && n > 1 {
@@ -133,7 +133,7 @@ impl AttackRestriction {
         violations
     }
 
-    pub fn get_types(&self) -> &std::collections::HashSet<AttackRestrictionType> {
+    pub fn get_types(&self) -> &crate::det::HashSet<AttackRestrictionType> {
         &self.types
     }
 }
@@ -165,8 +165,8 @@ impl AttackConstraints {
             possible_defenders,
         );
 
-        let mut restrictions = HashMap::new();
-        let mut requirements = HashMap::new();
+        let mut restrictions = HashMap::default();
+        let mut requirements = HashMap::default();
 
         for &attacker in &possible_attackers {
             restrictions.insert(
@@ -276,7 +276,7 @@ impl AttackConstraints {
 
         // Greedy: add creatures with requirements in priority order
         let mut attack_map: Vec<(CardId, DefenderId)> = Vec::new();
-        let mut used: std::collections::HashSet<CardId> = std::collections::HashSet::new();
+        let mut used: crate::det::HashSet<CardId> = crate::det::HashSet::default();
         let mut remaining_max = max;
 
         for req in &reqs {
@@ -401,7 +401,7 @@ mod scoped_combat_regression {
     use super::*;
     use crate::card::Card;
     use forge_carddb::parse_card_script;
-    use std::collections::{HashMap, HashSet};
+    use crate::det::{HashMap, HashSet};
 
     fn fixture_cards() -> Vec<Card> {
         let rules = parse_card_script("Name:Attacker\nTypes:Creature Human\nPT:2/2").unwrap();
@@ -409,15 +409,15 @@ mod scoped_combat_regression {
     }
     fn required(id: CardId, defender: DefenderId) -> AttackRequirement {
         AttackRequirement { attacker: id, must_attack_any: true, must_attack_defender: None,
-            goaded_by: None, defender_specific: HashMap::from([(defender, 1)]) }
+            goaded_by: None, defender_specific: HashMap::from_iter([(defender, 1)]) }
     }
     fn constraints() -> AttackConstraints {
         let defender = DefenderId::Player(PlayerId(1));
         AttackConstraints { possible_attackers: vec![CardId(0), CardId(1)],
             possible_defenders: vec![defender],
-            global_restrictions: GlobalAttackRestrictions { max: Some(1), defender_max: HashMap::new() },
-            restrictions: HashMap::new(),
-            requirements: HashMap::from([(CardId(0), required(CardId(0), defender)),
+            global_restrictions: GlobalAttackRestrictions { max: Some(1), defender_max: HashMap::default() },
+            restrictions: HashMap::default(),
+            requirements: HashMap::from_iter([(CardId(0), required(CardId(0), defender)),
                                          (CardId(1), required(CardId(1), defender))]) }
     }
     #[test]
@@ -440,7 +440,7 @@ mod scoped_combat_regression {
         let defender = DefenderId::Player(PlayerId(1));
         c.global_restrictions.defender_max.insert(defender, 1);
         c.restrictions.insert(CardId(0), AttackRestriction { attacker: CardId(0),
-            types: HashSet::from([AttackRestrictionType::OnlyAlone]), cant_attack: false,
+            types: HashSet::from_iter([AttackRestrictionType::OnlyAlone]), cant_attack: false,
             cant_attack_defenders: vec![] });
         assert_eq!(c.count_violations(&[(CardId(0), defender)], &cards), 1);
         assert_eq!(c.count_violations(&[(CardId(0), defender), (CardId(1), defender)], &cards), -1);

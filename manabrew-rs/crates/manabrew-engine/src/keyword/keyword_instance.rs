@@ -2,7 +2,7 @@
 //!
 //! Ported from Java's `KeywordInstance.java` and `Keyword.java` in `forge/game/keyword/`.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 use std::fmt;
 
 /// Base data shared by all keyword instances.
@@ -59,7 +59,7 @@ impl KeywordInstance {
             replacements: Vec::new(),
             spell_abilities: Vec::new(),
             static_abilities: Vec::new(),
-            svars: HashMap::new(),
+            svars: HashMap::default(),
         }
     }
 
@@ -182,7 +182,9 @@ impl KeywordInstance {
 
 /// The Keyword enum with all keyword variants.
 /// Mirrors Java's `Keyword` enum with 213 entries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum Keyword {
     Undefined,
     Absorb,

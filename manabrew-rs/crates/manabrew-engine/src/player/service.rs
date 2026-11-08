@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use crate::det::HashSet;
 
 use forge_foundation::ZoneType;
 
@@ -827,7 +827,7 @@ impl GameState {
     }
 
     pub fn player_graveyard_type_count(&self, player: PlayerId) -> usize {
-        let mut types = HashSet::new();
+        let mut types = HashSet::default();
         for &cid in self.cards_in_zone(ZoneType::Graveyard, player) {
             let card = self.card(cid);
             for core_type in &card.type_line.core_types {

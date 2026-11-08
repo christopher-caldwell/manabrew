@@ -1599,7 +1599,7 @@ pub fn resolve_count_svar_for_sa(
             .with_game(game)
             .with_spell_ability(sa)
             .with_source_controller(controller);
-        let mut counts = std::collections::HashMap::new();
+        let mut counts = crate::det::HashMap::default();
         let mut changelings = 0;
         for card in &game.cards {
             if card.zone != ZoneType::Battlefield || card.phased_out
@@ -1613,7 +1613,7 @@ pub fn resolve_count_svar_for_sa(
             }
             // A multitype card contributes once to each creature subtype;
             // unrelated subtypes such as Forest or Equipment never count.
-            let mut seen = std::collections::HashSet::new();
+            let mut seen = crate::det::HashSet::default();
             for subtype in &card.type_line.subtypes {
                 if crate::game::TypeRegistry::is_creature_type(subtype) && seen.insert(subtype) {
                     *counts.entry(subtype.as_str()).or_insert(0) += 1;
@@ -1629,7 +1629,7 @@ pub fn resolve_count_svar_for_sa(
     if let Some(valid) = body.strip_prefix("Count$MostCardName ") {
         let selector = crate::parsing::cached_compiled_selector(valid);
         let source = game.card(source_id);
-        let mut counts = std::collections::HashMap::new();
+        let mut counts = crate::det::HashMap::default();
         for card in &game.cards {
             if card.zone == ZoneType::Battlefield && !card.phased_out
                 && crate::card::valid_filter::matches_valid_card_selector_in_game(

@@ -1,6 +1,7 @@
 use forge_foundation::{PhaseType, ZoneType};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap};
+use crate::det::{HashMap};
 
 use crate::ability::AbilityKey;
 use crate::agent::GameEntity;

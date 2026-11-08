@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::ids::{CardId, PlayerId};
 use crate::spellability::SpellAbility;

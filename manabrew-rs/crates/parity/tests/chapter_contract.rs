@@ -282,10 +282,10 @@ fn resolve_effect<E: SpellAbilityEffect>(
 ) {
     let mut agents = pass_agents();
     let mut mana_pools = vec![ManaPool::default(), ManaPool::default()];
-    let token_templates = HashMap::new();
-    let token_art_variants = HashMap::new();
-    let token_fallback = HashMap::new();
-    let edition_dates = HashMap::new();
+    let token_templates = manabrew_engine::det::HashMap::default();
+    let token_art_variants = manabrew_engine::det::HashMap::default();
+    let token_fallback = manabrew_engine::det::HashMap::default();
+    let edition_dates = manabrew_engine::det::HashMap::default();
     let mut rng = ThreadRngAdapter;
     let mut ctx = EffectContext {
         game,

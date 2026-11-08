@@ -1,6 +1,6 @@
 //! Zone-change aggregation table (Java parity: `CardZoneTable`).
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use forge_foundation::ZoneType;
 use serde::{Deserialize, Serialize};

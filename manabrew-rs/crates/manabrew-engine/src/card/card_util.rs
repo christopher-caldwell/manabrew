@@ -1,6 +1,7 @@
 //! Card utility helpers mirroring Java's `CardUtil`.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{VecDeque};
+use crate::det::{HashSet};
 
 use forge_foundation::{CardStateName, CardTypeLine, Color, ColorSet, ZoneType};
 
@@ -300,7 +301,7 @@ pub fn get_empty_room_characteristic_with_state(
 }
 
 pub fn get_reflectable_mana_colors(game: &GameState, sa: &SpellAbility) -> HashSet<String> {
-    get_reflectable_mana_colors_inner(game, sa, sa, HashSet::new(), Vec::new())
+    get_reflectable_mana_colors_inner(game, sa, sa, HashSet::default(), Vec::new())
 }
 
 fn get_reflectable_mana_colors_inner(
@@ -538,7 +539,7 @@ pub fn card_can_produce_same_mana_type_with(
     }
 
     let other = game.card(other_id);
-    let mut colors = HashSet::new();
+    let mut colors = HashSet::default();
     for ab in &other.activated_abilities {
         if !ab.is_mana_ability {
             continue;

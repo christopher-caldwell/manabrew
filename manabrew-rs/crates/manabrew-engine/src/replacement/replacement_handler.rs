@@ -8,7 +8,7 @@
 //! (CantHappen → Control → Copy → Transform → Other), applying the first
 //! matching effect in each layer.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use forge_foundation::{PhaseType, ZoneType};
 
@@ -290,7 +290,7 @@ impl Default for ReplacementHandler {
 impl ReplacementHandler {
     pub fn new() -> Self {
         Self {
-            has_run: HashSet::new(),
+            has_run: HashSet::default(),
         }
     }
 
@@ -353,7 +353,7 @@ impl ReplacementHandler {
         layer: ReplacementLayer,
     ) -> ReplacementResult {
         let effects = collect_effects(game, event, layer);
-        let mut declined_effects: HashSet<(CardId, usize)> = HashSet::new();
+        let mut declined_effects: HashSet<(CardId, usize)> = HashSet::default();
 
         if effects.is_empty() {
             return ReplacementResult::NotReplaced;
@@ -1779,8 +1779,8 @@ mod tests {
             sides: 20,
             number: 1,
             ignore: 0,
-            ignore_chosen: HashMap::new(),
-            dice_pt_exchanges: HashSet::new(),
+            ignore_chosen: HashMap::default(),
+            dice_pt_exchanges: HashSet::default(),
         };
         let result = apply_replacements(&mut game, &mut event);
         assert_eq!(result, ReplacementResult::Updated);
@@ -1816,8 +1816,8 @@ mod tests {
             sides: 6,
             number: 2,
             ignore: 0,
-            ignore_chosen: HashMap::new(),
-            dice_pt_exchanges: HashSet::new(),
+            ignore_chosen: HashMap::default(),
+            dice_pt_exchanges: HashSet::default(),
         };
         let result = apply_replacements(&mut game, &mut event);
         assert_eq!(result, ReplacementResult::Updated);
@@ -1852,8 +1852,8 @@ mod tests {
             sides: 6,
             number: 2,
             ignore: 0,
-            ignore_chosen: HashMap::new(),
-            dice_pt_exchanges: HashSet::new(),
+            ignore_chosen: HashMap::default(),
+            dice_pt_exchanges: HashSet::default(),
         };
         let result = apply_replacements(&mut game, &mut event);
         assert_eq!(result, ReplacementResult::Updated);

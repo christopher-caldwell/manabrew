@@ -58,10 +58,10 @@ fn resolve_sa(game: &mut GameState, sa: &manabrew_engine::spellability::SpellAbi
     ];
     let mut trigger_handler = TriggerHandler::new();
     let mut mana_pools = vec![ManaPool::default(), ManaPool::default()];
-    let token_templates = std::collections::HashMap::new();
-    let token_art_variants = std::collections::HashMap::new();
-    let token_fallback = std::collections::HashMap::new();
-    let edition_dates = std::collections::HashMap::new();
+    let token_templates = manabrew_engine::det::HashMap::default();
+    let token_art_variants = manabrew_engine::det::HashMap::default();
+    let token_fallback = manabrew_engine::det::HashMap::default();
+    let edition_dates = manabrew_engine::det::HashMap::default();
     let mut rng = ThreadRngAdapter;
     let mut ctx = EffectContext {
         game,

@@ -533,7 +533,7 @@ fn evaluate_svar_expr(ctx: &EffectContext, sa: &SpellAbility, expr: &str) -> i32
 #[cfg(test)]
 mod numeric_damage_regressions {
     use super::*;
-    use std::collections::HashMap;
+    use crate::det::HashMap;
     use crate::agent::{PassAgent, PlayerAgent};
     use crate::card::Card;
     use crate::game::GameState;
@@ -559,8 +559,8 @@ mod numeric_damage_regressions {
         let mut trigger_handler = TriggerHandler::new();
         let mut agents: Vec<Box<dyn PlayerAgent>> = vec![Box::new(PassAgent), Box::new(PassAgent), Box::new(PassAgent), Box::new(PassAgent)];
         let mut pools = vec![ManaPool::default(); 4];
-        let templates = HashMap::new(); let variants = HashMap::new();
-        let fallback = HashMap::new(); let editions = HashMap::new();
+        let templates = HashMap::default(); let variants = HashMap::default();
+        let fallback = HashMap::default(); let editions = HashMap::default();
         let mut rng = crate::game_rng::ThreadRngAdapter;
         let mut ctx = EffectContext { game: &mut game, combat: None, agents: &mut agents, trigger_handler: &mut trigger_handler,
             token_templates: &templates, token_art_variants: &variants, token_fallback: &fallback,

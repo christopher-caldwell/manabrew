@@ -285,7 +285,7 @@ fn damage_all_matches_valid_card(
 mod tests {
     use crate::ability::spell_ability_effect::SpellAbilityEffect;
     use forge_foundation::{CardTypeLine, ColorSet, ManaCost, ZoneType};
-    use std::collections::HashMap;
+    use crate::det::HashMap;
 
     use crate::ability::effects::EffectContext;
     use crate::agent::PassAgent;
@@ -331,10 +331,10 @@ mod tests {
         let mut agents: Vec<Box<dyn crate::agent::PlayerAgent>> =
             vec![Box::new(PassAgent), Box::new(PassAgent)];
         let mut mp = vec![ManaPool::default(), ManaPool::default()];
-        let templates = HashMap::new();
-        let templates_variants = HashMap::new();
-        let token_fallback = HashMap::new();
-        let edition_dates: HashMap<String, String> = HashMap::new();
+        let templates = HashMap::default();
+        let templates_variants = HashMap::default();
+        let token_fallback = HashMap::default();
+        let edition_dates: HashMap<String, String> = HashMap::default();
         let mut rng_adapter = crate::game_rng::ThreadRngAdapter;
         let mut ctx = EffectContext {
             game: &mut game,
@@ -373,10 +373,10 @@ mod tests {
         let mut agents: Vec<Box<dyn crate::agent::PlayerAgent>> =
             vec![Box::new(PassAgent), Box::new(PassAgent)];
         let mut mp = vec![ManaPool::default(), ManaPool::default()];
-        let templates = HashMap::new();
-        let templates_variants = HashMap::new();
-        let token_fallback = HashMap::new();
-        let edition_dates: HashMap<String, String> = HashMap::new();
+        let templates = HashMap::default();
+        let templates_variants = HashMap::default();
+        let token_fallback = HashMap::default();
+        let edition_dates: HashMap<String, String> = HashMap::default();
         let mut rng_adapter = crate::game_rng::ThreadRngAdapter;
         let mut ctx = EffectContext {
             game: &mut game,
@@ -411,7 +411,7 @@ mod tests {
         let mut th = TriggerHandler::new();
         let mut agents: Vec<Box<dyn crate::agent::PlayerAgent>> = vec![Box::new(PassAgent), Box::new(PassAgent)];
         let mut mp = vec![ManaPool::default(), ManaPool::default()];
-        let templates = HashMap::new(); let variants = HashMap::new(); let fallback = HashMap::new(); let editions = HashMap::new();
+        let templates = HashMap::default(); let variants = HashMap::default(); let fallback = HashMap::default(); let editions = HashMap::default();
         let mut rng = crate::game_rng::ThreadRngAdapter;
         let mut ctx = EffectContext { game: &mut game, combat: None, agents: &mut agents, trigger_handler: &mut th,
             token_templates: &templates, token_art_variants: &variants, token_fallback: &fallback, edition_dates: &editions,

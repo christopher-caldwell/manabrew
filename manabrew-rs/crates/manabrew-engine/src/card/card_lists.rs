@@ -78,8 +78,7 @@ impl CardLists {
     }
 
     pub fn shuffle(list: &mut [CardId]) {
-        let mut rng = rand::thread_rng();
-        list.shuffle(&mut rng);
+        crate::game_rng::with_effect_rng(|rng| list.shuffle(rng));
     }
 
     pub fn filter_controlled_by(

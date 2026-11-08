@@ -2,7 +2,7 @@
 //!
 //! Ported from Java's `KeywordCollection.java` in `forge/game/keyword/`.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -14,8 +14,9 @@ use super::keyword_instance::{Keyword, KeywordInstanceData};
 /// Serializes as a `Vec<String>` of original keyword strings for backward compatibility.
 #[derive(Debug, Clone, Default)]
 pub struct KeywordCollection {
-    /// Map from keyword enum to list of keyword instance original strings.
-    map: HashMap<Keyword, Vec<KeywordInstanceData>>,
+    /// Map from keyword enum to list of keyword instance original strings. Ordered by keyword,
+    /// so iteration (and the keyword lists players see) is the same in every run.
+    map: BTreeMap<Keyword, Vec<KeywordInstanceData>>,
 }
 
 impl Serialize for KeywordCollection {
@@ -39,7 +40,7 @@ impl KeywordCollection {
     /// Create a new empty keyword collection.
     pub fn new() -> Self {
         Self {
-            map: HashMap::new(),
+            map: BTreeMap::new(),
         }
     }
 

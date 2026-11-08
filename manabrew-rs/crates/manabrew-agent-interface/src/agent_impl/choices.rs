@@ -1156,7 +1156,7 @@ pub(super) fn choose_random_discard<T: Responder>(
 ) -> Vec<CardId> {
     use rand::seq::SliceRandom;
     let mut v = hand.to_vec();
-    v.shuffle(&mut rand::thread_rng());
+    manabrew_engine::game_rng::with_effect_rng(|rng| v.shuffle(rng));
     v.truncate(num);
     v
 }

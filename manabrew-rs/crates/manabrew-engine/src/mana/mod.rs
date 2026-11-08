@@ -281,7 +281,7 @@ pub struct ManaPaymentContext {
     /// Color of the spell being cast (for `Spell.Colorless`-style qualifiers).
     pub card_color: Option<forge_foundation::ColorSet>,
     /// Chosen creature/card types keyed by mana source card ID (e.g. Cavern of Souls).
-    pub chosen_types_by_source: std::collections::HashMap<CardId, String>,
+    pub chosen_types_by_source: crate::det::HashMap<CardId, String>,
 }
 
 pub fn payment_context_for_sa(game: &GameState, sa: &SpellAbility) -> ManaPaymentContext {
@@ -1183,7 +1183,7 @@ fn apply_produce_mana_replacements_for_availability(
         replace_produce_mana, ReplacementLayer, ReplacementResult, ReplacementType,
     };
 
-    let mut has_run: std::collections::HashSet<(CardId, usize)> = std::collections::HashSet::new();
+    let mut has_run: crate::det::HashSet<(CardId, usize)> = crate::det::HashSet::default();
     let mut updated = false;
 
     loop {
@@ -2018,7 +2018,7 @@ mod tests {
         mana.restriction = Some("Spell.Creature+ChosenType".to_string());
         pool.add_mana(mana);
 
-        let mut chosen_types_by_source = std::collections::HashMap::new();
+        let mut chosen_types_by_source = crate::det::HashMap::default();
         chosen_types_by_source.insert(source, "Assassin".to_string());
 
         let ctx = ManaPaymentContext {

@@ -34,6 +34,7 @@ pub mod game_log_entry_type;
 pub mod game_log_formatter;
 pub mod game_loop;
 pub mod game_object;
+pub mod det;
 pub mod game_rng;
 pub mod game_runtime;
 pub mod game_snapshot;
