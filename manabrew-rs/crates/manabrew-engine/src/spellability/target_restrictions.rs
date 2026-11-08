@@ -590,14 +590,45 @@ pub fn has_candidates_in_spell_ability_chain(
     player: PlayerId,
     sa: &SpellAbility,
 ) -> bool {
+    has_candidates_in_spell_ability_chain_excluding(game, player, sa, None)
+}
+
+/// Same check for a spell about to be cast. `leaving` is the card being cast: it moves to
+/// the stack, so it is no longer a candidate in the zone it is cast from (Recoup's
+/// flashback from a graveyard that holds no other sorcery). A zone target with a minimum
+/// above one needs that many distinct candidates (Victimize's two creature cards).
+pub fn has_candidates_in_spell_ability_chain_excluding(
+    game: &GameState,
+    player: PlayerId,
+    sa: &SpellAbility,
+    leaving: Option<CardId>,
+) -> bool {
     let _perf_scope =
         crate::perf::ParamsLookupScopeGuard::enter(crate::perf::ParamsLookupScope::Target);
     let mut current = Some(sa);
     while let Some(node) = current {
         if let Some(tr) = node.target_restrictions.as_ref() {
             let min_targets = tr.get_min_targets(game, node);
-            if min_targets > 0 && !tr.has_candidates(game, player, node.source) {
-                return false;
+            if min_targets > 0 {
+                if let TargetKind::CardInZone { zone, filter } = &tr.target_kind {
+                    let found = get_valid_cards_in_zone_for_restrictions(
+                        game,
+                        tr,
+                        *zone,
+                        player,
+                        filter.as_deref(),
+                        node.source,
+                    )
+                    .into_iter()
+                    .filter(|&cid| Some(cid) != leaving)
+                    .filter(|&cid| can_be_targeted_by(game, cid, player, node.source))
+                    .count() as i32;
+                    if found < min_targets {
+                        return false;
+                    }
+                } else if !tr.has_candidates(game, player, node.source) {
+                    return false;
+                }
             }
         }
         current = node.sub_ability.as_deref();

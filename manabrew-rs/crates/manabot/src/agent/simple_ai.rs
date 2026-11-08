@@ -402,6 +402,18 @@ impl SimpleAi {
             .collect()
     }
 
+    /// Life a mana ability asks for ("{T}, Pay 1 life: Add one mana of any color.").
+    fn life_cost_of_mana(text: &str) -> Option<i32> {
+        text.split('\n').filter(|line| line.contains("Add ")).find_map(|line| {
+            let cost = line.split(':').next()?.to_ascii_lowercase();
+            let rest = cost.split("pay ").nth(1)?;
+            let mut words = rest.split_whitespace();
+            let amount = words.next()?.parse::<i32>().ok()?;
+            words.next().filter(|word| word.trim_matches(|c: char| !c.is_alphabetic()) == "life")?;
+            Some(amount)
+        })
+    }
+
     fn mana_output(card: &CardDto) -> Option<([i32; 5], i32, i32)> {
         let mut colors = [0i32; 5];
         let mut any = 0;
@@ -455,9 +467,15 @@ impl SimpleAi {
         let mut colors = [0i32; 5];
         let mut any = 0;
         let mut total = 0;
+        let life = self.view.as_ref().and_then(|v| v.players.iter().find(|p| p.id == player_id)).map_or(i32::MAX, |p| p.life);
         for card in self.battlefield(player_id).filter(|card| !card.tapped) {
             let creature = card.types.iter().any(|ty| ty == "Creature");
             if creature && (card.summoning_sick || !card.text.contains("{T}: Add")) {
+                continue;
+            }
+            // A source that costs life is spent only above that life, as the payment prompt
+            // decides; counting it would start a cast the payment then refuses.
+            if Self::life_cost_of_mana(&card.text).is_some_and(|cost| life <= cost) {
                 continue;
             }
             if let Some((produced, wild, amount)) = Self::mana_output(card) {
@@ -1402,13 +1420,38 @@ impl SimpleAi {
         let Some(view)=&self.view else { return 0; };
         view.stack.iter().enumerate().filter_map(|(i,item)| {
             if item.controller_id!=player_id || item.is_casting {return None;}
-            let amount=item.known_damage?;
+            let amount=item.known_damage.or_else(|| item.source_ability_text.as_deref().or(Some(item.text.as_str())).and_then(Self::damage_amount))?;
             if amount<=0 || item.targets.len()!=1 || !item.targets.iter().any(|t|
                 matches!(t.kind,TargetKind::Player | TargetKind::Card) && t.id==target_id && matches!(t.intent,Some(TargetingIntent::Damage))) {return None;}
             if view.stack[i+1..].iter().any(|threat|threat.targets.iter().any(|t|
                 t.id==item.id && matches!(t.kind,TargetKind::Spell))) {return None;}
             Some(amount)
         }).fold(0i32,|sum,amount|sum.saturating_add(amount))
+    }
+
+    /// Own abilities and spells on the stack that are not already countered (a later spell
+    /// or ability of anyone targeting them).
+    fn own_pending_items(&self, player_id: &str) -> Vec<&manabrew_agent_interface::game_view_dto::StackObjectDto> {
+        let Some(view) = &self.view else { return Vec::new(); };
+        view.stack.iter().enumerate().filter(|(i, item)| {
+            item.controller_id == player_id && !item.is_casting
+                && !view.stack[i + 1..].iter().any(|later| later.targets.iter().any(|t|
+                    t.id == item.id && matches!(t.kind, TargetKind::Spell)))
+        }).map(|(_, item)| item).collect()
+    }
+
+    /// Permanents or cards our own stack already destroys, exiles, bounces or blinks. A
+    /// second removal aimed at one would fizzle once the first resolves.
+    fn removed_by_own_stack(&self, player_id: &str, target_id: &str) -> bool {
+        self.own_pending_items(player_id).iter().any(|item| item.targets.iter().any(|t|
+            t.id == target_id && matches!(t.kind, TargetKind::Card)
+                && matches!(t.intent, Some(TargetingIntent::Destroy | TargetingIntent::Exile | TargetingIntent::Bounce))))
+    }
+
+    /// How many of our pending damage objects aim at this target, whatever they deal.
+    fn own_damage_hits(&self, player_id: &str, target_id: &str) -> i32 {
+        self.own_pending_items(player_id).iter().filter(|item| item.targets.iter().any(|t|
+            t.id == target_id && matches!(t.intent, Some(TargetingIntent::Damage)))).count() as i32
     }
 
     fn damage_target_score(&self, target: &TargetRef, player_id: &str, damage: i32) -> i32 {
@@ -1453,6 +1496,12 @@ impl SimpleAi {
         if !matches!(target.kind, TargetKind::Spell | TargetKind::Card) { return false; }
         if matches!(target.kind, TargetKind::Spell) {
             let Some(object) = view.stack.iter().find(|item| item.id == target.id && !item.is_casting) else { return false; };
+            // Two or more of our counters at one spell are enough, even taxing ones (storm
+            // copies of Flusterstorm); a further counter would only fizzle after it is taken.
+            if self.own_pending_items(player_id).iter().filter(|item| item.targets.iter().any(|t|
+                t.id == target.id && matches!(t.intent, Some(TargetingIntent::Counter)))).count() >= 2 {
+                return true;
+            }
             if object.source_card.as_ref().is_none_or(|c| c.text.to_ascii_lowercase().contains("can't be countered") || c.text.to_ascii_lowercase().contains("cannot be countered")) { return false; }
         } else {
             let Some(card) = self.card(&target.id) else { return false; };
@@ -1955,7 +2004,8 @@ impl BotAgent for SimpleAi {
                 if self_reuse || self_copy {
                     let mut scored: Vec<_> = candidates.iter().map(|target| {
                         let card = self.card(&target.id);
-                        let value = card.and_then(|card| self.reentry_value(card, &deciding_player_id));
+                        let value = card.and_then(|card| self.reentry_value(card, &deciding_player_id))
+                            .filter(|_| !self.removed_by_own_stack(&deciding_player_id, &target.id));
                         (value, -card.map_or(0, Self::card_value), target.clone())
                     }).collect();
                     scored.sort_by_key(|(value, low, _)| std::cmp::Reverse((value.unwrap_or(i32::MIN), *low)));
@@ -2017,6 +2067,9 @@ impl BotAgent for SimpleAi {
                         Some(damage) if hostile => self.damage_target_score(target, &deciding_player_id, damage),
                         _ => self.target_score(target, &deciding_player_id, hostile),
                     }};
+                    let countered = hostile && matches!(intent, TargetingIntent::Counter)
+                        && matches!(target.kind, TargetKind::Spell)
+                        && self.covered_by_friendly_answer(target, &deciding_player_id);
                     let covered = hostile && matches!(intent,TargetingIntent::Damage) && match target.kind {
                         TargetKind::Player if target.id!=deciding_player_id => self.view.as_ref().and_then(|view|view.players.iter().find(|p|p.id==target.id))
                             .is_some_and(|p| p.life>0 && self.pending_damage(&deciding_player_id,&target.id)>=p.life),
@@ -2029,7 +2082,15 @@ impl BotAgent for SimpleAi {
                         TargetKind::Card => self.card(&target.id).is_some_and(|card| card.controller_id == deciding_player_id),
                         _ => false,
                     };
-                    std::cmp::Reverse(base - if covered {100_000} else {0} - if friendly {200_000} else {0})
+                    // Already dealt with by our own stack: a removal at a permanent already being
+                    // removed, or damage at a target our other pending damage already covers or
+                    // that is being removed. Picked only when nothing else is left.
+                    let handled = hostile && matches!(target.kind, TargetKind::Card)
+                        && matches!(intent, TargetingIntent::Damage | TargetingIntent::Destroy | TargetingIntent::Exile | TargetingIntent::Bounce)
+                        && self.removed_by_own_stack(&deciding_player_id, &target.id);
+                    let spread = if hostile && matches!(intent, TargetingIntent::Damage) { 2_000 * self.own_damage_hits(&deciding_player_id, &target.id) } else { 0 };
+                    std::cmp::Reverse(base - if covered {100_000} else {0} - if friendly {200_000} else {0}
+                        - if handled {300_000} else {0} - if countered {300_000} else {0} - spread)
                 });
                 Some(PromptOutput::ChooseBoardTargets(ChooseBoardTargetsOutput::BoardTargets {
                     chosen: candidates.into_iter().take(take).collect(),
@@ -2434,12 +2495,23 @@ impl BotAgent for SimpleAi {
                 use manabrew_protocol::game::ManaColor;
                 let colors = [("W", ManaColor::White), ("U", ManaColor::Blue), ("B", ManaColor::Black),
                     ("R", ManaColor::Red), ("G", ManaColor::Green), ("C", ManaColor::Colorless)];
-                let (available_colors, _, _) = self.mana_sources(&deciding_player_id);
-                let deficits: Vec<_> = colors.iter().enumerate().filter_map(|(index, (symbol, color))| {
+                let deficits: Vec<_> = colors.iter().map(|(symbol, color)| {
                     let required = input.mana_cost.split('{').skip(1)
                         .filter(|part| part.split('}').next() == Some(*symbol)).count() as i32;
                     let floating = pool.and_then(|p| p.get(color)).copied().unwrap_or(0) as i32;
-                    let source_count = available_colors.get(index).copied().unwrap_or(floating);
+                    // Only sources that make nothing else can be counted on for this
+                    // color; a flexible source (Mana Confluence) must go to the color
+                    // the fixed sources cannot cover, or the last shard is unpayable.
+                    let fixed_sources = input.actions.iter().filter(|action| matches!(
+                        &action.kind,
+                        manabrew_protocol::prompts::common::PaymentActionKind::ActivateManaAbility(info)
+                            if info.produced_mana.as_ref().is_some_and(|produced| {
+                                produced.iter().any(|m| m.amount > 0)
+                                    && produced.iter().all(|m| m.amount == 0 || m.color == *color)
+                            })
+                    )).count() as i32;
+                    (symbol, color, required, floating, floating + fixed_sources)
+                }).filter_map(|(_, color, required, floating, source_count)| {
                     (required > floating).then_some((*color, (required - source_count).max(0), required - floating))
                 }).collect();
                 self.pending_mana_color = deficits.into_iter().max_by_key(|(_, scarce, unpaid)| (*scarce, *unpaid)).map(|(color, _, _)| color);
@@ -3531,6 +3603,91 @@ mod execution_audit_policy {
         bot.pending_voluntary_cast = Some("card-9".into());
         let out = targets(&mut bot, "card-9", "Destroy target creature.", "destroy", &["card-7"], 1, true);
         assert_eq!(out["chosen"][0]["id"], "card-7");
+    }
+
+    /// DEV-072: a source that costs life is not counted when paying would end the game, so a
+    /// cast that needs it is not started and then refused at the payment.
+    #[test]
+    fn a_life_costing_source_is_not_counted_at_low_life() {
+        let confluence = |id: &str| { let mut c = land(id, 0, ""); c.subtypes.clear();
+            c.text = "{T}, Pay 1 life: Add one mana of any color.".into(); c };
+        for (life, expected) in [(1, 0), (5, 1)] {
+            let mut view = view(0, StepKind::Main1, vec![(ZoneKind::Battlefield, 0, vec![confluence("card-1")])]);
+            view.players[0].life = life;
+            let mut bot = SimpleAi::default();
+            bot.observe(view);
+            assert_eq!(bot.mana_sources("player-0").2, expected, "life {life}");
+        }
+    }
+
+    /// DEV-071: a stack item of ours that already aims at a target in a given way.
+    fn own_item(id: &str, text: &str, target_id: &str, kind: &str, intent: &str) -> StackObjectDto {
+        let target: manabrew_protocol::prompts::common::TargetRef = serde_json::from_value(json!({"id":target_id,"kind":kind,"intent":intent})).unwrap();
+        StackObjectDto { id: id.into(), controller_id: "player-0".into(), text: text.into(), source_ability_text: Some(text.into()),
+            targets: vec![target], ..Default::default() }
+    }
+
+    /// DEV-071: a second damage trigger skips the creature our first one already kills.
+    #[test]
+    fn a_second_damage_trigger_picks_a_different_target() {
+        let mut view = view(0, StepKind::Main1, vec![(ZoneKind::Battlefield, 1, vec![
+            creature("card-7", 1, (1, 1), 1, ""), creature("card-8", 1, (1, 1), 1, "")])]);
+        view.stack.push(own_item("stack-1", "CARDNAME deals 1 damage to target creature.", "card-7", "card", "damage"));
+        let mut bot = SimpleAi::default();
+        bot.observe(view);
+        let out = targets(&mut bot, "card-9", "CARDNAME deals 1 damage to target creature.", "damage", &["card-7", "card-8"], 1, false);
+        assert_eq!(out["chosen"][0]["id"], "card-8");
+    }
+
+    /// DEV-071: removal skips a permanent our stack already exiles, and with nothing else left
+    /// still takes it.
+    #[test]
+    fn removal_skips_a_permanent_already_being_removed() {
+        let mut view = view(0, StepKind::Main1, vec![(ZoneKind::Battlefield, 1, vec![
+            creature("card-7", 1, (6, 6), 6, ""), creature("card-8", 1, (1, 1), 1, "")])]);
+        view.stack.push(own_item("stack-1", "Destroy target creature.", "card-7", "card", "destroy"));
+        let mut bot = SimpleAi::default();
+        bot.observe(view);
+        let out = targets(&mut bot, "card-9", "Destroy target creature.", "destroy", &["card-7", "card-8"], 1, false);
+        assert_eq!(out["chosen"][0]["id"], "card-8");
+        let out = targets(&mut bot, "card-9", "Destroy target creature.", "destroy", &["card-7"], 1, false);
+        assert_eq!(out["chosen"][0]["id"], "card-7");
+    }
+
+    /// DEV-071: a doubled blink takes a different creature than the blink already on the stack.
+    #[test]
+    fn a_second_blink_takes_a_different_creature() {
+        const EPHEMERATE: &str = "Exile target creature you control, then return it to the battlefield under its owner's control.";
+        let first = creature("card-1", 0, (3, 3), 5, "When Aang enters, look at the top five cards of your library.");
+        let second = creature("card-2", 0, (2, 2), 3, "When this creature enters, draw a card.");
+        let mut view = view(0, StepKind::Main1, vec![(ZoneKind::Battlefield, 0, vec![first, second])]);
+        view.stack.push(own_item("stack-1", EPHEMERATE, "card-1", "card", "exile"));
+        let mut bot = SimpleAi::default();
+        bot.observe(view);
+        bot.pending_voluntary_cast = Some("card-9".into());
+        let out = targets(&mut bot, "card-9", EPHEMERATE, "exile", &["card-1", "card-2"], 1, true);
+        assert_eq!(out["chosen"][0]["id"], "card-2");
+    }
+
+    /// DEV-071: a second counterspell is not cast at a spell two of ours already counter, and
+    /// one is still cast when only one does.
+    #[test]
+    fn a_counter_is_not_cast_at_a_spell_already_countered() {
+        for (own_counters, expected) in [(2, "pass"), (1, "act")] {
+            let islands: Vec<_> = (0..3).map(|i| land(&format!("card-{}", 20 + i), 0, "Island")).collect();
+            let hand = vec![spell_card("card-9", "{U}{U}", 2, "Counter target spell.")];
+            let mut view = view(0, StepKind::Main1, vec![(ZoneKind::Battlefield, 0, islands), (ZoneKind::Hand, 0, hand)]);
+            view.stack.push(StackObjectDto { id: "stack-1".into(), controller_id: "player-1".into(), is_spell: true,
+                text: "Draw a card.".into(), source_card: Some(spell_card("card-30", "{1}{U}", 2, "Draw a card.")), ..Default::default() });
+            for i in 0..own_counters {
+                let mut item = own_item(&format!("stack-{}", i + 2), "Counter target spell unless its controller pays {1}.", "stack-1", "spell", "counter");
+                item.is_spell = true;
+                view.stack.push(item);
+            }
+            let mut bot = SimpleAi::default();
+            bot.observe(view);
+            assert_eq!(cast_choice(&mut bot, "card-9"), expected, "{own_counters} counters already aimed");
+        }
     }
 
     /// A cast cancelled at target selection is not started again against the same board.

@@ -1576,6 +1576,7 @@ fn calculate_available_mana_excluding_with_reserved_impl(
             continue;
         }
 
+        let entries_before = (source_count, source_colors.len());
         // Add 1 mana for each distinct color this source can produce (optimistic for colors).
         // The total_sources cap ensures the total mana count stays correct.
         let mut added_any = false;
@@ -1788,6 +1789,36 @@ fn calculate_available_mana_excluding_with_reserved_impl(
             source_count += 1;
             source_colors.push(src_mask);
         }
+        // A permanent whose every mana ability taps or sacrifices it can be
+        // activated once, however many such abilities it carries (a Treasure
+        // granted extra abilities), so it adds the most one ability yields.
+        if mana_abilities.len() > 1
+            && mana_abilities.iter().all(|ab| {
+                ab.cost.parts.iter().any(|p| {
+                    matches!(p, CostPart::Tap)
+                        || matches!(p, CostPart::Sacrifice { type_filter, .. } if type_filter == "CARDNAME")
+                })
+            })
+        {
+            let one_activation = mana_abilities
+                .iter()
+                .map(|ab| {
+                    let atoms = ab
+                        .produced_ir
+                        .as_ref()
+                        .and_then(|ir| ir.fixed_atoms())
+                        .map_or(1, |a| a.len().max(1));
+                    atoms as i32 * resolve_mana_ability_amount(game, card_id, player, ab)
+                })
+                .max()
+                .unwrap_or(1);
+            let added = (source_count - entries_before.0).max(0);
+            if added > one_activation {
+                let drop = (added - one_activation) as usize;
+                source_count -= drop as i32;
+                source_colors.truncate(source_colors.len().saturating_sub(drop));
+            }
+        }
         if added_any {
             let combined_mask = added_atoms.iter().fold(src_mask, |mask, atom| mask | atom);
             add_taps_for_mana_trigger_mana_for_availability(
@@ -1895,6 +1926,24 @@ mod tests {
         let id=game.create_card(card);game.move_card(id,ZoneType::Battlefield,player);game.card_mut(id).activated_abilities[0].ability_index=130;
         let mut pool=ManaPool::new();let mut tapped=vec![];tap_land_for_mana(&mut game,&mut pool,player,id,ManaAtom::BLACK,true,&mut tapped,Some(130));
         assert_eq!(pool.collect_trigger_mana(),vec![("TrigScry".to_string(),id)]);
+    }
+
+    /// DEV-072: a Treasure granted extra sacrifice abilities (Goldspan Dragon: "add two mana")
+    /// is one permanent that can be sacrificed once, so it makes the most one ability yields
+    /// (two), not the sum of its abilities.
+    #[test]
+    fn a_sacrifice_source_with_several_abilities_counts_once() {
+        let mut game = GameState::new(&["A", "B"], 40);
+        let player = PlayerId(0);
+        let ability = |amount: i32| format!("AB$ Mana | Cost$ T Sac<1/CARDNAME> | Produced$ Any | Amount$ {amount} | SpellDescription$ Add mana of any one color.");
+        let card = Card::new(CardId(0), "Treasure".into(), player, CardTypeLine::parse("Artifact Treasure"), ManaCost::no_cost(),
+            ColorSet::COLORLESS, None, None, vec![], vec![ability(1), ability(2), ability(2)]);
+        let id = game.create_card(card);
+        game.move_card(id, ZoneType::Battlefield, player);
+        let avail = calculate_available_mana(&ManaPool::new(), &game, player);
+        assert_eq!(avail.total_sources, Some(2), "{avail:?}");
+        assert!(!avail.can_pay(&ManaCost::parse("3")));
+        assert!(avail.can_pay(&ManaCost::parse("2")));
     }
 
     #[test]

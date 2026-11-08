@@ -142,10 +142,17 @@ pub(crate) fn known_direct_damage(game: &GameState, sa: &SpellAbility) -> Option
     if effect.damage_map { return None; }
     let n = match effect.amount.as_ref()? {
         AmountExpr::Literal(n) => *n,
-        AmountExpr::SVar(name) => {
+        // `NumDmg$ X` parses as the bare variable; it names the card's own SVar "X".
+        amount @ (AmountExpr::SVar(_) | AmountExpr::X) => {
+            let name = if let AmountExpr::SVar(name) = amount { name.as_str() } else { "X" };
             let source=sa.source?;
-            if game.card(source).get_s_var(name)? != "TriggeredCard$CardPower" { return None; }
-            if let Some(n)=sa.get_triggering_value(AbilityKey::TriggeredCardPower).and_then(|v|v.trim().parse::<i32>().ok()) { n }
+            let expression = game.card(source).get_s_var(name)?;
+            // A count the engine can evaluate now (Scourge of Valkas: the Dragons you control)
+            // is as known as the power of a creature that just entered.
+            if expression.starts_with("Count$") && !expression.contains('/') {
+                manabrew_engine::svar::resolve_count_svar_for_sa(expression, game, source, sa.activating_player, sa)
+            } else if expression != "TriggeredCard$CardPower" { return None; }
+            else if let Some(n)=sa.get_triggering_value(AbilityKey::TriggeredCardPower).and_then(|v|v.trim().parse::<i32>().ok()) { n }
             else {
                 let triggered=sa.get_triggering_card(AbilityKey::Card)?;
                 let card=game.cards.get(triggered.index())?;

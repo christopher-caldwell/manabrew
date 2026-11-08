@@ -1003,10 +1003,9 @@ impl GameLoop {
                 self.pool(player), game, player, Some(card_id), &[], Some(&payment_ctx),
             );
             let cast_sa = crate::spellability::build_spell_ability_for_card_cast(game, card_id, player);
-            let targets_ok = cast_sa.target_restrictions.as_ref().is_none_or(|tr| {
-                tr.get_min_targets(game, &cast_sa) <= 0
-                    || target_restrictions::has_candidates_in_spell_ability_chain(game, player, &cast_sa)
-            });
+            let targets_ok = target_restrictions::has_candidates_in_spell_ability_chain_excluding(
+                game, player, &cast_sa, Some(card_id),
+            );
             let sp_additional_ok = if let Some(sc) = card.action_spell_cost.as_ref() {
                 crate::cost::can_pay_ignoring_mana_for_spell(sc, game, card_id, player)
             } else {
@@ -1301,6 +1300,50 @@ mod tests {
         assert!(offered(&game), "legal creature target in graveyard");
         game.move_card(creature, ZoneType::Exile, player);
         assert!(!offered(&game), "target left the graveyard");
+    }
+
+    /// DEV-073: a flashback spell that targets cards in its own graveyard cannot count itself,
+    /// since it leaves the graveyard when cast (Recoup with no other sorcery).
+    #[test]
+    fn flashback_does_not_count_the_spell_itself_as_its_target() {
+        let player = PlayerId(0);
+        let mut game = GameState::new(&["A", "B"], 40);
+        let mut spell = card("Recoup", player, "Sorcery", "1 R", ColorSet::RED, None, None,
+            vec!["SP$ Pump | ValidTgts$ Sorcery.YouOwn | TgtZone$ Graveyard | KW$ Flashback | PumpZone$ Graveyard"]);
+        spell.keywords.add("Flashback:3 R");
+        let id = game.create_card(spell);
+        game.move_card(id, ZoneType::Graveyard, player);
+        let mut gl = GameLoop::new(2);
+        gl.pool_mut(player).add(forge_foundation::ManaAtom::RED, 5);
+        let offered = |g: &GameState| gl.get_playable_cards(g, player, false).iter().any(|p| p.card_id == id);
+        assert!(!offered(&game), "Recoup is the only sorcery card");
+        let other = game.create_card(card("Other", player, "Sorcery", "R", ColorSet::RED, None, None, vec![]));
+        game.move_card(other, ZoneType::Graveyard, player);
+        assert!(offered(&game), "another sorcery card can be the target");
+    }
+
+    /// DEV-073: a spell that must choose two cards in a zone needs two candidates, not one.
+    #[test]
+    fn a_two_target_graveyard_spell_needs_two_candidates() {
+        let player = PlayerId(0);
+        let mut game = GameState::new(&["A", "B"], 40);
+        let spell = card("Raise", player, "Instant", "R", ColorSet::RED, None, None,
+            vec!["SP$ ChangeZone | Origin$ Graveyard | Destination$ Battlefield | ValidTgts$ Creature.YouCtrl | TargetMin$ 2 | TargetMax$ 2"]);
+        let id = game.create_card(spell);
+        game.move_card(id, ZoneType::Hand, player);
+        let mountain = game.create_card(card("Mountain", player, "Basic Land - Mountain", "", ColorSet::COLORLESS, None, None, vec![]));
+        game.move_card(mountain, ZoneType::Battlefield, player);
+        let mut gl = GameLoop::new(2);
+        gl.pool_mut(player).add(forge_foundation::ManaAtom::RED, 1);
+        let offered = |g: &GameState| gl.get_playable_cards(g, player, false).iter().any(|p| p.card_id == id);
+        let mut creature = |g: &mut GameState| {
+            let c = g.create_card(card("Dead", player, "Creature", "1 B", ColorSet::BLACK, Some(1), Some(1), vec![]));
+            g.move_card(c, ZoneType::Graveyard, player);
+        };
+        creature(&mut game);
+        assert!(!offered(&game), "one creature card is not two targets");
+        creature(&mut game);
+        assert!(offered(&game), "two creature cards are");
     }
 
     /// DEV-046: a modal spell is not offered when none of its modes has a legal target; it
