@@ -1113,10 +1113,17 @@ impl SimpleAi {
                 CardView::Visible(card) if card.types.iter().any(|t| t == "Creature") && card.id != source_id
                     && card.power.as_deref().and_then(|p| p.parse::<i32>().ok()).unwrap_or(0) >= 2));
         }
+        if title.contains("you may put a +1/+1 counter on") { return true; }
         if title.contains("create a token that's a copy") || (title.contains("you may create") && !title.contains("exile")) {
             return true;
         }
         // A shock land entering: untapped when this turn needs the mana or life is comfortable.
+        if title.starts_with("pay ") && title.contains("{life} for ") && !self.card(source_id).is_some_and(|c| c.types.iter().any(|t| t == "Land")) {
+            // Paying life for the source's own "you may pay N life. If you do, ..." gain.
+            let Some(text) = self.card(source_id).map(|c| c.text.to_ascii_lowercase()) else { return false; };
+            let Some(reward) = text.split("you may pay ").nth(1).and_then(|rest| rest.split("if you do, ").nth(1)) else { return false; };
+            return (reward.starts_with("draw") && library >= 6) || (reward.starts_with("search") && library > 0) || reward.starts_with("create");
+        }
         if title.starts_with("pay 2 {life} for ") {
             let Some(land) = self.card(source_id).filter(|card| card.types.iter().any(|t| t == "Land")) else { return false; };
             let untapped = self.battlefield(player_id).filter(|c| c.id != land.id && !c.tapped && Self::is_mana_source(c)).count() as i32;
@@ -4107,12 +4114,26 @@ mod execution_audit_policy {
         const TOKEN: &str = "Whenever another nontoken creature you control dies, you may exile it. If you do, create a token that's a copy of it.";
         for (title, library, life, expected) in [(SEARCH, 60, 40, true), (SEARCH, 0, 40, false), (PAY_DRAW, 60, 40, true), (PAY_DRAW, 60, 10, false),
             (PAY_TEN, 60, 25, false), (TOKEN, 60, 40, true), ("Pay {4}?", 60, 40, false), ("Do you want to draw 2 card(s)?", 60, 40, true),
-            ("Do you want to draw 2 card(s)?", 3, 40, false), ("Search kaalia's library?", 60, 40, true)] {
+            ("Do you want to draw 2 card(s)?", 3, 40, false), ("Search kaalia's library?", 60, 40, true),
+            ("Whenever an opponent casts a spell, you may put a +1/+1 counter on CARDNAME.", 60, 40, true)] {
             let mut v = with_library(view(0, StepKind::Main1, vec![]), library);
             v.players[0].life = life;
             let mut bot = SimpleAi::default();
             bot.observe(v);
             assert_eq!(confirm(&mut bot, "card-1", title), expected, "{title} library {library} life {life}");
+        }
+    }
+
+    #[test]
+    fn paying_life_for_a_sources_own_draw_is_accepted_with_a_library_and_life_to_spare() {
+        let ring = CardDto { id: "card-30".into(), controller_id: "player-0".into(), owner_id: "player-0".into(), types: vec!["Enchantment".into()],
+            text: "Whenever you choose a creature as your Ring-bearer, you may pay 2 life. If you do, draw a card.".into(), ..Default::default() };
+        for (library, life, expected) in [(60, 40, true), (3, 40, false), (60, 10, false)] {
+            let mut v = with_library(view(0, StepKind::Upkeep, vec![(ZoneKind::Battlefield, 0, vec![ring.clone()])]), library);
+            v.players[0].life = life;
+            let mut bot = SimpleAi::default();
+            bot.observe(v);
+            assert_eq!(confirm(&mut bot, "card-30", "Pay 2 {LIFE} for Call of the Ring?"), expected, "library {library} life {life}");
         }
     }
 
