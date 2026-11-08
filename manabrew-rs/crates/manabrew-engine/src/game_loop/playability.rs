@@ -376,15 +376,9 @@ impl GameLoop {
                 // NonStackingEffect is an AI hint in Java (AiController), not a game rule.
                 // Do NOT filter here — let the agent decide whether to cast duplicates.
 
-                if let Some(ref tr) = cast_sa.target_restrictions {
-                    let min_targets = tr.get_min_targets(game, &cast_sa);
-                    if min_targets > 0
-                        && !target_restrictions::has_candidates_in_spell_ability_chain(
-                            game, player, &cast_sa,
-                        )
-                    {
-                        continue;
-                    }
+                // The chain is checked even when only a sub-ability targets (Victimize).
+                if !target_restrictions::has_candidates_in_spell_ability_chain(game, player, &cast_sa) {
+                    continue;
                 }
 
                 // Check if we can pay the mana cost (normal or alternative).
@@ -1327,8 +1321,10 @@ mod tests {
     fn a_two_target_graveyard_spell_needs_two_candidates() {
         let player = PlayerId(0);
         let mut game = GameState::new(&["A", "B"], 40);
-        let spell = card("Raise", player, "Instant", "R", ColorSet::RED, None, None,
-            vec!["SP$ ChangeZone | Origin$ Graveyard | Destination$ Battlefield | ValidTgts$ Creature.YouCtrl | TargetMin$ 2 | TargetMax$ 2"]);
+        // Victimize: the targets are in a sub-ability behind a sacrifice.
+        let mut spell = card("Raise", player, "Instant", "R", ColorSet::RED, None, None,
+            vec!["SP$ Sacrifice | Defined$ You | SacValid$ Creature | SubAbility$ Rise"]);
+        spell.svars.insert("Rise".into(), "DB$ ChangeZone | ValidTgts$ Creature.YouCtrl | TargetMin$ 2 | TargetMax$ 2 | Origin$ Graveyard | Destination$ Battlefield".into());
         let id = game.create_card(spell);
         game.move_card(id, ZoneType::Hand, player);
         let mountain = game.create_card(card("Mountain", player, "Basic Land - Mountain", "", ColorSet::COLORLESS, None, None, vec![]));
