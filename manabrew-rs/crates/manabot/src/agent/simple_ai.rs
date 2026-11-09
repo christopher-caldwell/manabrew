@@ -2231,16 +2231,26 @@ impl BotAgent for SimpleAi {
                 if let Some((_, key)) = &pick {
                     self.attempted_actions.insert(key.clone());
                 }
+                // Passing normally skips to my next main phase, which also skips the last opponent's
+                // end step. With a reserve kept, stop there: it is the last chance to spend it.
+                let until = match self.view.as_ref() {
+                    Some(view) if self.reserve.is_some()
+                        && view.active_player_id != deciding_player_id
+                        && !matches!(view.step, StepKind::EndOfTurn | StepKind::Cleanup)
+                        && self.last_opponent_turn(&deciding_player_id) => PassUntil {
+                        player_id: view.active_player_id.clone(),
+                        phase: manabrew_protocol::game::StepKind::EndOfTurn,
+                        through_combat: false,
+                    },
+                    _ => PassUntil {
+                        player_id: deciding_player_id.clone(),
+                        phase: manabrew_protocol::game::StepKind::Main1,
+                        through_combat: false,
+                    },
+                };
                 Some(PromptOutput::ChooseAction(match pick {
                     Some((action_id, _)) => ChooseActionOutput::Act { action_id },
-                    None => ChooseActionOutput::Pass {
-                        until: Some(PassUntil {
-                            player_id: deciding_player_id.clone(),
-                            phase: manabrew_protocol::game::StepKind::Main1,
-                            through_combat: false,
-                        }),
-                        exhaust_stack: true,
-                    },
+                    None => ChooseActionOutput::Pass { until: Some(until), exhaust_stack: true },
                 }))
             }
             PromptInput::ChooseAttackers(manabrew_protocol::prompts::choose_attackers::ChooseAttackersInput {
@@ -4579,6 +4589,24 @@ mod execution_audit_policy {
             let picked = if offered.is_empty() { false } else { prompt_for(&mut bot, &spell, intent, &offered)["type"] == "boardTargets" };
             assert_eq!(cast, picked, "{label}: cast check and prompt disagree");
             assert_eq!(cast, expected, "{label}");
+        }
+    }
+
+    /// With a reserve kept, a pass on the last opponent's turn stops at their end step, where the reserve
+    /// may be spent; otherwise it runs to my next main phase.
+    #[test]
+    fn a_pass_with_a_reserve_stops_at_the_last_opponents_end_step() {
+        let counter = spell_card("card-9", "{U}{U}", 2, "Counter target spell.");
+        for (active, expected_player, expected_phase) in [(3, "player-3", "endOfTurn"), (1, "player-0", "main1")] {
+            let lands: Vec<_> = (0..3).map(|i| land(&format!("card-{}", 20 + i), 0, "Island")).collect();
+            let mut v = view(active, StepKind::Main1, vec![(ZoneKind::Battlefield, 0, lands), (ZoneKind::Hand, 0, vec![counter.clone()])]);
+            v.zones.push(ZoneDto { zone: ZoneKind::Hand, owner_id: "player-3".into(), count: 4, cards: vec![] });
+            let mut bot = SimpleAi::default();
+            bot.observe(v);
+            let out = act(&mut bot, json!([]));
+            assert_eq!(out["type"], "pass");
+            assert_eq!(out["until"]["playerId"], expected_player, "active player-{active}");
+            assert_eq!(out["until"]["phase"], expected_phase, "active player-{active}");
         }
     }
 

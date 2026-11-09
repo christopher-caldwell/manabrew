@@ -208,7 +208,7 @@ impl SimpleAi {
 
     /// The opponent whose turn is last before mine is the one whose end step is the last chance to
     /// spend the reserve.
-    fn last_opponent_turn(&self, me: &str) -> bool {
+    pub(super) fn last_opponent_turn(&self, me: &str) -> bool {
         let Some(view) = self.view.as_ref() else {
             return false;
         };
