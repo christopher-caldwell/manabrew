@@ -11,6 +11,7 @@ use manabrew_protocol::game::ManaColor;
 use manabrew_protocol::prompts::common::{PaymentAction, PaymentActionKind};
 
 /// One way a source can be tapped: the action to send, and what it makes.
+#[derive(Clone)]
 struct SourceTap {
     action_id: String,
     color: ManaColor,
@@ -74,6 +75,31 @@ fn unpaid(cost: &str, floating: &[(ManaColor, i32)]) -> Option<(Vec<ManaColor>, 
     Some((pips, (generic - spare).max(0)))
 }
 
+/// Whether `order` can be paid from distinct `sources`, with `generic` more mana left over from
+/// the unused ones. Fills `chosen` with the action for each pip, in order.
+fn assign<'a>(order: &[ManaColor], sources: &'a [(String, Vec<SourceTap>)], taken: &mut Vec<bool>, chosen: &mut Vec<&'a str>, generic: i32) -> bool {
+    let Some((pip, rest)) = order.split_first() else {
+        let spare: i32 = sources.iter().zip(taken.iter()).filter(|(_, used)| !**used)
+            .map(|((_, options), _)| options.iter().map(|o| o.amount).max().unwrap_or(0)).sum();
+        return spare >= generic;
+    };
+    for (index, (_, options)) in sources.iter().enumerate() {
+        let Some(option) = options.iter().find(|o| o.color == *pip) else { continue };
+        if taken[index] {
+            continue;
+        }
+        taken[index] = true;
+        chosen.push(&option.action_id);
+        // A source that makes more than the pip needs (a `{C}{C}` land) also pays generic.
+        if assign(rest, sources, taken, chosen, (generic - (option.amount - 1)).max(0)) {
+            return true;
+        }
+        chosen.pop();
+        taken[index] = false;
+    }
+    false
+}
+
 /// The next source to tap so that the cost stays payable, or `None` when the automatic payer
 /// should go on: no coloured pip left, no source with a choice of colour, a cost this does not
 /// read, or no assignment at all.
@@ -100,30 +126,14 @@ pub fn planned_tap(cost: &str, floating: &[(ManaColor, i32)], actions: &[Payment
     let mut order = pips.clone();
     order.sort_by_key(|pip| capable(pip));
     sources.sort_by_key(|(_, options)| options.len());
+    // Sources with one colour only cannot be wasted. When they alone pay every pip, the
+    // automatic payer cannot strand a colour, so it keeps the payment.
+    let fixed: Vec<_> = sources.iter().filter(|(_, options)| !flexible(options)).cloned().collect();
+    if assign(&order, &fixed, &mut vec![false; fixed.len()], &mut Vec::new(), 0) {
+        return None;
+    }
     let mut taken = vec![false; sources.len()];
     let mut chosen: Vec<&str> = Vec::new();
-    fn assign<'a>(order: &[ManaColor], sources: &'a [(String, Vec<SourceTap>)], taken: &mut Vec<bool>, chosen: &mut Vec<&'a str>, generic: i32) -> bool {
-        let Some((pip, rest)) = order.split_first() else {
-            let spare: i32 = sources.iter().zip(taken.iter()).filter(|(_, used)| !**used)
-                .map(|((_, options), _)| options.iter().map(|o| o.amount).max().unwrap_or(0)).sum();
-            return spare >= generic;
-        };
-        for (index, (_, options)) in sources.iter().enumerate() {
-            let Some(option) = options.iter().find(|o| o.color == *pip) else { continue };
-            if taken[index] {
-                continue;
-            }
-            taken[index] = true;
-            chosen.push(&option.action_id);
-            // A source that makes more than the pip needs (a `{C}{C}` land) also pays generic.
-            if assign(rest, sources, taken, chosen, (generic - (option.amount - 1)).max(0)) {
-                return true;
-            }
-            chosen.pop();
-            taken[index] = false;
-        }
-        false
-    }
     if assign(&order, &sources, &mut taken, &mut chosen, generic) {
         chosen.first().map(|id| id.to_string())
     } else {
@@ -194,6 +204,16 @@ mod tests {
         assert_eq!(planned_tap("{X}{R}", &[], &kaalia_sources(), &skip), None);
         assert_eq!(planned_tap("{R/W}{B}", &[], &kaalia_sources(), &skip), None);
         assert_eq!(planned_tap("{3}", &[], &kaalia_sources(), &skip), None, "generic cost: the automatic payer");
+    }
+
+    /// A flexible land is no reason to take over when single-colour lands pay every pip.
+    #[test]
+    fn the_automatic_payer_keeps_a_cost_the_fixed_lands_pay() {
+        let skip = Default::default();
+        let mut sources = vec![tap("tap:card-1:0", "card-1", 0, "R", 1), tap("tap:card-2:0", "card-2", 0, "W", 1)];
+        sources.extend(kaalia_sources().into_iter().filter(|a| a.id.starts_with("tap:card-286")));
+        assert_eq!(planned_tap("{R}{W}", &[], &sources, &skip), None);
+        assert!(planned_tap("{R}{W}{B}", &[], &sources, &skip).is_some(), "black needs the flexible land");
     }
 
     #[test]
