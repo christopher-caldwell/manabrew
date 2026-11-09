@@ -122,7 +122,7 @@ impl GameLoop {
         true
     }
 
-    pub(crate) fn action_space(
+    pub fn action_space(
         &self,
         game: &GameState,
         player: PlayerId,

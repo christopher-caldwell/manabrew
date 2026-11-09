@@ -2,6 +2,12 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResourceFacts {
+    pub available: i32,
+    pub capacity: i32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ActionFacts {
     pub action_id: String,
     pub mode: String,
