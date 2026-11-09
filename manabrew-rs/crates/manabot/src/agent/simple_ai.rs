@@ -8,6 +8,7 @@ use manabrew_agent_interface::prompt::*;
 use super::BotAgent;
 
 mod roles;
+mod threat;
 use roles::Roles;
 
 /// How many recent prompts to remember when detecting a stuck loop.
@@ -574,8 +575,9 @@ impl SimpleAi {
         self.cancelled_plays.insert(source_id.to_string(), signature);
     }
 
-    /// An opposing spell that "counter target ..." text could legally take and that no answer
-    /// of ours already covers. Without one, a counterspell would be started and cancelled.
+    /// An opposing spell that "counter target ..." text could legally take, that no answer of ours
+    /// already covers, and that matters enough to spend a counterspell on (`threat::COUNTER_MIN`).
+    /// Without one, a counterspell would be started and cancelled, or wasted on a minor spell.
     fn counterable_spell_exists(&self, text: &str, player_id: &str) -> bool {
         let Some(view) = &self.view else { return true };
         view.stack.iter().any(|item| {
@@ -587,7 +589,8 @@ impl SimpleAi {
                 return false;
             }
             let target = TargetRef { kind: TargetKind::Spell, id: item.id.clone(), intent: None, oracle: None };
-            !self.covered_by_friendly_answer(&target, player_id)
+            threat::spell_importance(view, item, player_id) >= threat::COUNTER_MIN
+                && !self.covered_by_friendly_answer(&target, player_id)
         })
     }
 
@@ -706,6 +709,14 @@ impl SimpleAi {
             && text.contains("spell")
             && !text.contains("ability")
             && !self.counterable_spell_exists(&text, player_id)
+        {
+            return false;
+        }
+        // A protection spell is cast for a valuable permanent an opposing spell or ability is aimed
+        // at, and held otherwise.
+        if threat::is_protection(&text)
+            && !card.types.iter().any(|ty| ty == "Creature")
+            && threat::most_threatened_importance(view, player_id).is_none_or(|value| value < threat::PROTECT_MIN)
         {
             return false;
         }
@@ -1257,6 +1268,10 @@ impl SimpleAi {
             incoming -= threats.remove(0);
             keep.insert(creature.id);
         }
+        // Blockers that still leave us in danger save nothing; they attack instead.
+        if Self::life_in_danger(life, incoming, false) {
+            keep.clear();
+        }
         keep
     }
 
@@ -1321,8 +1336,11 @@ impl SimpleAi {
                 _ => None,
             })
             .collect();
+        // An engine creature or commander does not trade into a cheaper body.
+        let key = self.importance(attacker) >= threat::KEY_PERMANENT;
         let losing = |blocker: &Combatant| {
-            Self::can_destroy(blocker, &me) && !Self::can_destroy(&me, blocker)
+            Self::can_destroy(blocker, &me)
+                && (!Self::can_destroy(&me, blocker) || (key && blocker.value < me.value))
         };
         if menace {
             let killers = blockers.iter().filter(|b| losing(b)).count();
@@ -1651,21 +1669,22 @@ impl SimpleAi {
                 if damage >= life {
                     10_000
                 } else {
-                    1_000 + self.attack_target_score(&target.id) / 8
+                    1_000 + self.attack_target_score(&target.id, player_id) / 8
                 }
             }
             TargetKind::Card => {
                 let Some(card) = self.card(&target.id) else {
                     return 0;
                 };
+                let importance = self.importance(card);
                 if card.controller_id == player_id {
-                    return -Self::card_value(card);
+                    return -importance;
                 }
                 let lethal = (Self::stat(card.toughness.as_deref()) - card.damage).max(1);
                 if card.types.iter().any(|ty| ty == "Creature") && lethal > damage {
-                    Self::card_value(card) / 4
+                    importance / 4
                 } else {
-                    1_000 + Self::card_value(card) * 4
+                    1_000 + importance * 4
                 }
             }
             TargetKind::Spell => 0,
@@ -1763,7 +1782,7 @@ impl SimpleAi {
             );
         match target.kind {
             TargetKind::Player => {
-                let value = self.attack_target_score(&target.id);
+                let value = self.attack_target_score(&target.id, player_id);
                 let own = target.id == player_id;
                 if hostile == own {
                     -value
@@ -1775,8 +1794,12 @@ impl SimpleAi {
                 let Some(card) = self.card(&target.id) else {
                     return 0;
                 };
-                let value = Self::card_value(card) + if !hostile && self.life_counter_pinger(player_id, false).is_some_and(|pinger| pinger.id == card.id) { 10_000 } else { 0 };
+                let mut value = self.importance(card) + if !hostile && self.life_counter_pinger(player_id, false).is_some_and(|pinger| pinger.id == card.id) { 10_000 } else { 0 };
                 let own = card.controller_id == player_id;
+                // A helpful effect (protection, a blink) goes to the permanent under attack first.
+                if !hostile && own && self.view.as_ref().is_some_and(|view| threat::threatened(view, card, player_id)) {
+                    value += 5_000;
+                }
                 if hostile == own {
                     -value
                 } else {
@@ -1791,34 +1814,25 @@ impl SimpleAi {
                     if item.controller_id == player_id {
                         -1_000
                     } else {
-                        1_000
+                        1_000 + self.view.as_ref().map_or(0, |view| threat::spell_importance(view, item, player_id))
                     }
                 }),
         }
     }
 
-    fn attack_target_score(&self, id: &str) -> i32 {
+    /// How much `me` should want to hit this attack target: an opponent's danger, a planeswalker's importance.
+    fn attack_target_score(&self, id: &str, me: &str) -> i32 {
         let Some(view) = &self.view else {
             return 0;
         };
-        let Some(player) = view.players.iter().find(|player| player.id == id) else {
-            return self.card(id).map_or(0, Self::card_value);
-        };
-        let life = player.life.max(0);
-        let board = view
-            .zones
-            .iter()
-            .filter(|zone| zone.zone == ZoneKind::Battlefield && zone.owner_id == id)
-            .flat_map(|zone| &zone.cards)
-            .filter_map(|card| match card {
-                CardView::Visible(card) if card.types.iter().any(|ty| ty == "Creature") => {
-                    Some(Self::card_value(card))
-                }
-                _ => None,
-            })
-            .sum::<i32>();
-        let life_deficit = (20 - life).max(0);
-        board * 2 + life_deficit * life_deficit
+        if view.players.iter().any(|player| player.id == id) {
+            return threat::opponent_danger(view, id, me);
+        }
+        self.card(id).map_or(0, |card| self.importance(card))
+    }
+
+    fn importance(&self, card: &CardDto) -> i32 {
+        self.view.as_ref().map_or_else(|| Self::card_value(card), |view| threat::permanent_importance(view, card))
     }
 }
 
@@ -2007,7 +2021,7 @@ impl BotAgent for SimpleAi {
             }) => {
                 let default_target = attack_targets
                     .iter()
-                    .max_by_key(|target| self.attack_target_score(&target.id))
+                    .max_by_key(|target| self.attack_target_score(&target.id, &deciding_player_id))
                     .map(|target| target.id.clone())
                     .unwrap_or_else(|| "player-1".to_string());
                 let attack_power = attackers
@@ -2064,7 +2078,7 @@ impl BotAgent for SimpleAi {
                     let mut targets: Vec<_> = attacker.valid_target_ids.iter()
                         .filter(|target| !self.failed_attack_targets.contains(*target)).collect();
                     targets.sort_by_key(|target| std::cmp::Reverse((attacker.goaded_by.as_ref().is_some_and(|g|
-                        target.starts_with("player-") && *target != g), self.attack_target_score(target))));
+                        target.starts_with("player-") && *target != g), self.attack_target_score(target, &deciding_player_id))));
                     for target in targets {
                         if let Some(position) = attack_targets.iter().position(|item| item.id == *target) {
                             let penalty = i32::from(attacker.goaded_by.as_ref().is_some_and(|g|
@@ -2117,16 +2131,17 @@ impl BotAgent for SimpleAi {
                 for a in attackers.iter().filter(|a| !a.must_attack) {
                     if max_attackers.is_some_and(|max| assignments.len() >= max) { break; }
                     if reprompted || keep.contains(&a.attacker_id) { continue; }
-                    let target_id = match a.valid_target_ids.iter()
+                    // The most dangerous opponent this creature can safely and usefully attack.
+                    let mut targets: Vec<&String> = a.valid_target_ids.iter()
                         .filter(|target| !self.failed_attack_targets.contains(*target))
                         .filter(|target| target_limits.get(*target).is_none_or(|limit|
                             assignments.iter().filter(|entry| entry.target_id.as_str() == target.as_str()).count() < *limit))
-                        .max_by_key(|target| self.attack_target_score(target)) {
-                            Some(target) => target.clone(), None => continue,
-                        };
-                    if (lethal_target && target_id == default_target) || self.should_attack(&a.attacker_id, &target_id) {
-                        assignments.push(AttackAssignment { attacker_id: a.attacker_id.clone(), target_id });
-                    }
+                        .collect();
+                    targets.sort_by_key(|target| std::cmp::Reverse(self.attack_target_score(target, &deciding_player_id)));
+                    let Some(target_id) = targets.into_iter()
+                        .find(|target| (lethal_target && **target == default_target) || self.should_attack(&a.attacker_id, target))
+                        .cloned() else { continue };
+                    assignments.push(AttackAssignment { attacker_id: a.attacker_id.clone(), target_id });
                 }
                 self.last_attack_declaration = assignments
                     .iter()

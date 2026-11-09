@@ -18,15 +18,9 @@ use serde_json::{json, Value};
 
 /// Puzzles the bot gets wrong today. Update this list when a step fixes (or breaks) one.
 const KNOWN_FAILURES: &[&str] = &[
-    "1a-counter-minor",
-    "1c-counter-best",
     "2b-living-death-no",
     "3a-hold-answer",
-    "4-attack-leader",
-    "6a-removal-engine",
-    "6b-removal-drain",
     "8b-windfall-no",
-    "10a-protect-key",
 ];
 
 struct Puzzle {
@@ -584,7 +578,7 @@ fn hold_back_a_blocker() -> String {
 }
 
 fn protect_key_permanent(key_is_targeted: bool) -> String {
-    let mut battlefield = lands(20, 0, "Green", 3);
+    let mut battlefield = lands(20, 0, "Forest", 3);
     battlefield.push(creature("card-1", 0, (4, 4), 5, ENGINE));
     battlefield.push(CardDto {
         identity: manabrew_protocol::game::CardIdentity {
