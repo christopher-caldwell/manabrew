@@ -399,7 +399,7 @@ impl SimpleAi {
             .filter(|zone| zone.zone == ZoneKind::Battlefield && zone.owner_id != player_id)
             .flat_map(|zone| &zone.cards)
             .filter_map(|card| match card {
-                CardView::Visible(card) if card.types.iter().any(|ty| ty == "Creature") => {
+                CardView::Visible(card) if card.types.iter().any(|ty| ty == "Creature") && !card.phased_out => {
                     Some(card)
                 }
                 _ => None,
@@ -596,7 +596,7 @@ impl SimpleAi {
             .filter(|zone| zone.zone == ZoneKind::Battlefield && zone.owner_id != player_id)
             .flat_map(|zone| &zone.cards)
             .filter(|card| match card {
-                CardView::Visible(card) => !card.types.iter().any(|ty| ty == "Land"),
+                CardView::Visible(card) => !card.phased_out && !card.types.iter().any(|ty| ty == "Land"),
                 CardView::Hidden { .. } => false,
             })
             .count()
@@ -691,11 +691,11 @@ impl SimpleAi {
     }
 
     /// Whether `source` (a spell or ability of `player_id`) may target `card` at all: not under
-    /// Shroud, not an opponent's Hexproof, not Protection from a colour the source has. The engine
+    /// Shroud, not an opponent's Hexproof, not Protection from a colour the source has, not phased out. The engine
     /// never offers such a permanent as a candidate, so a cast must not count it either.
     fn can_target(&self, card: &CardDto, source: Option<&CardDto>, player_id: &str) -> bool {
         const COLOR_NAMES: [(char, &str); 5] = [('W', "white"), ('U', "blue"), ('B', "black"), ('R', "red"), ('G', "green")];
-        card.keywords.iter().map(|keyword| keyword.to_ascii_lowercase()).all(|keyword| {
+        !card.phased_out && card.keywords.iter().map(|keyword| keyword.to_ascii_lowercase()).all(|keyword| {
             if keyword.contains("shroud") {
                 return false;
             }
@@ -898,11 +898,14 @@ impl SimpleAi {
         {
             return false;
         }
-        // A protection spell is cast for a valuable permanent an opposing spell or ability is aimed
-        // at, and held otherwise.
+        // A protection spell is cast when what it protects is threatened (a spell aimed at an important
+        // permanent, a wipe or mass removal it stops, a combat that would kill an important creature),
+        // and otherwise held, apart from the last opponent's end step, where a spell with a lasting
+        // effect spends the mana the reserve kept.
         if threat::is_protection(&text)
             && !card.types.iter().any(|ty| ty == "Creature")
-            && threat::most_threatened_importance(view, player_id).is_none_or(|value| value < threat::PROTECT_MIN)
+            && !threat::protection_wanted(view, player_id, threat::grants(&text))
+            && !(self.reserve_spending_window(player_id) && threat::has_lasting_effect(&text))
         {
             return false;
         }
@@ -1253,10 +1256,15 @@ impl SimpleAi {
             if searches && (text.contains("land") || ["plains", "island", "swamp", "mountain", "forest"].iter().any(|t| text.contains(t))) {
                 return main;
             }
-            // Cards, not a rock: a mana rock is sacrificed once the lands carry the mana.
+            // Cards, not a rock: a mana rock is sacrificed once the lands carry the mana, which is
+            // six lands, or five when nothing in hand or the command zone costs more than the lands.
             let rock = Self::is_mana_source(source);
             if text.starts_with("draw a card") || text.contains("explores") {
-                return idle && (!rock || self.lands_in_play(me) >= 6) && self.library_count(me) >= 6;
+                let lands = self.lands_in_play(me);
+                let lands_carry = lands >= 6 || (lands >= 5 && [ZoneKind::Hand, ZoneKind::Command].iter()
+                    .flat_map(|zone| self.zone_cards(me, *zone))
+                    .all(|card| card.types.iter().any(|ty| ty == "Land") || card.cmc + card.commander_tax.unwrap_or(0) <= lands as i32));
+                return idle && (!rock || lands_carry) && self.library_count(me) >= 6;
             }
             if text.contains("gain haste") {
                 let slow: i32 = self.battlefield(me).filter(|c| c.summoning_sick && !c.tapped)
@@ -4551,6 +4559,7 @@ mod execution_audit_policy {
             ("bounce an opponent's creature", "U", BOUNCE, "bounce", vec![], vec![creature("card-5", 1, (2, 2), 3, "")], vec![], vec!["card-5"], true),
             ("bounce: already being exiled by another seat", "U", BOUNCE, "bounce", vec![], vec![creature("card-5", 1, (2, 2), 3, "")], vec![exile_elsewhere], vec!["card-5"], false),
             ("bounce: opponent's creature has hexproof", "U", BOUNCE, "bounce", vec![], vec![with(creature("card-5", 1, (2, 2), 3, ""), "Hexproof")], vec![], vec![], false),
+            ("bounce: opponent's creature is phased out", "U", BOUNCE, "bounce", vec![], vec![CardDto { phased_out: true, ..creature("card-5", 1, (2, 2), 3, "") }], vec![], vec![], false),
             ("bounce: only our own creature, not threatened", "U", BOUNCE, "bounce", vec![creature("card-1", 0, (2, 2), 3, "")], vec![], vec![], vec!["card-1"], false),
         ];
         for (label, colour, text, intent, ours, theirs, stack, offered, expected) in cases {
@@ -4570,6 +4579,42 @@ mod execution_audit_policy {
             let picked = if offered.is_empty() { false } else { prompt_for(&mut bot, &spell, intent, &offered)["type"] == "boardTargets" };
             assert_eq!(cast, picked, "{label}: cast check and prompt disagree");
             assert_eq!(cast, expected, "{label}");
+        }
+    }
+
+    /// A protection spell nothing threatens is held, except at the end step of the last opponent's
+    /// turn when it does more than protect (a token, a counter, a card).
+    #[test]
+    fn a_protection_spell_with_a_lasting_effect_is_spent_at_the_last_opponents_end_step() {
+        const LASTING: &str = "Amass Zombies 1. You and permanents you control gain hexproof until end of turn.";
+        const PLAIN: &str = "Creatures you control gain indestructible until end of turn.";
+        for (text, active, step, expected) in [
+            (LASTING, 3, StepKind::EndOfTurn, "act"),
+            (LASTING, 1, StepKind::EndOfTurn, "pass"),
+            (LASTING, 3, StepKind::Main2, "pass"),
+            (PLAIN, 3, StepKind::EndOfTurn, "pass"),
+        ] {
+            let mut lands: Vec<_> = (0..3).map(|i| land(&format!("card-{}", 20 + i), 0, "Island")).collect();
+            lands.push(creature("card-1", 0, (4, 4), 5, "Whenever a creature enters the battlefield under your control, draw a card."));
+            let mut bot = SimpleAi::default();
+            bot.observe(view(active, step, vec![(ZoneKind::Battlefield, 0, lands), (ZoneKind::Hand, 0, vec![spell_card("card-9", "{1}{U}", 2, text)])]));
+            assert_eq!(cast_choice(&mut bot, "card-9"), expected, "{text} on player-{active}'s {step:?}");
+        }
+    }
+
+    /// A mana rock is sacrificed for its card once the lands carry the mana: six lands, or five when
+    /// nothing held costs more than the lands.
+    #[test]
+    fn a_mana_rock_is_sacrificed_for_a_card_when_the_lands_carry_the_hand() {
+        let rock = CardDto { id: "card-6".into(), controller_id: "player-0".into(), owner_id: "player-0".into(), types: vec!["Artifact".into()], text: "{T}: Add {C}.".into(), ..Default::default() };
+        let cost = format!("{{1}}, {{T}}, {SAC_SELF}");
+        for (lands, hand_cmc, expected) in [(5, 4, "act"), (5, 7, "pass"), (4, 2, "pass"), (6, 9, "act")] {
+            let mut battlefield: Vec<_> = (0..lands).map(|i| land(&format!("card-{}", 20 + i), 0, "Island")).collect();
+            battlefield.push(rock.clone());
+            let held = creature("card-30", 0, (3, 3), hand_cmc, "");
+            let mut bot = SimpleAi::default();
+            bot.observe(with_library(view(0, StepKind::Main2, vec![(ZoneKind::Battlefield, 0, battlefield), (ZoneKind::Hand, 0, vec![held])]), 60));
+            assert_eq!(act(&mut bot, ability("card-6", &cost, "Draw a card."))["type"], expected, "{lands} lands, hand of {hand_cmc}");
         }
     }
 

@@ -224,6 +224,13 @@ impl SimpleAi {
         alive[(active + 1) % alive.len()] == me
     }
 
+    /// The end step of the last opponent's turn: the last chance to spend a reserve that went unused.
+    pub(super) fn reserve_spending_window(&self, me: &str) -> bool {
+        self.view.as_ref().is_some_and(|view| {
+            view.active_player_id != me && view.step == StepKind::EndOfTurn && self.last_opponent_turn(me)
+        })
+    }
+
     /// Whether a spell is worth more than keeping the mana: an answer itself, a mana source, a
     /// commander, a win, or a permanent worth `DEVELOP_OVERRIDE`.
     fn beats_reserve(&self, card: &CardDto, me: &str) -> bool {
@@ -276,9 +283,7 @@ impl SimpleAi {
         if cost.is_empty() || !self.cost_affordable(reserve, me) {
             return false;
         }
-        let spending_window = view.active_player_id != me
-            && view.step == StepKind::EndOfTurn
-            && self.last_opponent_turn(me);
+        let spending_window = self.reserve_spending_window(me);
         !spending_window && !self.cost_affordable(&format!("{reserve}{cost}"), me)
     }
 }

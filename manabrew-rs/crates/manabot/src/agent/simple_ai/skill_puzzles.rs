@@ -251,6 +251,8 @@ const ENGINE: &str = "Whenever a creature enters the battlefield under your cont
 const WINDFALL: &str = "Each player discards their hand, then draws cards equal to the greatest number of cards a player discarded this way.";
 const PROTECTION: &str =
     "Target creature you control gains hexproof and indestructible until end of turn.";
+const MASS_PROTECTION: &str = "Creatures you control gain indestructible until end of turn.";
+const EXILE_WIPE: &str = "Exile all creatures.";
 const DRAIN: &str = "At the beginning of your upkeep, each opponent loses 3 life.";
 const DESTROY_PERMANENT: &str = "Destroy target permanent.";
 
@@ -611,6 +613,33 @@ fn protect_key_permanent(key_is_targeted: bool) -> String {
     cast_label(cast_or_hold(&mut bot, &[("card-9", "cast")]) == "cast")
 }
 
+/// Mass protection ("creatures you control gain indestructible"): cast with a wipe it stops on the
+/// stack, held on a quiet board, and held against a wipe that exiles.
+fn protect_the_board(threat: Option<&str>) -> String {
+    let mut battlefield = lands(20, 0, "Forest", 3);
+    battlefield.extend((0..2).map(|i| creature(&format!("card-{}", 1 + i), 0, (4, 4), 5, ENGINE)));
+    let mut bot = bot_seeing({
+        let mut v = view(
+            1,
+            StepKind::Main1,
+            [40; 4],
+            vec![
+                zone(ZoneKind::Battlefield, 0, battlefield),
+                zone(
+                    ZoneKind::Hand,
+                    0,
+                    vec![spell("card-9", &["Instant"], "{G}", 1, MASS_PROTECTION)],
+                ),
+            ],
+        );
+        if let Some(wipe) = threat {
+            v.stack.push(on_stack(1, spell("card-30", &["Sorcery"], "{2}{B}{B}", 4, wipe), json!([])));
+        }
+        v
+    });
+    cast_label(cast_or_hold(&mut bot, &[("card-9", "cast")]) == "cast")
+}
+
 fn puzzles() -> Vec<Puzzle> {
     vec![
         Puzzle {
@@ -727,6 +756,24 @@ fn puzzles() -> Vec<Puzzle> {
             name: "Removal aimed at a spare token; keep the protection spell",
             expected: "hold",
             play: || protect_key_permanent(false),
+        },
+        Puzzle {
+            id: "11a-protect-board",
+            name: "A wipe that destroys is on the stack; cast the mass protection",
+            expected: "cast",
+            play: || protect_the_board(Some(WRATH)),
+        },
+        Puzzle {
+            id: "11b-quiet-board",
+            name: "Nothing threatens the board; keep the mass protection",
+            expected: "hold",
+            play: || protect_the_board(None),
+        },
+        Puzzle {
+            id: "11c-wrong-protection",
+            name: "A wipe that exiles is on the stack; indestructible does not help, keep it",
+            expected: "hold",
+            play: || protect_the_board(Some(EXILE_WIPE)),
         },
     ]
 }

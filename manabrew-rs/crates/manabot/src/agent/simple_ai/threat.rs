@@ -188,22 +188,53 @@ pub fn permanent_importance(view: &GameViewDto, card: &CardDto) -> i32 {
     points
 }
 
-/// Whether the text is a spell that protects one of its controller's permanents.
+/// What a protection effect gives, read from its text.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Grants {
+    /// Hexproof, shroud or protection: stops a spell or ability aimed at the permanent.
+    pub untargetable: bool,
+    /// Indestructible or regeneration: survives destruction and lethal damage, not exile or -X/-X.
+    pub indestructible: bool,
+    /// Phasing out: untouchable by everything until it phases back in.
+    pub phases: bool,
+}
+
+impl Grants {
+    fn any(self) -> bool {
+        self.untargetable || self.indestructible || self.phases
+    }
+}
+
+pub fn grants(text: &str) -> Grants {
+    let text = text.to_ascii_lowercase();
+    Grants {
+        untargetable: ["hexproof", "shroud", "protection from"].iter().any(|word| text.contains(word)),
+        indestructible: ["indestructible", "regenerate"].iter().any(|word| text.contains(word)),
+        phases: text.contains("phase out") || text.contains("phases out"),
+    }
+}
+
+/// Whether the text is a spell that protects its controller's permanents, one target or all of them.
+/// A spell that only phases permanents out has its own timing rule (`SimpleAi::sane`).
 pub fn is_protection(text: &str) -> bool {
     let text = text.to_ascii_lowercase();
-    [
-        "gains hexproof",
-        "gain hexproof",
-        "gains indestructible",
-        "gain indestructible",
-        "protection from",
-        "regenerate",
-    ]
-    .iter()
-    .any(|grant| text.contains(grant))
+    let granted = grants(&text);
+    (granted.untargetable || granted.indestructible)
         && text.contains("you control")
         && !text.contains("destroy target")
         && !text.contains("exile target")
+}
+
+/// Whether a protection spell does something that lasts beyond the protection: a sentence of its text,
+/// other than the grant, that makes a permanent, a card or a counter.
+pub fn has_lasting_effect(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    text.split(['.', '\n']).any(|sentence| {
+        !grants(sentence).any()
+            && ["amass", "create", "draw", "put ", "search", "return", "scry", "surveil", "proliferate"]
+                .iter()
+                .any(|word| sentence.contains(word))
+    })
 }
 
 /// An opposing spell or ability of this stack object is aimed at the card to harm it.
@@ -244,13 +275,96 @@ fn harms(item: &StackObjectDto, card_id: &str) -> bool {
     })
 }
 
+/// How an opposing mass effect takes permanents, which decides what stops it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sweep {
+    /// Destruction or damage: indestructible survives it.
+    Destroys { creatures_only: bool },
+    /// Exile, sacrifice, -X/-X or bounce: only phasing or counterspells stop it.
+    Removes { creatures_only: bool },
+}
+
+/// An opposing stack object that takes every creature, or every permanent of a kind, from everyone
+/// (a board wipe or other mass removal).
+fn sweep(item: &StackObjectDto) -> Option<Sweep> {
+    let effect = item
+        .source_ability_text
+        .as_deref()
+        .filter(|text| !text.is_empty())
+        .unwrap_or(&item.text)
+        .to_ascii_lowercase();
+    let card_text = item.source_card.as_ref().map(|card| card.text.to_ascii_lowercase());
+    let hostile = ["destroy", "exile", "damage", "-x/-x", "-1/-1", "sacrifice", "return"]
+        .iter()
+        .any(|word| effect.contains(word));
+    let wide = [
+        "destroy all", "destroy each", "exile all", "exile each", "each creature", "all creatures",
+        "each nonland", "all nonland", "each permanent", "all permanents", "each other creature",
+        "all other creatures",
+    ]
+    .iter()
+    .any(|phrase| effect.contains(phrase));
+    let wipe = item.source_card.as_ref().is_some_and(|card| is_wipe(card, card_text.as_deref().unwrap_or("")));
+    if !(wipe || (hostile && wide && !effect.contains("target "))) {
+        return None;
+    }
+    let creatures_only = effect.contains("creature") || wipe;
+    let removes = ["exile", "sacrifice", "-x/-x", "-1/-1", "return"].iter().any(|word| effect.contains(word));
+    Some(if removes { Sweep::Removes { creatures_only } } else { Sweep::Destroys { creatures_only } })
+}
+
 /// An opposing stack object that destroys or exiles every creature.
 fn sweeps(item: &StackObjectDto) -> bool {
-    let text = item.text.to_ascii_lowercase();
-    match item.source_card.as_ref() {
-        Some(card) => is_wipe(card, &card.text.to_ascii_lowercase()),
-        None => text.contains("destroy all creatures") || text.contains("exile all creatures"),
+    sweep(item).is_some()
+}
+
+/// A creature of mine in combat that its opponents in combat would kill: damage equal to its
+/// toughness, or any deathtouch.
+fn would_die_in_combat(view: &GameViewDto, card: &CardDto) -> bool {
+    let counterparts: Vec<&CardDto> = view
+        .combat_assignments
+        .iter()
+        .filter_map(|pair| {
+            let other = if card.is_attacking && pair.attacker_id == card.id {
+                &pair.blocker_id
+            } else if !card.is_attacking && pair.blocker_id == card.id {
+                &pair.attacker_id
+            } else {
+                return None;
+            };
+            find_card(view, other)
+        })
+        .collect();
+    let damage: i32 = counterparts.iter().map(|other| power(other)).sum();
+    let remaining = (SimpleAi::stat(card.toughness.as_deref()) - card.damage).max(1);
+    counterparts.iter().any(|other| SimpleAi::has_keyword(other, "Deathtouch")) || damage >= remaining
+}
+
+/// Whether holding back a protection spell would cost me something that matters: a targeted spell at an
+/// important permanent; a board wipe or mass removal that this protection stops, with enough on my side
+/// to lose; or an important creature that combat would kill, for protection that survives combat.
+pub fn protection_wanted(view: &GameViewDto, me: &str, granted: Grants) -> bool {
+    if !granted.any() {
+        return false;
     }
+    let key = |card: &CardDto| permanent_importance(view, card) >= PROTECT_MIN;
+    let opposing = || view.stack.iter().filter(|item| item.controller_id != me && !item.is_casting);
+    if battlefield_of(view, me).any(|card| key(card) && opposing().any(|item| harms(item, &card.id))) {
+        return true;
+    }
+    let at_stake = |creatures_only: bool| -> i32 {
+        battlefield_of(view, me)
+            .filter(|card| !has_type(card, "Land") && (!creatures_only || is_creature(card)))
+            .map(|card| permanent_importance(view, card))
+            .sum()
+    };
+    let stopped = opposing().filter_map(sweep).any(|kind| match kind {
+        Sweep::Destroys { creatures_only } => (granted.indestructible || granted.phases) && at_stake(creatures_only) >= PROTECT_MIN,
+        Sweep::Removes { creatures_only } => granted.phases && at_stake(creatures_only) >= PROTECT_MIN,
+    });
+    stopped
+        || ((granted.indestructible || granted.phases)
+            && battlefield_of(view, me).any(|card| is_creature(card) && key(card) && would_die_in_combat(view, card)))
 }
 
 /// A permanent of `me` that an opposing stack object is aimed at to harm it, or a creature of mine
@@ -262,14 +376,6 @@ pub fn threatened(view: &GameViewDto, card: &CardDto, me: &str) -> bool {
                 && !item.is_casting
                 && (harms(item, &card.id) || (is_creature(card) && sweeps(item)))
         })
-}
-
-/// The most important of `me`'s permanents that an opposing stack object is aimed at.
-pub fn most_threatened_importance(view: &GameViewDto, me: &str) -> Option<i32> {
-    battlefield_of(view, me)
-        .filter(|card| threatened(view, card, me))
-        .map(|card| permanent_importance(view, card))
-        .max()
 }
 
 fn is_wipe(card: &CardDto, text: &str) -> bool {
@@ -626,29 +732,61 @@ mod tests {
         assert!(kill("k") > kill("nothing"));
     }
 
+    fn key_creature() -> CardDto {
+        creature("k", 0, (4, 4), "Whenever a creature enters the battlefield under your control, draw a card.")
+    }
+
+    const INDESTRUCTIBLE: &str = "Creatures you control gain indestructible until end of turn.";
+    const HEXPROOF: &str = "You and permanents you control gain hexproof until end of turn.";
+
     #[test]
     fn protection_needs_an_important_permanent_under_threat() {
-        let key = creature(
-            "k",
-            0,
-            (4, 4),
-            "Whenever a creature enters the battlefield under your control, draw a card.",
-        );
         let token = creature("t", 0, (1, 1), "");
-        let mut view = board(40, vec![key, token]);
-        assert_eq!(most_threatened_importance(&view, "player-0"), None);
-        view.stack.push(on_stack(
-            1,
-            card("r", 1, &["Instant"], 2, "Destroy target creature."),
-            vec![aimed_at("t")],
-        ));
-        assert!(most_threatened_importance(&view, "player-0").unwrap() < PROTECT_MIN);
-        view.stack.push(on_stack(
-            1,
-            card("s", 1, &["Instant"], 2, "Destroy target creature."),
-            vec![aimed_at("k")],
-        ));
-        assert!(most_threatened_importance(&view, "player-0").unwrap() >= PROTECT_MIN);
+        let mut view = board(40, vec![key_creature(), token]);
+        assert!(!protection_wanted(&view, "player-0", grants(HEXPROOF)));
+        view.stack.push(on_stack(1, card("r", 1, &["Instant"], 2, "Destroy target creature."), vec![aimed_at("t")]));
+        assert!(!protection_wanted(&view, "player-0", grants(HEXPROOF)));
+        view.stack.push(on_stack(1, card("s", 1, &["Instant"], 2, "Destroy target creature."), vec![aimed_at("k")]));
+        assert!(protection_wanted(&view, "player-0", grants(HEXPROOF)));
+    }
+
+    #[test]
+    fn a_wipe_is_stopped_only_by_protection_that_beats_how_it_removes() {
+        let mut view = board(40, vec![key_creature()]);
+        view.stack.push(on_stack(1, card("w", 1, &["Sorcery"], 4, "Destroy all creatures."), vec![]));
+        assert!(protection_wanted(&view, "player-0", grants(INDESTRUCTIBLE)));
+        assert!(!protection_wanted(&view, "player-0", grants(HEXPROOF)), "hexproof does not stop a wipe");
+        assert!(protection_wanted(&view, "player-0", grants("Permanents you control phase out.")));
+        view.stack[0] = on_stack(1, card("x", 1, &["Sorcery"], 4, "Exile all creatures."), vec![]);
+        assert!(!protection_wanted(&view, "player-0", grants(INDESTRUCTIBLE)), "indestructible does not stop exile");
+        assert!(protection_wanted(&view, "player-0", grants("Permanents you control phase out.")));
+    }
+
+    #[test]
+    fn a_wipe_with_nothing_of_mine_to_lose_wants_no_protection() {
+        let mut view = board(40, vec![creature("t", 0, (1, 1), "")]);
+        view.stack.push(on_stack(1, card("w", 1, &["Sorcery"], 4, "Destroy all creatures."), vec![]));
+        assert!(!protection_wanted(&view, "player-0", grants(INDESTRUCTIBLE)));
+    }
+
+    #[test]
+    fn combat_that_would_kill_an_important_creature_wants_indestructible_only() {
+        let mut blocker = creature("b", 1, (5, 5), "");
+        blocker.is_attacking = true;
+        let mut view = board(40, vec![key_creature(), blocker]);
+        assert!(!protection_wanted(&view, "player-0", grants(INDESTRUCTIBLE)), "no combat yet");
+        view.combat_assignments.push(manabrew_agent_interface::game_view_dto::CombatAssignmentDto {
+            blocker_id: "k".into(),
+            attacker_id: "b".into(),
+        });
+        assert!(protection_wanted(&view, "player-0", grants(INDESTRUCTIBLE)));
+        assert!(!protection_wanted(&view, "player-0", grants(HEXPROOF)), "hexproof does not save a blocker");
+    }
+
+    #[test]
+    fn a_lasting_effect_is_something_besides_the_grant() {
+        assert!(has_lasting_effect("Amass Zombies 1. You and permanents you control gain hexproof until end of turn."));
+        assert!(!has_lasting_effect(INDESTRUCTIBLE));
     }
 
     #[test]
@@ -656,6 +794,9 @@ mod tests {
         assert!(is_protection(
             "Target creature you control gains hexproof and indestructible until end of turn."
         ));
+        assert!(is_protection(INDESTRUCTIBLE));
+        assert!(is_protection(HEXPROOF));
+        assert!(!is_protection("All permanents you control phase out."));
         assert!(!is_protection("Destroy target creature."));
         assert!(!is_protection("Creatures you control get +1/+1."));
     }
