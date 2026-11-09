@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use manabrew_agent_interface::game_view_dto::{
-    CardDto, CardView, GameViewDto, StepKind, TargetingIntent, ZoneKind,
+    grants_unblockability, CardDto, CardView, GameViewDto, StepKind, TargetingIntent, ZoneKind,
 };
 use manabrew_agent_interface::prompt::*;
 
@@ -11,6 +11,8 @@ mod payment;
 mod plan;
 mod roles;
 mod threat;
+#[cfg(test)]
+mod diagnostic_regressions;
 use roles::Roles;
 
 /// How many recent prompts to remember when detecting a stuck loop.
@@ -655,8 +657,7 @@ impl SimpleAi {
                 || self.answers_another_opponent(item, player_id) {
                 return false;
             }
-            let types: Vec<String> = item.source_card.as_ref().map(|card| card.types.clone()).unwrap_or_default();
-            if !Self::counter_clause_allows(text, &types, true) {
+            if !Self::counter_affects(text, item.source_card.as_ref(), true) {
                 return false;
             }
             let target = TargetRef { kind: TargetKind::Spell, id: item.id.clone(), intent: None, oracle: None };
@@ -688,6 +689,26 @@ impl SimpleAi {
             return wanted.iter().any(|word| has(word));
         }
         unknown
+    }
+
+    /// A legal target is not necessarily affected: a conditional counter may target a spell of
+    /// any colour but do nothing on resolution. Use the public source card for both cast and target
+    /// selection. Unknown wording is left to the engine rather than inventing a restriction.
+    fn counter_affects(text: &str, card: Option<&CardDto>, unknown: bool) -> bool {
+        let Some(card) = card else { return unknown };
+        if !Self::counter_clause_allows(text, &card.types, unknown) { return false; }
+        let Some(clause) = text.split("counter target ").nth(1) else { return unknown };
+        let clause = clause.split('.').next().unwrap_or("");
+        let qualifier = clause.split("spell").next().unwrap_or("");
+        const COLORS: [(char, &str); 5] = [('W', "white"), ('U', "blue"), ('B', "black"), ('R', "red"), ('G', "green")];
+        let positive: Vec<_> = COLORS.iter().filter(|(_,name)| qualifier.split_whitespace().any(|word| word == *name)).collect();
+        if !positive.is_empty() && !positive.iter().any(|(letter,_)| card.color.contains(*letter)) { return false; }
+        if COLORS.iter().any(|(letter,name)| qualifier.split_whitespace().any(|word| word == format!("non{name}")) && card.color.contains(*letter)) { return false; }
+        if let Some(condition) = clause.split(" if it's ").nth(1).or_else(|| clause.split(" if it is ").nth(1)) {
+            let colors: Vec<_> = COLORS.iter().filter(|(_,name)| condition.split_whitespace().any(|word| word == *name)).collect();
+            if !colors.is_empty() && !colors.iter().any(|(letter,_)| card.color.contains(*letter)) { return false; }
+        }
+        true
     }
 
     /// Whether `source` (a spell or ability of `player_id`) may target `card` at all: not under
@@ -757,7 +778,9 @@ impl SimpleAi {
                 let item = self.view.as_ref().and_then(|view| view.stack.iter().find(|item| item.id == target.id));
                 let own = matches!(intent, TargetingIntent::Counter) && item.is_some_and(|item| item.controller_id == player_id);
                 let third_party = matches!(intent, TargetingIntent::Counter) && item.is_some_and(|item| self.answers_another_opponent(item, player_id));
-                !own && !third_party && !self.covered_by_friendly_answer(target, player_id)
+                let ineffective = matches!(intent, TargetingIntent::Counter) && source.is_some_and(|source|
+                    item.is_some_and(|item| !Self::counter_affects(&source.text.to_ascii_lowercase(), item.source_card.as_ref(), true)));
+                !own && !third_party && !ineffective && !self.covered_by_friendly_answer(target, player_id)
             }
             TargetKind::Card => {
                 let Some(card) = self.card(&target.id) else { return true };
@@ -1373,8 +1396,31 @@ impl SimpleAi {
         best.map(|(_, mask)| (0..n).filter(|i| mask & (1 << i) != 0).map(|i| cards[i].id.clone()).collect()).unwrap_or_default()
     }
 
+    /// Evasion matters after attackers are declared and before blockers. It is wasted on an
+    /// opponent, an untargetable or already evasive creature, or an attacker with no possible blocker.
+    fn useful_evasion_target(&self, card: &CardDto, source: Option<&CardDto>, me: &str) -> bool {
+        let Some(view) = &self.view else { return false };
+        if view.active_player_id != me || view.step != StepKind::CombatDeclareAttackers
+            || card.controller_id != me || !card.is_attacking || Self::stat(card.power.as_deref()) <= 0
+            || !self.can_target(card, source, me) || Self::has_keyword(card, "Unblockable")
+            || card.text.to_ascii_lowercase().contains("can't be blocked") { return false; }
+        let Some(target) = card.attack_target_id.as_deref() else { return false };
+        let defender = self.card(target).map_or(target, |target| target.controller_id.as_str());
+        let blockers = self.battlefield(defender).filter(|blocker|
+            blocker.types.iter().any(|ty| ty == "Creature") && !blocker.tapped && !blocker.phased_out
+                && !blocker.text.to_ascii_lowercase().contains("can't block")
+                && (!Self::has_keyword(card, "Flying") || Self::has_keyword(blocker, "Flying") || Self::has_keyword(blocker, "Reach")))
+            .count();
+        blockers >= if Self::has_keyword(card, "Menace") { 2 } else { 1 }
+    }
+
     fn wasted_activation(&self, info: &ActivatableAbilityInfo) -> bool {
         let text = info.description.to_ascii_lowercase();
+        if grants_unblockability(&text) {
+            let Some(source) = self.card(&info.card_id) else { return true };
+            return !self.battlefield(&source.controller_id)
+                .any(|card| self.useful_evasion_target(card, Some(source), &source.controller_id));
+        }
         if let Some(source) = self.card(&info.card_id) {
             let pending_lifelink = self.view.as_ref().is_some_and(|view| view.stack.iter().any(|item| {
                 item.controller_id == source.controller_id && item.source_ability_text.as_deref().unwrap_or(&item.text).to_ascii_lowercase().contains("lifelink")
@@ -1941,7 +1987,7 @@ impl SimpleAi {
                     (Some(TargetingIntent::Counter), TargetKind::Spell) => {
                         let Some(object)=view.stack.iter().find(|item| item.id==t.id) else { return false; };
                         let Some(card)=object.source_card.as_ref() else { return false; };
-                        clause.starts_with("counter target ") && Self::counter_clause_allows(clause, &card.types, false)
+                        clause.starts_with("counter target ") && Self::counter_affects(clause, Some(card), false)
                     }
                     (Some(intent @ (TargetingIntent::Destroy | TargetingIntent::Exile | TargetingIntent::Bounce)), TargetKind::Card) => {
                         let Some(card)=self.card(&t.id) else { return false; };
@@ -2232,9 +2278,10 @@ impl BotAgent for SimpleAi {
                     self.attempted_actions.insert(key.clone());
                 }
                 // Passing normally skips to my next main phase, which also skips the last opponent's
-                // end step. With a reserve kept, stop there: it is the last chance to spend it.
+                // end step. A reserve or protection with lasting value needs that opportunity,
+                // including before there is a key permanent to reserve protection for.
                 let until = match self.view.as_ref() {
-                    Some(view) if self.reserve.is_some()
+                    Some(view) if (self.reserve.is_some() || self.holds_value_protection(&deciding_player_id))
                         && view.active_player_id != deciding_player_id
                         && !matches!(view.step, StepKind::EndOfTurn | StepKind::Cleanup)
                         && self.last_opponent_turn(&deciding_player_id) => PassUntil {
@@ -2430,6 +2477,13 @@ impl BotAgent for SimpleAi {
                 let required = (min_targets - chosen_targets).max(0) as usize;
                 let own_card = |target: &TargetRef| matches!(target.kind, TargetKind::Card)
                     && self.card(&target.id).is_some_and(|card| card.controller_id == deciding_player_id);
+                if grants_unblockability(&effect) && cancellable {
+                    candidates.retain(|target| matches!(target.kind, TargetKind::Card) && self.card(&target.id)
+                        .is_some_and(|card| self.useful_evasion_target(card, prompt.source_card.as_ref(), &deciding_player_id)));
+                    if candidates.is_empty() {
+                        return Some(PromptOutput::ChooseBoardTargets(ChooseBoardTargetsOutput::Cancel));
+                    }
+                }
                 // Exiling the player's own permanent and returning it at once is
                 // reuse, not removal: the engine labels it hostile `Exile`.
                 let self_reuse = matches!(intent, TargetingIntent::Exile)

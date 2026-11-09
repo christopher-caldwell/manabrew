@@ -231,6 +231,16 @@ impl SimpleAi {
         })
     }
 
+    /// A protection spell with independent lasting value needs its end-step opportunity even
+    /// before there is a key permanent to protect (and therefore no protection reserve). Otherwise
+    /// the pass-until shortcut can make the spending rule unreachable for the entire game.
+    pub(super) fn holds_value_protection(&self, me: &str) -> bool {
+        self.zone_cards(me, ZoneKind::Hand).into_iter().any(|card| {
+            is_instant_speed(card) && threat::is_protection(&card.text)
+                && threat::has_lasting_effect(&card.text) && self.affordable(card, me)
+        })
+    }
+
     /// Whether a spell is worth more than keeping the mana: an answer itself, a mana source, a
     /// commander, a win, or a permanent worth `DEVELOP_OVERRIDE`.
     fn beats_reserve(&self, card: &CardDto, me: &str) -> bool {

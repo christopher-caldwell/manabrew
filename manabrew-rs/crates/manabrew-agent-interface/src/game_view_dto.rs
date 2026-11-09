@@ -21,6 +21,7 @@ pub fn targeting_intent_of(sa: &SpellAbility) -> TargetingIntent {
         return TargetingIntent::Hostile;
     };
     match api {
+        ApiType::Effect if grants_unblockability(&sa.description) => TargetingIntent::Buff,
         ApiType::DealDamage | ApiType::DamageAll | ApiType::EachDamage => TargetingIntent::Damage,
         ApiType::Destroy | ApiType::DestroyAll => TargetingIntent::Destroy,
         ApiType::Sacrifice | ApiType::SacrificeAll => TargetingIntent::Sacrifice,
@@ -58,6 +59,33 @@ pub fn targeting_intent_of(sa: &SpellAbility) -> TargetingIntent {
         ApiType::Fight => TargetingIntent::Fight,
         ApiType::Attach | ApiType::Unattach => TargetingIntent::Attach,
         _ => TargetingIntent::Hostile,
+    }
+}
+
+/// An evasion grant implemented as a temporary static effect is helpful to its target, even though
+/// the generic `Effect` API carries no targeting polarity of its own. Do not confuse "can't block"
+/// (a restriction) with "can't be blocked" (a benefit).
+pub fn grants_unblockability(description: &str) -> bool {
+    let text = description.trim_start().to_ascii_lowercase();
+    text.starts_with("target creature can't be blocked")
+        || text.starts_with("target creature cannot be blocked")
+}
+
+#[cfg(test)]
+mod evasion_intent_regression {
+    use super::*;
+
+    #[test]
+    fn an_evasion_effect_is_helpful_but_a_blocking_restriction_is_hostile() {
+        for (description, expected) in [
+            ("Target creature can't be blocked this turn.", TargetingIntent::Buff),
+            ("Target creature can't block this turn.", TargetingIntent::Hostile),
+        ] {
+            let mut sa = SpellAbility::new_simple(None, PlayerId(0), "");
+            sa.api = Some(manabrew_engine::ability::api_type::ApiType::Effect);
+            sa.description = description.into();
+            assert_eq!(targeting_intent_of(&sa),expected,"{description}");
+        }
     }
 }
 
