@@ -1,10 +1,27 @@
 //! Facts supplied by the host for offered actions. Unknown is never a zero gain.
+//! Facts are trusted host attestations for one fresh public observation and prompt.
+//! The host must mark effects unknown when continuous effects, replacements, or
+//! other conditions make the described conditional result unrepresentable.
+//! The policy does not discover those rules from card text or certify the host.
+//! All channels must be supplied again after each observation and decision.
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResourceFacts {
     pub available: i32,
     pub capacity: i32,
+}
+
+/// Host-verified payment for an offered action in the current observation.
+/// `remaining` is immediately usable mana after paying, not future capacity.
+/// The host must establish legal payment, including colors and all additional costs,
+/// without executing the action. The pilot validates the arithmetic and cost shape.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PaymentFacts {
+    pub action_id: String,
+    pub spent: i32,
+    pub remaining: i32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

@@ -11,7 +11,10 @@
 pub mod agent;
 mod state;
 
-pub use agent::{ActionFacts, AgentKind, BotAgent, BotResponder, EffectFact, ResourceFacts, SimpleAi};
+pub use agent::{
+    ActionFacts, AgentKind, BotAgent, BotResponder, EffectFact, PaymentFacts, ResourceFacts,
+    SimpleAi,
+};
 pub use state::{BotConfig, BotState};
 
 #[cfg(feature = "native")]

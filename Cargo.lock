@@ -4405,6 +4405,7 @@ name = "manabot"
 version = "0.17.8"
 dependencies = [
  "bitflags 2.11.0",
+ "forge-foundation",
  "futures-util",
  "js-sys",
  "manabrew-agent-interface",

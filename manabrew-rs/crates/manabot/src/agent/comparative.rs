@@ -1,13 +1,19 @@
-//! Experimental policies for the bounded native comparison. No hidden state or search.
-use super::{ActionFacts, BotAgent, EffectFact, ResourceFacts, SimpleAi};
+//! Bounded, public-observation policies. These do not execute engine branches.
+//! Effect scores are conditional on the declared instruction resolving unchanged;
+//! they are not a probability or a guarantee. Engine effect RNG is thread-local,
+//! so cloning game state would not isolate speculative execution.
+use super::{ActionFacts, BotAgent, EffectFact, PaymentFacts, ResourceFacts, SimpleAi};
 use manabrew_protocol::{
     game::{CardView, GameViewDto, StepKind, ZoneKind},
-    prompts::{choose_action::ChooseActionOutput, PromptInput, PromptOutput},
+    prompts::{
+        choose_action::ChooseActionOutput,
+        common::{AvailableActionKind, PlayCardMode},
+        PromptInput, PromptOutput,
+    },
     transport::AgentPrompt,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
 
 #[derive(Clone, Debug, Serialize)]
 struct ProjectedPosition {
@@ -38,10 +44,12 @@ pub struct Comparative {
     fallback: SimpleAi,
     variant: Variant,
     view: Option<GameViewDto>,
-    facts: Vec<ActionFacts>,
-    resources: Option<ResourceFacts>,
-    attempted: BTreeSet<String>,
+    fresh_view: bool,
     state: String,
+    attempted: std::collections::BTreeSet<String>,
+    facts: Option<Vec<ActionFacts>>,
+    resources: Option<ResourceFacts>,
+    payments: Option<Vec<PaymentFacts>>,
     record: Option<Value>,
 }
 impl Comparative {
@@ -50,106 +58,89 @@ impl Comparative {
             fallback: SimpleAi::default(),
             variant,
             view: None,
-            facts: vec![],
-            resources: None,
-            attempted: BTreeSet::new(),
+            fresh_view: false,
             state: String::new(),
+            attempted: Default::default(),
+            facts: None,
+            resources: None,
+            payments: None,
             record: None,
         }
     }
-}
-impl BotAgent for Comparative {
-    fn observe(&mut self, view: GameViewDto) {
-        let state = serde_json::to_string(&view).unwrap_or_default();
-        if state != self.state {
-            self.attempted.clear();
-            self.state = state;
-        }
-        self.fallback.observe(view.clone());
-        self.view = Some(view);
-    }
-    fn observe_action_facts(&mut self, facts: &[ActionFacts]) {
-        self.facts = facts.to_vec();
-    }
-    fn observe_resources(&mut self, facts: Option<ResourceFacts>) {
-        self.resources = facts;
-    }
-    fn take_decision_record(&mut self) -> Option<Value> {
-        self.record.take()
-    }
-    fn decide(&mut self, prompt: AgentPrompt) -> Option<PromptOutput> {
+
+    fn evaluate(
+        &self,
+        prompt: &AgentPrompt,
+        facts: &[ActionFacts],
+        resources: &ResourceFacts,
+        payments: &[PaymentFacts],
+        alternatives: &mut Vec<Value>,
+    ) -> Result<(PromptOutput, Value), String> {
         let PromptInput::ChooseAction(input) = &prompt.input else {
-            return self.fallback.decide(prompt);
+            return Err("unsupported prompt".into());
         };
-        let Some(view) = self.view.as_ref() else {
-            return self.fallback.decide(prompt);
-        };
+        let view = self.view.as_ref().ok_or("missing observation")?;
         let me = &prompt.deciding_player_id;
         if view.active_player_id != *me
             || !matches!(view.step, StepKind::Main1 | StepKind::Main2)
             || !view.stack.is_empty()
         {
-            self.record = Some(
-                json!({"reason":"outside supported main-phase empty-stack subset", "fallback":true}),
-            );
-            return self.fallback.decide(prompt);
+            return Err("outside supported main-phase empty-stack subset".into());
         }
-        let mut own = 0i32;
-        let mut enemy = 0i32;
-        let mut own_vulnerable = 0i32;
-        let mut enemy_vulnerable = 0i32;
-        let Some(resources) = self.resources.as_ref() else {
-            self.record = Some(json!({"reason":"unverified mana sources", "fallback":true}));
-            return self.fallback.decide(prompt);
-        };
-        let mana = resources.available;
-        let mut hand = 0usize;
+        if !(0..=1000).contains(&resources.available) || !(0..=1000).contains(&resources.capacity) {
+            return Err("invalid resource totals".into());
+        }
+        let mut own = 0;
+        let mut enemy = 0;
+        let mut hand = None;
         let mut library = None;
+        let mut hand_cards = Vec::new();
         for zone in &view.zones {
             if zone.zone == ZoneKind::Hand && zone.owner_id == *me {
-                hand = zone.count;
+                if hand.is_some() || zone.count != zone.cards.len() || zone.count > 1000 {
+                    return Err("incomplete hand".into());
+                }
+                hand = Some(zone.count as i32);
+                hand_cards.extend(zone.cards.iter());
             }
             if zone.zone == ZoneKind::Library && zone.owner_id == *me {
-                library = Some(zone.count);
+                if library.is_some() || zone.count > 1000 {
+                    return Err("invalid library count".into());
+                }
+                library = Some(zone.count as i32);
             }
             if zone.zone != ZoneKind::Battlefield {
                 continue;
             }
+            if zone.count != zone.cards.len() || zone.count > 1000 {
+                return Err("incomplete battlefield".into());
+            }
             for c in &zone.cards {
-                let CardView::Visible(c) = c else { continue };
-                if c.phased_out {
-                    continue;
-                }
-                if !c.types.iter().any(|t| t == "Creature") {
-                    continue;
-                }
-                let Some(power) = c.power.as_deref().and_then(|p| p.parse::<i32>().ok()) else {
-                    self.record =
-                        Some(json!({"reason":"unknown battlefield power", "fallback":true}));
-                    return self.fallback.decide(prompt);
+                let CardView::Visible(c) = c else {
+                    return Err("hidden battlefield card".into());
                 };
-                let protected = c
-                    .keywords
-                    .iter()
-                    .chain(c.granted_keywords.iter())
-                    .any(|k| k.eq_ignore_ascii_case("indestructible"));
+                if c.phased_out || !c.types.iter().any(|t| t == "Creature") {
+                    continue;
+                }
+                let power = c
+                    .power
+                    .as_deref()
+                    .and_then(|p| p.parse::<i32>().ok())
+                    .filter(|p| (-100..=100).contains(p))
+                    .ok_or("unknown battlefield power")?;
+                // Board is a crude nonnegative attack-pressure measure, not literal power.
                 if c.controller_id == *me {
-                    own += power;
-                    if !protected {
-                        own_vulnerable += power;
-                    }
+                    own += power.max(0);
                 } else {
-                    enemy += power;
-                    if !protected {
-                        enemy_vulnerable += power;
-                    }
+                    enemy += power.max(0);
                 }
             }
         }
+        let hand = hand.ok_or("missing hand")?;
         let before = ProjectedPosition {
-            mana,
+            mana: resources.available,
             capacity: resources.capacity,
-            hand: hand as i32,
+            hand,
             own_board: own,
             enemy_board: enemy,
         };
@@ -159,16 +150,16 @@ impl BotAgent for Comparative {
         } else {
             0
         };
-        let mut alternatives = vec![
-            json!({"action":"pass","cost":0,"score":pass_score,"before":before,"after":before,"components":before_components,"reason":"retain resources"}),
+        *alternatives = vec![
+            json!({"action":"pass","cost":0,"score":pass_score,"before":before,"after":before,"components":if matches!(self.variant, Variant::Consequence) { before_components.clone() } else { json!({"retain":0}) }}),
         ];
-        let mut ranked: Vec<(i32, String)> = vec![(pass_score, String::new())];
-        let facts = self.facts.clone();
+        let mut ranked = vec![(pass_score, String::new())];
+        let mut seen = std::collections::BTreeSet::new();
         for action in &input.actions {
             if matches!(
                 &action.kind,
-                manabrew_protocol::prompts::common::AvailableActionKind::UndoMana { .. }
-                    | manabrew_protocol::prompts::common::AvailableActionKind::ActivateAbility(
+                AvailableActionKind::UndoMana { .. }
+                    | AvailableActionKind::ActivateAbility(
                         manabrew_protocol::prompts::common::ActivatableAbilityInfo {
                             is_mana_ability: true,
                             ..
@@ -178,123 +169,652 @@ impl BotAgent for Comparative {
                 continue;
             }
             if self.attempted.contains(&action.id) {
+                alternatives.push(
+                    json!({"action":action.id,"skipped":"already attempted in this observation"}),
+                );
                 continue;
             }
-            let Some(f) = facts.iter().find(|f| f.action_id == action.id) else {
-                self.record = Some(
-                    json!({"reason":"missing action facts", "fallback":true,"alternatives":alternatives}),
-                );
-                return self.fallback.decide(prompt);
-            };
-            let (Some(effect), Some(_cost)) = (&f.effect, &f.mana_cost) else {
-                self.record = Some(
-                    json!({"reason":"unsupported offered action or cost", "fallback":true,"facts":facts}),
-                );
-                return self.fallback.decide(prompt);
-            };
-            let card_id = match &action.kind {
-                manabrew_protocol::prompts::common::AvailableActionKind::Cast {
-                    card_id, ..
-                } => card_id,
-                _ => {
-                    self.record = Some(json!({"reason":"unsupported action kind","fallback":true}));
-                    return self.fallback.decide(prompt);
-                }
-            };
-            let Some(card) = view
-                .zones
-                .iter()
-                .flat_map(|z| &z.cards)
-                .find_map(|c| match c {
-                    CardView::Visible(c) if &c.id == card_id => Some(c),
-                    _ => None,
-                })
+            if !seen.insert(&action.id) {
+                return Err("duplicate action identity".into());
+            }
+            let AvailableActionKind::Cast {
+                card_id,
+                mode: PlayCardMode::Normal,
+                face_index: None | Some(0),
+                ..
+            } = &action.kind
             else {
-                return self.fallback.decide(prompt);
+                return Err("unsupported action kind or mode".into());
             };
-            let cost = card.cmc.max(0);
-            let left = (mana - cost).max(0);
-            let threat = (enemy - own).max(0);
-            if matches!(effect, EffectFact::Draw { .. }) && library.is_none() {
-                self.record = Some(
-                    json!({"reason":"library count unavailable", "fallback":true, "facts":facts}),
-                );
-                return self.fallback.decide(prompt);
+            if !hand_cards
+                .iter()
+                .any(|c| matches!(c, CardView::Visible(c) if &c.id == card_id && c.owner_id == *me))
+            {
+                return Err("cast card not in visible hand".into());
             }
-            let unsafe_draw = matches!(effect, EffectFact::Draw { cards } if *cards > library.unwrap_or(0) as i32);
-            let dies_on_entry =
-                matches!(effect, EffectFact::Creature { toughness, .. } if *toughness <= 0);
+            let mut matching = facts.iter().filter(|f| f.action_id == action.id);
+            let f = matching.next().ok_or("missing action facts")?;
+            if matching.next().is_some() || f.mode != "normal" || !f.unknown.is_empty() {
+                return Err("ambiguous or unknown action facts".into());
+            }
+            let effect = f.effect.as_ref().ok_or("missing effect")?;
+            let cost_text = f.mana_cost.as_deref().ok_or("missing cost")?;
+            let cost = parse_cost(cost_text).ok_or("unrepresentable mana cost")?;
+            let mut matching = payments.iter().filter(|p| p.action_id == action.id);
+            let payment = matching.next().ok_or("missing verified payment")?;
+            if matching.next().is_some()
+                || payment.spent != cost
+                || payment.remaining < 0
+                || payment.remaining.checked_add(payment.spent) != Some(resources.available)
+            {
+                return Err("invalid payment accounting".into());
+            }
+            let scope = f.target_scope.as_deref();
             let mut after = before.clone();
-            after.mana = left;
-            after.hand = (after.hand - 1).max(0);
-            match effect {
-                EffectFact::Creature { power, toughness } if *toughness > 0 => {
-                    after.own_board += power
+            after.mana = payment.remaining;
+            after.hand -= 1;
+            let mut strategic = serde_json::Map::new();
+            let threat = (enemy - own).max(0);
+            let score = match effect {
+                EffectFact::Creature { power, toughness }
+                    if scope == Some("self permanent")
+                        && (-100..=100).contains(power)
+                        && (-100..=100).contains(toughness) =>
+                {
+                    let survives = *toughness > 0;
+                    let board_gain = if survives { (*power).max(0) } else { 0 };
+                    after.own_board += board_gain;
+                    strategic.insert("development".into(), json!(board_gain * 2));
+                    strategic.insert(
+                        "defense".into(),
+                        json!(if survives && threat > 0 { 3 } else { 0 }),
+                    );
+                    strategic.insert("cost".into(), json!(-cost));
+                    strategic.insert("card".into(), json!(-2));
+                    board_gain * 2 + if survives && threat > 0 { 3 } else { 0 } - cost - 2
                 }
-                EffectFact::Draw { cards } if !unsafe_draw => after.hand += cards,
+                EffectFact::Draw { cards }
+                    if scope == Some("controller") && (1..=100).contains(cards) =>
+                {
+                    let count = library.ok_or("missing library count")?;
+                    if *cards > count {
+                        return Err("draw exceeds library count".into());
+                    }
+                    after.hand += cards;
+                    let gain = cards * 3;
+                    let need = if hand <= 3 { 3 } else { 0 };
+                    let danger = if threat > 5 { -3 } else { 0 };
+                    strategic.insert("draw".into(), json!(gain));
+                    strategic.insert("need".into(), json!(need));
+                    strategic.insert("danger".into(), json!(danger));
+                    strategic.insert("cost".into(), json!(-cost));
+                    strategic.insert("card".into(), json!(-2));
+                    gain + need + danger - cost - 2
+                }
+                EffectFact::ManaPermanent { produced, creature }
+                    if scope == Some("self permanent")
+                        && produced.len() == 1
+                        && matches!(produced[0].as_str(), "W" | "U" | "B" | "R" | "G" | "C")
+                        && !creature =>
+                {
+                    after.capacity += 1; // Future turns only; no immediate mana is assumed.
+                    let investment = if resources.capacity < 5 { 6 } else { 2 };
+                    strategic.insert("future_capacity".into(), json!(investment));
+                    strategic.insert("cost".into(), json!(-cost));
+                    strategic.insert("card".into(), json!(-2));
+                    investment - cost - 2
+                }
                 EffectFact::DestroyCreatures => {
-                    after.own_board -= own_vulnerable;
-                    after.enemy_board -= enemy_vulnerable;
+                    return Err("wipe outcome is not established by public facts".into())
                 }
-                EffectFact::ManaPermanent { .. } => after.capacity += 1,
-                _ => (),
-            }
-            let (projected, components) = after.value();
-            let (score, why) = if unsafe_draw {
-                (-10000, "draw can exhaust the library")
-            } else if dies_on_entry {
-                (-10000, "zero toughness does not persist")
-            } else {
-                match self.variant {
-                    Variant::Consequence => (
-                        projected,
-                        "one shared value function applied to projected position",
-                    ),
-                    Variant::Strategic => match effect {
-                        EffectFact::Creature { power, .. } => (
-                            2 + power.min(&5) + if threat > 0 { 3 } else { 0 },
-                            "develop a blocker and attacker",
-                        ),
-                        EffectFact::Draw { cards } => (
-                            cards * 2 + if hand <= 3 { 4 } else { -2 }
-                                - if threat > 5 { 3 } else { 0 },
-                            "replenish access",
-                        ),
-                        EffectFact::DestroyCreatures => (
-                            enemy_vulnerable - own_vulnerable - 2,
-                            "compare vulnerable creatures",
-                        ),
-                        EffectFact::ManaPermanent { creature, .. } => (
-                            (if threat > 5 {
-                                1
-                            } else if mana < 5 {
-                                6
-                            } else {
-                                2
-                            }) - if *creature { 1 } else { 0 },
-                            "invest in future mana",
-                        ),
-                    },
-                }
+                _ => return Err("unsupported effect or target scope".into()),
             };
-            alternatives.push(json!({"action":action.id,"cost":f.mana_cost,"effect":effect,"score":score,"before":before,"after":after,"components":components,"uncertainty":"conditional on resolution; wipe outcomes range from unchanged board to projected vulnerable removals; replacements and prevention are not forecast","reason":why}));
+            let (projected, components) = after.value();
+            let (score, components) = if matches!(self.variant, Variant::Consequence) {
+                (projected, components)
+            } else {
+                (score, Value::Object(strategic))
+            };
+            alternatives.push(json!({"action":action.id,"cost":cost_text,"payment":payment,"effect":effect,"score":score,"before":before,"after":after,"components":components,"resolution_uncertain":f.resolution_uncertain,"assumption":"conditional on instruction resolving unchanged"}));
             ranked.push((score, action.id.clone()));
         }
         ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-        let chosen = ranked[0].1.clone();
-        self.record = Some(
-            json!({"fallback":false,"alternatives":alternatives,"chosen":if chosen.is_empty(){"pass"}else{&chosen},"public_context":{"own_power":own,"enemy_power":enemy,"own_vulnerable":own_vulnerable,"enemy_vulnerable":enemy_vulnerable,"hand":hand,"verified_available_mana":mana,"mana_capacity":resources.capacity,"library_count":library},"assumption":"scores model potential effects, not guaranteed outcomes"}),
-        );
-        if chosen.is_empty() {
-            Some(PromptOutput::ChooseAction(ChooseActionOutput::Pass {
+        let chosen = &ranked[0].1;
+        let output = if chosen.is_empty() {
+            PromptOutput::ChooseAction(ChooseActionOutput::Pass {
                 until: None,
                 exhaust_stack: false,
-            }))
+            })
         } else {
-            self.attempted.insert(chosen.clone());
-            Some(PromptOutput::ChooseAction(ChooseActionOutput::Act {
-                action_id: chosen,
-            }))
+            PromptOutput::ChooseAction(ChooseActionOutput::Act {
+                action_id: chosen.clone(),
+            })
+        };
+        Ok((
+            output,
+            json!({"fallback":false,"alternatives":alternatives,"chosen":if chosen.is_empty() {"pass"} else {chosen},"before_value":before_value,"before_components":before_components}),
+        ))
+    }
+}
+
+// Accept only fixed generic and single-color symbols. No hybrid, variable, life,
+// or non-mana costs. The separate host payment attests actual color legality.
+fn parse_cost(text: &str) -> Option<i32> {
+    let mut rest = text.trim();
+    if rest.is_empty() {
+        return Some(0);
+    }
+    let mut total: i32 = 0;
+    while !rest.is_empty() {
+        rest = rest.strip_prefix('{')?;
+        let (symbol, tail) = rest.split_once('}')?;
+        let n = if matches!(symbol, "W" | "U" | "B" | "R" | "G" | "C") {
+            1
+        } else {
+            symbol
+                .parse::<i32>()
+                .ok()
+                .filter(|n| (0..=100).contains(n))?
+        };
+        total = total.checked_add(n)?;
+        if total > 100 {
+            return None;
         }
+        rest = tail.trim_start();
+    }
+    Some(total)
+}
+impl BotAgent for Comparative {
+    fn observe(&mut self, view: GameViewDto) {
+        let state = serde_json::to_string(&view).unwrap_or_default();
+        if state != self.state {
+            self.attempted.clear();
+            self.state = state;
+        }
+        self.facts = None;
+        self.resources = None;
+        self.payments = None;
+        self.fresh_view = true;
+        self.fallback.observe(view.clone());
+        self.view = Some(view);
+    }
+    fn observe_action_facts(&mut self, facts: &[ActionFacts]) {
+        self.facts = Some(facts.to_vec());
+    }
+    fn observe_resources(&mut self, facts: Option<ResourceFacts>) {
+        self.resources = facts;
+    }
+    fn observe_payments(&mut self, facts: &[PaymentFacts]) {
+        self.payments = Some(facts.to_vec());
+    }
+    fn take_decision_record(&mut self) -> Option<Value> {
+        self.record.take()
+    }
+    fn decide(&mut self, prompt: AgentPrompt) -> Option<PromptOutput> {
+        self.record = None;
+        let facts = self.facts.take();
+        let resources = self.resources.take();
+        let payments = self.payments.take();
+        let mut alternatives = Vec::new();
+        let fresh = std::mem::replace(&mut self.fresh_view, false);
+        let result = match (
+            fresh,
+            facts.as_deref(),
+            resources.as_ref(),
+            payments.as_deref(),
+        ) {
+            (true, Some(f), Some(r), Some(p)) => self.evaluate(&prompt, f, r, p, &mut alternatives),
+            _ => Err("missing or stale decision facts, resources, or verified payments".into()),
+        };
+        match result {
+            Ok((output, mut record)) => {
+                if let PromptOutput::ChooseAction(ChooseActionOutput::Act { action_id }) = &output {
+                    self.attempted.insert(action_id.clone());
+                }
+                record["output"] = json!(output);
+                self.record = Some(record);
+                Some(output)
+            }
+            Err(reason) => {
+                let output = self
+                    .fallback
+                    .decide(prompt)
+                    .unwrap_or(PromptOutput::ChooseAction(ChooseActionOutput::Pass {
+                        until: None,
+                        exhaust_stack: false,
+                    }));
+                self.record = Some(
+                    json!({"fallback":true,"reason":reason,"alternatives":alternatives,"facts":facts,"resources":resources,"payments":payments,"output":output}),
+                );
+                Some(output)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::{AgentKind, BotResponder};
+    use manabrew_agent_interface::agent_impl::Responder;
+    use manabrew_protocol::game::{CardDto, ZoneDto};
+
+    fn view(me: &str) -> GameViewDto {
+        let mut view = GameViewDto::default();
+        view.active_player_id = me.into();
+        view.step = StepKind::Main1;
+        let cards = ["a", "b", "c"]
+            .into_iter()
+            .map(|id| {
+                CardView::Visible(CardDto {
+                    id: id.into(),
+                    owner_id: me.into(),
+                    controller_id: me.into(),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        view.zones = vec![
+            ZoneDto {
+                zone: ZoneKind::Hand,
+                owner_id: me.into(),
+                cards,
+                count: 3,
+            },
+            ZoneDto {
+                zone: ZoneKind::Library,
+                owner_id: me.into(),
+                cards: vec![],
+                count: 10,
+            },
+        ];
+        view
+    }
+    fn prompt(me: &str, order: &[&str]) -> AgentPrompt {
+        let actions: Vec<Value> = order.iter().map(|id| json!({"type":"cast","id":id,"cardId":id,"mode":{"type":"normal"},"label":"cast"})).collect();
+        serde_json::from_value(json!({"promptId":1,"decidingPlayerId":me,"input":{"type":"chooseAction","actions":actions}})).unwrap()
+    }
+    fn facts() -> Vec<ActionFacts> {
+        vec![
+            ActionFacts {
+                action_id: "a".into(),
+                mode: "normal".into(),
+                mana_cost: Some("{2}".into()),
+                target_scope: Some("self permanent".into()),
+                effect: Some(EffectFact::Creature {
+                    power: 4,
+                    toughness: 4,
+                }),
+                unknown: vec![],
+                resolution_uncertain: true,
+            },
+            ActionFacts {
+                action_id: "b".into(),
+                mode: "normal".into(),
+                mana_cost: Some("{1}".into()),
+                target_scope: Some("controller".into()),
+                effect: Some(EffectFact::Draw { cards: 2 }),
+                unknown: vec![],
+                resolution_uncertain: true,
+            },
+            ActionFacts {
+                action_id: "c".into(),
+                mode: "normal".into(),
+                mana_cost: Some("{1}".into()),
+                target_scope: Some("self permanent".into()),
+                effect: Some(EffectFact::ManaPermanent {
+                    produced: vec!["G".into()],
+                    creature: false,
+                }),
+                unknown: vec![],
+                resolution_uncertain: true,
+            },
+        ]
+    }
+    fn payments() -> Vec<PaymentFacts> {
+        [("a", 2), ("b", 1), ("c", 1)]
+            .into_iter()
+            .map(|(id, spent)| PaymentFacts {
+                action_id: id.into(),
+                spent,
+                remaining: 4 - spent,
+            })
+            .collect()
+    }
+    fn ready(bot: &mut BotResponder, me: &str, facts: &[ActionFacts]) {
+        bot.observe(view(me));
+        bot.observe_resources(Some(ResourceFacts {
+            available: 4,
+            capacity: 4,
+        }));
+        bot.observe_action_facts(facts);
+        bot.observe_payments(&payments());
+    }
+    fn run(bot: &mut BotResponder, p: AgentPrompt) -> (Value, Value) {
+        let output = serde_json::to_value(bot.respond(p)).unwrap();
+        let record = bot.take_decision_record().expect("current record");
+        assert_eq!(record["output"], output["action"]);
+        (output, record)
+    }
+    #[test]
+    fn production_selection_evaluates_and_records_both_policies() {
+        assert_eq!(AgentKind::default(), AgentKind::Simple);
+        for kind in [AgentKind::Strategic, AgentKind::Consequence] {
+            let mut bot = BotResponder::new(kind.build());
+            ready(&mut bot, "player-0", &facts());
+            let (output, record) = run(&mut bot, prompt("player-0", &["a", "b", "c"]));
+            assert_eq!(record["fallback"], false);
+            assert_eq!(record["alternatives"].as_array().unwrap().len(), 4);
+            assert_eq!(record["chosen"], output["action"]["output"]["actionId"]);
+            let a = &record["alternatives"][1];
+            assert_eq!(a["before"]["mana"], 4);
+            assert_eq!(a["after"]["mana"], 2);
+            assert_eq!(a["after"]["hand"], 2);
+            let parts = a["components"].as_object().unwrap();
+            assert_eq!(
+                parts.values().map(|v| v.as_i64().unwrap()).sum::<i64>(),
+                a["score"].as_i64().unwrap()
+            );
+            assert_eq!(record["alternatives"][3]["after"]["mana"], 3);
+            assert_eq!(record["alternatives"][3]["after"]["capacity"], 5);
+            assert!(bot.take_decision_record().is_none());
+        }
+    }
+    #[test]
+    fn equivalent_seats_and_reordered_menu_select_same_action() {
+        for kind in [AgentKind::Strategic, AgentKind::Consequence] {
+            let mut a = BotResponder::new(kind.build());
+            let mut b = BotResponder::new(kind.build());
+            ready(&mut a, "player-0", &facts());
+            ready(&mut b, "player-2", &facts());
+            let (_, x) = run(&mut a, prompt("player-0", &["a", "b", "c"]));
+            let (_, y) = run(&mut b, prompt("player-2", &["c", "a", "b"]));
+            assert_eq!(x["chosen"], y["chosen"]);
+        }
+    }
+    #[test]
+    fn invalid_facts_and_context_fall_back_with_current_output() {
+        for reason_case in 0..8 {
+            let mut bot = BotResponder::new(AgentKind::Consequence.build());
+            let mut f = facts();
+            let mut v = view("player-0");
+            let mut p = payments();
+            match reason_case {
+                0 => f[0].unknown.push("unknown".into()),
+                1 => f[0].mana_cost = Some("{X}".into()),
+                2 => f[0].target_scope = Some("opponent".into()),
+                3 => {
+                    f.remove(0);
+                }
+                4 => p[0].remaining = 4,
+                5 => {
+                    if let Some(z) = v.zones.iter_mut().find(|z| z.zone == ZoneKind::Library) {
+                        z.count = 1;
+                    }
+                }
+                6 => f[0].effect = Some(EffectFact::DestroyCreatures),
+                _ => f[0].mode = "alternate".into(),
+            }
+            bot.observe(v);
+            bot.observe_resources(Some(ResourceFacts {
+                available: 4,
+                capacity: 4,
+            }));
+            bot.observe_action_facts(&f);
+            bot.observe_payments(&p);
+            let (_, record) = run(&mut bot, prompt("player-0", &["a", "b", "c"]));
+            assert_eq!(record["fallback"], true, "case {reason_case}");
+            assert!(record["reason"].as_str().is_some());
+        }
+    }
+    #[test]
+    fn records_and_facts_do_not_survive_later_decisions() {
+        let mut bot = BotResponder::new(AgentKind::Consequence.build());
+        ready(&mut bot, "player-0", &facts());
+        let _ = bot.respond(prompt("player-0", &["a", "b", "c"]));
+        let (_, later) = run(&mut bot, prompt("player-0", &["a", "b", "c"]));
+        assert_eq!(later["fallback"], true);
+        ready(&mut bot, "player-0", &facts());
+        bot.observe(view("player-0"));
+        let (_, stale) = run(&mut bot, prompt("player-0", &["a", "b", "c"]));
+        assert_eq!(stale["fallback"], true);
+    }
+    #[test]
+    fn zero_toughness_has_no_board_gain() {
+        let mut bot = BotResponder::new(AgentKind::Consequence.build());
+        let mut f = facts();
+        f[0].effect = Some(EffectFact::Creature {
+            power: 4,
+            toughness: 0,
+        });
+        ready(&mut bot, "player-0", &f);
+        let (_, record) = run(&mut bot, prompt("player-0", &["a", "b", "c"]));
+        assert_eq!(record["alternatives"][1]["after"]["own_board"], 0);
+    }
+    #[test]
+    fn engine_created_observation_supports_real_choice_without_mutation() {
+        use forge_foundation::{CardTypeLine, ColorSet, ManaCost, PhaseType, ZoneType};
+        use manabrew_agent_interface::game_view_dto::GameViewDtoExt;
+        use manabrew_engine::{
+            card::Card,
+            game::GameState,
+            ids::{CardId, PlayerId},
+            mana::ManaPool,
+        };
+        let player = PlayerId(0);
+        let mut game = GameState::new(&["First", "Second"], 20);
+        game.turn.phase = PhaseType::Main1;
+        let mut ids = Vec::new();
+        for (name, power) in [("Alpha", 2), ("Beta", 5)] {
+            let card = Card::new(
+                CardId(0),
+                name.into(),
+                player,
+                CardTypeLine::parse("Creature"),
+                ManaCost::zero(),
+                ColorSet::COLORLESS,
+                Some(power),
+                Some(3),
+                vec![],
+                vec![],
+            );
+            let id = game.create_card(card);
+            game.card_mut(id).zone = ZoneType::Hand;
+            ids.push(id);
+        }
+        game.replace_zone_cards(ZoneType::Hand, player, ids.clone());
+        let space = manabrew_engine::game_loop::GameLoop::new(2).action_space(&game, player, true);
+        assert!(ids
+            .iter()
+            .all(|id| space.playable.iter().any(|play| play.card_id == *id)));
+        let pools = vec![ManaPool::new(), ManaPool::new()];
+        let before = GameViewDto::from_engine(&game, &pools, player, "fixture");
+        let keys: Vec<String> = ids.iter().map(|id| format!("card-{}", id.0)).collect();
+        let fs: Vec<ActionFacts> = keys
+            .iter()
+            .zip([2, 5])
+            .map(|(id, power)| ActionFacts {
+                action_id: id.clone(),
+                mode: "normal".into(),
+                mana_cost: Some("{0}".into()),
+                target_scope: Some("self permanent".into()),
+                effect: Some(EffectFact::Creature {
+                    power,
+                    toughness: 3,
+                }),
+                unknown: vec![],
+                resolution_uncertain: true,
+            })
+            .collect();
+        let ps: Vec<PaymentFacts> = keys
+            .iter()
+            .map(|id| PaymentFacts {
+                action_id: id.clone(),
+                spent: 0,
+                remaining: 0,
+            })
+            .collect();
+        let mut bot = BotResponder::new(AgentKind::Consequence.build());
+        bot.observe(before.clone());
+        bot.observe_resources(Some(ResourceFacts {
+            available: 0,
+            capacity: 0,
+        }));
+        bot.observe_action_facts(&fs);
+        bot.observe_payments(&ps);
+        let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let (_, record) = run(&mut bot, prompt("player-0", &refs));
+        assert_eq!(record["fallback"], false);
+        assert_eq!(record["chosen"], keys[1]);
+        let after = GameViewDto::from_engine(&game, &pools, player, "fixture");
+        assert_eq!(
+            serde_json::to_value(before).unwrap(),
+            serde_json::to_value(after).unwrap()
+        );
+    }
+
+    #[test]
+    fn non_action_prompt_replaces_prior_record_and_legacy_facts_abstain() {
+        let mut bot = BotResponder::new(AgentKind::Consequence.build());
+        ready(&mut bot, "player-0", &facts());
+        let _ = bot.respond(prompt("player-0", &["a", "b", "c"]));
+        ready(&mut bot, "player-0", &facts());
+        let boolean: AgentPrompt = serde_json::from_value(json!({"promptId":2,"decidingPlayerId":"player-0","input":{"type":"chooseBoolean","confirmLabel":"Yes","denyLabel":"No","presentation":{"title":"Confirm","targets":[]}}})).unwrap();
+        let (_, record) = run(&mut bot, boolean);
+        assert_eq!(record["fallback"], true);
+        assert_eq!(record["reason"], "unsupported prompt");
+        bot.observe(view("player-0"));
+        bot.observe_resources(Some(ResourceFacts {
+            available: 4,
+            capacity: 4,
+        }));
+        bot.observe_action_facts(&facts());
+        let (_, record) = run(&mut bot, prompt("player-0", &["a", "b", "c"]));
+        assert_eq!(record["fallback"], true);
+    }
+    #[test]
+    fn protected_wipe_and_creature_mana_are_not_scored_as_exact() {
+        let mut v = view("player-0");
+        let protected = CardDto {
+            id: "enemy".into(),
+            controller_id: "player-1".into(),
+            owner_id: "player-1".into(),
+            types: vec!["Creature".into()],
+            power: Some("6".into()),
+            toughness: Some("6".into()),
+            keywords: vec!["Indestructible".into()],
+            ..Default::default()
+        };
+        v.zones.push(ZoneDto {
+            zone: ZoneKind::Battlefield,
+            owner_id: "player-1".into(),
+            cards: vec![CardView::Visible(protected)],
+            count: 1,
+        });
+        for effect in [
+            EffectFact::DestroyCreatures,
+            EffectFact::ManaPermanent {
+                produced: vec!["G".into()],
+                creature: true,
+            },
+        ] {
+            let mut f = facts();
+            f[0].effect = Some(effect);
+            let mut bot = BotResponder::new(AgentKind::Consequence.build());
+            bot.observe(v.clone());
+            bot.observe_resources(Some(ResourceFacts {
+                available: 4,
+                capacity: 4,
+            }));
+            bot.observe_action_facts(&f);
+            bot.observe_payments(&payments());
+            let (_, record) = run(&mut bot, prompt("player-0", &["a", "b", "c"]));
+            assert_eq!(record["fallback"], true);
+            assert_eq!(record["alternatives"].as_array().unwrap().len(), 1);
+        }
+    }
+    #[test]
+    fn default_control_ignores_fact_channels_on_populated_prompt() {
+        let mut control = BotResponder::default();
+        let mut supplied = BotResponder::new(AgentKind::Simple.build());
+        control.observe(view("player-0"));
+        supplied.observe(view("player-0"));
+        supplied.observe_action_facts(&facts());
+        supplied.observe_resources(Some(ResourceFacts {
+            available: 4,
+            capacity: 4,
+        }));
+        supplied.observe_payments(&payments());
+        let p = prompt("player-0", &["a", "b", "c"]);
+        assert_eq!(
+            serde_json::to_value(control.respond(p.clone())).unwrap(),
+            serde_json::to_value(supplied.respond(p)).unwrap()
+        );
+    }
+    #[test]
+    fn names_do_not_change_choice_but_public_threat_changes_values() {
+        let mut original = view("player-0");
+        let mut renamed = original.clone();
+        for zone in &mut renamed.zones {
+            for card in &mut zone.cards {
+                if let CardView::Visible(card) = card {
+                    card.identity.name = "A different name".into();
+                }
+            }
+        }
+        let select = |v: GameViewDto| {
+            let mut bot = BotResponder::new(AgentKind::Strategic.build());
+            bot.observe(v);
+            bot.observe_resources(Some(ResourceFacts {
+                available: 4,
+                capacity: 4,
+            }));
+            bot.observe_action_facts(&facts());
+            bot.observe_payments(&payments());
+            run(&mut bot, prompt("player-0", &["a", "b", "c"])).1
+        };
+        let a = select(original.clone());
+        let b = select(renamed);
+        assert_eq!(a["chosen"], b["chosen"]);
+        let enemy = CardDto {
+            id: "e".into(),
+            owner_id: "player-1".into(),
+            controller_id: "player-1".into(),
+            types: vec!["Creature".into()],
+            power: Some("7".into()),
+            toughness: Some("7".into()),
+            ..Default::default()
+        };
+        original.zones.push(ZoneDto {
+            zone: ZoneKind::Battlefield,
+            owner_id: "player-1".into(),
+            count: 1,
+            cards: vec![CardView::Visible(enemy)],
+        });
+        let threatened = select(original);
+        assert_ne!(
+            a["alternatives"][1]["score"],
+            threatened["alternatives"][1]["score"]
+        );
+    }
+    #[test]
+    fn attempted_action_is_retried_only_after_observation_changes() {
+        let mut bot = BotResponder::new(AgentKind::Consequence.build());
+        ready(&mut bot, "player-0", &facts());
+        let (_, first) = run(&mut bot, prompt("player-0", &["a", "b", "c"]));
+        ready(&mut bot, "player-0", &facts());
+        let (_, repeated) = run(&mut bot, prompt("player-0", &["a", "b", "c"]));
+        assert_ne!(first["chosen"], repeated["chosen"]);
+        let mut changed = view("player-0");
+        changed.turn = 1;
+        bot.observe(changed);
+        bot.observe_resources(Some(ResourceFacts {
+            available: 4,
+            capacity: 4,
+        }));
+        bot.observe_action_facts(&facts());
+        bot.observe_payments(&payments());
+        let (_, next) = run(&mut bot, prompt("player-0", &["a", "b", "c"]));
+        assert_eq!(first["chosen"], next["chosen"]);
     }
 }

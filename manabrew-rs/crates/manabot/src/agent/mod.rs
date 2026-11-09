@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod action_facts;
 pub mod comparative;
-pub use action_facts::{ActionFacts, EffectFact, ResourceFacts};
+pub use action_facts::{ActionFacts, EffectFact, PaymentFacts, ResourceFacts};
 pub mod simple_ai;
 pub use simple_ai::SimpleAi;
 
@@ -29,7 +29,10 @@ pub trait BotAgent: Send {
     fn observe(&mut self, _view: GameViewDto) {}
     fn observe_action_facts(&mut self, _facts: &[ActionFacts]) {}
     fn observe_resources(&mut self, _facts: Option<ResourceFacts>) {}
-    fn take_decision_record(&mut self) -> Option<serde_json::Value> { None }
+    fn observe_payments(&mut self, _facts: &[PaymentFacts]) {}
+    fn take_decision_record(&mut self) -> Option<serde_json::Value> {
+        None
+    }
     fn decide(&mut self, prompt: AgentPrompt) -> Option<PromptOutput>;
 }
 
@@ -47,8 +50,12 @@ impl AgentKind {
     pub fn build(self) -> Box<dyn BotAgent + Send> {
         match self {
             AgentKind::Simple => Box::<SimpleAi>::default(),
-            AgentKind::Strategic => Box::new(comparative::Comparative::new(comparative::Variant::Strategic)),
-            AgentKind::Consequence => Box::new(comparative::Comparative::new(comparative::Variant::Consequence)),
+            AgentKind::Strategic => Box::new(comparative::Comparative::new(
+                comparative::Variant::Strategic,
+            )),
+            AgentKind::Consequence => Box::new(comparative::Comparative::new(
+                comparative::Variant::Consequence,
+            )),
         }
     }
 }
@@ -70,9 +77,17 @@ impl Default for BotResponder {
 }
 
 impl BotResponder {
-    pub fn take_decision_record(&mut self) -> Option<serde_json::Value> { self.agent.take_decision_record() }
+    pub fn take_decision_record(&mut self) -> Option<serde_json::Value> {
+        self.agent.take_decision_record()
+    }
 
-    pub fn observe_resources(&mut self, facts: Option<ResourceFacts>) { self.agent.observe_resources(facts); }
+    pub fn observe_resources(&mut self, facts: Option<ResourceFacts>) {
+        self.agent.observe_resources(facts);
+    }
+
+    pub fn observe_payments(&mut self, facts: &[PaymentFacts]) {
+        self.agent.observe_payments(facts);
+    }
 
     /// Feed host-derived facts for the current offered actions.
     pub fn observe_action_facts(&mut self, facts: &[ActionFacts]) {
