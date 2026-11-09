@@ -4178,3 +4178,6 @@ mod execution_audit_policy {
         assert_eq!(pick, "card-50", "the caster names the pile with the big creature");
     }
 }
+
+#[cfg(test)]
+mod skill_puzzles;
