@@ -19,11 +19,14 @@ use manabrew_agent_interface::prompt::{
 };
 use serde::{Deserialize, Serialize};
 
+pub mod action_facts;
+pub use action_facts::{ActionFacts, EffectFact};
 pub mod simple_ai;
 pub use simple_ai::SimpleAi;
 
 pub trait BotAgent: Send {
     fn observe(&mut self, _view: GameViewDto) {}
+    fn observe_action_facts(&mut self, _facts: &[ActionFacts]) {}
     fn decide(&mut self, prompt: AgentPrompt) -> Option<PromptOutput>;
 }
 
@@ -60,6 +63,11 @@ impl Default for BotResponder {
 }
 
 impl BotResponder {
+    /// Feed host-derived facts for the current offered actions.
+    pub fn observe_action_facts(&mut self, facts: &[ActionFacts]) {
+        self.agent.observe_action_facts(facts);
+    }
+
     /// Feed the seat's latest view to the agent, as a state envelope would.
     pub fn observe(&mut self, view: GameViewDto) {
         self.agent.observe(view);
