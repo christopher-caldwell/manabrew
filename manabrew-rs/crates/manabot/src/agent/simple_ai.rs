@@ -764,7 +764,13 @@ impl SimpleAi {
                 if !self.can_target(card, source, player_id) {
                     return false;
                 }
-                if card.controller_id == player_id {
+                // Our own permanent is no answer target unless the text asks for one of ours or a
+                // bounce saves it; cards in a graveyard or other zone are not permanents to answer.
+                let ours_by_text = source.is_some_and(|source| {
+                    let text = source.text.to_ascii_lowercase();
+                    text.contains("you control") || text.contains("your graveyard") || text.contains("from your")
+                });
+                if card.controller_id == player_id && card.zone == Some(ZoneKind::Battlefield) && !ours_by_text {
                     let saved = matches!(intent, TargetingIntent::Bounce)
                         && self.view.as_ref().is_some_and(|view| threat::threatened(view, card, player_id));
                     if !saved {
@@ -4549,7 +4555,7 @@ mod execution_audit_policy {
         ];
         for (label, colour, text, intent, ours, theirs, stack, offered, expected) in cases {
             let mut battlefield: Vec<_> = (0..3).map(|i| land(&format!("card-{}", 20 + i), 0, "Island")).collect();
-            battlefield.extend(ours);
+            battlefield.extend(ours.into_iter().map(|mut card| { card.zone = Some(ZoneKind::Battlefield); card }));
             let mut spell = spell_card("card-9", "{U}", 1, text);
             spell.color = colour.into();
             let mut zones = vec![(ZoneKind::Battlefield, 0, battlefield), (ZoneKind::Hand, 0, vec![spell.clone()])];
@@ -4565,6 +4571,20 @@ mod execution_audit_policy {
             assert_eq!(cast, picked, "{label}: cast check and prompt disagree");
             assert_eq!(cast, expected, "{label}");
         }
+    }
+
+    /// An "exile target card from your graveyard" spell is no removal: its own card is the target.
+    #[test]
+    fn exiling_a_card_from_our_graveyard_is_not_cancelled_as_a_removal() {
+        let mut spell = spell_card("card-9", "{U}", 1, "Exile target card that's an instant or sorcery from your graveyard. Copy it.");
+        spell.color = "U".into();
+        let mut dead = spell_card("card-40", "{R}", 1, "Deal 3 damage to any target.");
+        dead.zone = Some(ZoneKind::Graveyard);
+        let lands: Vec<_> = (0..3).map(|i| land(&format!("card-{}", 20 + i), 0, "Island")).collect();
+        let mut bot = SimpleAi::default();
+        bot.observe(view(0, StepKind::Main1, vec![(ZoneKind::Battlefield, 0, lands), (ZoneKind::Hand, 0, vec![spell.clone()]), (ZoneKind::Graveyard, 0, vec![dead])]));
+        assert_eq!(cast_choice(&mut bot, "card-9"), "act");
+        assert_eq!(prompt_for(&mut bot, &spell, "exile", &["card-40"])["type"], "boardTargets");
     }
 
     /// DEV-090: "that player controls" limits the pick to the player our combat reached, though the
