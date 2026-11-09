@@ -7,6 +7,7 @@ use manabrew_agent_interface::prompt::*;
 
 use super::BotAgent;
 
+mod plan;
 mod roles;
 mod threat;
 use roles::Roles;
@@ -69,6 +70,8 @@ pub struct SimpleAi {
     /// The cast the bot last chose, with the stack size then. If that card is still in hand at
     /// the next action prompt with nothing added to the stack, the play failed.
     last_cast_pick: Option<(String, usize)>,
+    /// The mana cost the turn plan keeps open at this prompt, if any (see `plan.rs`).
+    reserve: Option<String>,
 }
 
 const KNOWN_TYPES: [&str; 8] = ["creature", "instant", "sorcery", "enchantment", "artifact", "planeswalker", "land", "battle"];
@@ -1962,6 +1965,7 @@ impl BotAgent for SimpleAi {
                     }
                     self.last_lifelink_combo_progress = Some(progress);
                 }
+                self.reserve = self.plan_reserve(&actions, &deciding_player_id);
                 let pick = actions
                     .iter()
                     .filter(|action| {
@@ -1976,6 +1980,7 @@ impl BotAgent for SimpleAi {
                                 AvailableActionKind::ActivateAbility(info) if self.wasted_activation(info)
                             )
                             && self.sane(action, &deciding_player_id)
+                            && !self.dips_into_reserve(action, &deciding_player_id)
                     })
                     .max_by_key(|action| self.action_score(action, &deciding_player_id));
                 self.pending_lifelink_combo_cost = pick.and_then(|action| match &action.kind {

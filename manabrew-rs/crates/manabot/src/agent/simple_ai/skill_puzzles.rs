@@ -19,7 +19,6 @@ use serde_json::{json, Value};
 /// Puzzles the bot gets wrong today. Update this list when a step fixes (or breaks) one.
 const KNOWN_FAILURES: &[&str] = &[
     "2b-living-death-no",
-    "3a-hold-answer",
     "8b-windfall-no",
 ];
 
