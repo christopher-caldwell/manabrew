@@ -79,6 +79,17 @@ impl Comparative {
         let PromptInput::ChooseAction(input) = &prompt.input else {
             return Err("unsupported prompt".into());
         };
+        // The entire menu must have unambiguous identities, including actions
+        // this evaluator does not score. An empty ID collides with pass below.
+        let mut seen = std::collections::BTreeSet::new();
+        for action in &input.actions {
+            if action.id.is_empty() {
+                return Err("empty action identity".into());
+            }
+            if !seen.insert(&action.id) {
+                return Err("duplicate action identity".into());
+            }
+        }
         let view = self.view.as_ref().ok_or("missing observation")?;
         let me = &prompt.deciding_player_id;
         if view.active_player_id != *me
@@ -154,7 +165,6 @@ impl Comparative {
             json!({"action":"pass","cost":0,"score":pass_score,"before":before,"after":before,"components":if matches!(self.variant, Variant::Consequence) { before_components.clone() } else { json!({"retain":0}) }}),
         ];
         let mut ranked = vec![(pass_score, String::new())];
-        let mut seen = std::collections::BTreeSet::new();
         for action in &input.actions {
             if matches!(
                 &action.kind,
@@ -173,9 +183,6 @@ impl Comparative {
                     json!({"action":action.id,"skipped":"already attempted in this observation"}),
                 );
                 continue;
-            }
-            if !seen.insert(&action.id) {
-                return Err("duplicate action identity".into());
             }
             let AvailableActionKind::Cast {
                 card_id,
@@ -816,5 +823,56 @@ mod tests {
         bot.observe_payments(&payments());
         let (_, next) = run(&mut bot, prompt("player-0", &["a", "b", "c"]));
         assert_eq!(first["chosen"], next["chosen"]);
+    }
+    #[test]
+    fn empty_and_ambiguous_menu_ids_fall_back_for_both_policies() {
+        for kind in [AgentKind::Strategic, AgentKind::Consequence] {
+            let mut bot = BotResponder::new(kind.build());
+            let mut empty_facts = facts();
+            empty_facts[0].action_id = String::new();
+            empty_facts[0].mana_cost = Some("{0}".into());
+            let mut v = view("player-0");
+            if let CardView::Visible(card) = &mut v.zones[0].cards[0] {
+                card.id = "".into();
+            }
+            bot.observe(v);
+            bot.observe_resources(Some(ResourceFacts {
+                available: 0,
+                capacity: 0,
+            }));
+            bot.observe_action_facts(&empty_facts);
+            bot.observe_payments(&[PaymentFacts {
+                action_id: "".into(),
+                spent: 0,
+                remaining: 0,
+            }]);
+            let (_, record) = run(&mut bot, prompt("player-0", &[""]));
+            assert_eq!(record["fallback"], true);
+            assert_eq!(record["reason"], "empty action identity");
+            assert!(record["alternatives"].as_array().unwrap().is_empty());
+
+            let duplicate: AgentPrompt = serde_json::from_value(json!({"promptId":2,"decidingPlayerId":"player-0","input":{"type":"chooseAction","actions":[
+                {"type":"activateAbility","id":"a","cardId":"land","abilityIndex":0,"description":"mana","isManaAbility":true},
+                {"type":"cast","id":"a","cardId":"a","mode":{"type":"normal"},"label":"cast"}
+            ]}})).unwrap();
+            ready(&mut bot, "player-0", &facts());
+            let (_, record) = run(&mut bot, duplicate);
+            assert_eq!(record["fallback"], true);
+            assert_eq!(record["reason"], "duplicate action identity");
+            assert!(record["alternatives"].as_array().unwrap().is_empty());
+
+            // Populate the attempted set with an actual selection, then repeat its
+            // identity twice. Validation must run before the attempted-action skip.
+            ready(&mut bot, "player-0", &facts());
+            let (_, first) = run(&mut bot, prompt("player-0", &["a", "b", "c"]));
+            assert_eq!(first["fallback"], false);
+            let chosen = first["chosen"].as_str().unwrap();
+            assert_ne!(chosen, "pass");
+            ready(&mut bot, "player-0", &facts());
+            let (_, record) = run(&mut bot, prompt("player-0", &[chosen, chosen]));
+            assert_eq!(record["fallback"], true);
+            assert_eq!(record["reason"], "duplicate action identity");
+            assert!(record["alternatives"].as_array().unwrap().is_empty());
+        }
     }
 }
