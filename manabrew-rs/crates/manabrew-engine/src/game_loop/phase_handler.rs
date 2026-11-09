@@ -16,6 +16,7 @@ impl GameLoop {
             let mut event = ReplacementEvent::BeginTurn { player: active };
             let result = apply_replacements(game, &mut event);
             if result == ReplacementResult::Skipped || result == ReplacementResult::Replaced {
+                self.apply_turn_event(game, agents, TurnEvent::AdvanceTurn);
                 return;
             }
         }

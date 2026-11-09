@@ -16,7 +16,7 @@ use crate::card_trait_base::CardTrait;
 pub fn can_replace(
     effect: &ReplacementEffect,
     event: &ReplacementEvent,
-    _game: &GameState,
+    game: &GameState,
     source_card: &Card,
 ) -> bool {
     if effect.event != ReplacementType::BeginTurn {
@@ -26,6 +26,9 @@ pub fn can_replace(
         ReplacementEvent::BeginTurn { player } => *player,
         _ => return false,
     };
+    if effect.ir.extra_turn.is_some_and(|extra| extra != game.turn.is_extra_turn) {
+        return false;
+    }
     if let Some(valid) = effect.ir.valid_player_selector.as_ref() {
         if !effect.matches_compiled_valid_player(valid, player, source_card) {
             return false;

@@ -1280,6 +1280,36 @@ mod tests {
     }
 
     #[test]
+    fn extra_turn_replacement_only_skips_extra_turn_and_advances() {
+        use crate::replacement::replacement_effect::parse_replacement_effect;
+        use crate::replacement::replacement_handler::{apply_replacements, ReplacementEvent};
+        use crate::replacement::replacement_result::ReplacementResult;
+
+        let p0 = PlayerId(0);
+        let p1 = PlayerId(1);
+        let mut game = GameState::new(&["A", "B"], 20);
+        let mut card = activated_permanent(p0, "Trouble in Pairs", "Enchantment", vec![]);
+        card.add_replacement_effect(parse_replacement_effect(
+            "Event$ BeginTurn | ActiveZones$ Battlefield | ValidPlayer$ Opponent | ExtraTurn$ True | Skip$ True",
+        ).unwrap());
+        let id = game.create_card(card);
+        game.move_card(id, ZoneType::Battlefield, p0);
+        game.turn.active_player = p1;
+        let mut event = ReplacementEvent::BeginTurn { player: p1 };
+        assert_eq!(apply_replacements(&mut game, &mut event), ReplacementResult::NotReplaced);
+
+        game.turn.is_extra_turn = true;
+        game.turn.extra_turn_anchor = Some(p0);
+        let mut gl = GameLoop::new(2);
+        let mut agents: Vec<Box<dyn PlayerAgent>> = vec![Box::new(InvalidPlayAgent), Box::new(InvalidPlayAgent)];
+        let before = game.turn.turn_number;
+        gl.run_turn_state_machine(&mut game, &mut agents);
+        assert_eq!(game.active_player(), p1);
+        assert_eq!(game.turn.turn_number, before + 1);
+        assert!(!game.turn.is_extra_turn);
+    }
+
+    #[test]
     fn priority_round_ignores_illegal_actions() {
         let p0 = PlayerId(0);
         let p1 = PlayerId(1);
