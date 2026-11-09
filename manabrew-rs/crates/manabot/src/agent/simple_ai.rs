@@ -7,6 +7,7 @@ use manabrew_agent_interface::prompt::*;
 
 use super::BotAgent;
 
+mod payment;
 mod plan;
 mod roles;
 mod threat;
@@ -578,17 +579,34 @@ impl SimpleAi {
         self.cancelled_plays.insert(source_id.to_string(), signature);
     }
 
+    /// An opponent's spell or ability that counters, destroys, exiles or bounces something a
+    /// third seat controls. Stopping it would only protect that object for its owner, so it is
+    /// not a target for our counter.
+    fn answers_another_opponent(&self, item: &manabrew_agent_interface::game_view_dto::StackObjectDto, player_id: &str) -> bool {
+        let Some(view) = &self.view else { return false };
+        item.controller_id != player_id && item.targets.iter().any(|t| {
+            let controller = match t.kind {
+                TargetKind::Spell => view.stack.iter().find(|other| other.id == t.id).map(|other| other.controller_id.as_str()),
+                TargetKind::Card => self.card(&t.id).map(|card| card.controller_id.as_str()),
+                _ => None,
+            };
+            matches!(t.intent, Some(TargetingIntent::Counter | TargetingIntent::Destroy | TargetingIntent::Exile | TargetingIntent::Bounce))
+                && controller.is_some_and(|c| c != player_id && c != item.controller_id)
+        })
+    }
+
     /// An opposing spell that "counter target ..." text could legally take, that no answer of ours
     /// already covers, and that matters enough to spend a counterspell on (`threat::COUNTER_MIN`).
     /// Without one, a counterspell would be started and cancelled, or wasted on a minor spell.
     fn counterable_spell_exists(&self, text: &str, player_id: &str) -> bool {
         let Some(view) = &self.view else { return true };
         view.stack.iter().any(|item| {
-            if item.controller_id == player_id || item.is_casting || !item.is_spell {
+            if item.controller_id == player_id || item.is_casting || !item.is_spell
+                || self.answers_another_opponent(item, player_id) {
                 return false;
             }
             let types: Vec<String> = item.source_card.as_ref().map(|card| card.types.clone()).unwrap_or_default();
-            if !Self::counter_clause_allows(text, &types) {
+            if !Self::counter_clause_allows(text, &types, true) {
                 return false;
             }
             let target = TargetRef { kind: TargetKind::Spell, id: item.id.clone(), intent: None, oracle: None };
@@ -598,10 +616,11 @@ impl SimpleAi {
     }
 
     /// Whether "counter target <qualifier> spell" can take a spell with these card types.
-    /// An unrecognized qualifier is allowed: the target prompt decides.
-    fn counter_clause_allows(text: &str, types: &[String]) -> bool {
-        let Some(after) = text.split("counter target ").nth(1) else { return true };
-        let qualifier = after.split(" spell").next().unwrap_or("").trim();
+    /// An unrecognized qualifier, or text with no counter clause, gives `unknown`: the target
+    /// prompt decides a cast, while a counter already on the stack only counts when it is known.
+    fn counter_clause_allows(text: &str, types: &[String], unknown: bool) -> bool {
+        let Some(after) = text.split("counter target ").nth(1) else { return unknown };
+        let qualifier = after.split("spell").next().unwrap_or("").trim();
         let has = |ty: &str| types.iter().any(|t| t.eq_ignore_ascii_case(ty));
         if qualifier.is_empty() {
             return true;
@@ -618,14 +637,22 @@ impl SimpleAi {
         if wanted.iter().all(|word| KNOWN_TYPES.contains(word)) {
             return wanted.iter().any(|word| has(word));
         }
-        true
+        unknown
+    }
+
+    /// What exiling and returning `card` gains, for a blink spell: none when it gains nothing
+    /// or our own stack already removes it. The one rule for both the cast check and the target
+    /// prompt, so they cannot disagree.
+    fn reuse_value(&self, card: &CardDto, player_id: &str) -> Option<i32> {
+        self.reentry_value(card, player_id)
+            .filter(|&value| value > 0 && !self.removed_by_stack(player_id, &card.id))
     }
 
     /// A permanent of ours that exiling and returning improves, for a blink spell.
     fn reuse_target_exists(&self, player_id: &str, creatures_only: bool) -> bool {
         self.battlefield(player_id)
             .filter(|card| !creatures_only || card.types.iter().any(|ty| ty == "Creature"))
-            .any(|card| self.reentry_value(card, player_id).is_some_and(|value| value > 0))
+            .any(|card| self.reuse_value(card, player_id).is_some())
     }
 
     fn sane(&self, action: &AvailableAction, player_id: &str) -> bool {
@@ -1626,18 +1653,33 @@ impl SimpleAi {
     /// Own abilities and spells on the stack that are not already countered (a later spell
     /// or ability of anyone targeting them).
     fn own_pending_items(&self, player_id: &str) -> Vec<&manabrew_agent_interface::game_view_dto::StackObjectDto> {
+        self.side_pending_items(player_id, player_id)
+    }
+
+    /// Whether a stack object of `controller` works for us against an object `target_controller`
+    /// controls: ours, or, when the object is not ours, any other seat's. A second opponent's
+    /// counter or removal at the same object does what ours would.
+    fn on_our_side(player_id: &str, target_controller: &str, controller: &str) -> bool {
+        controller == player_id || (target_controller != player_id && controller != target_controller)
+    }
+
+    /// Pending (not already countered) spells and abilities on our side against an object that
+    /// `target_controller` controls, see `on_our_side`.
+    fn side_pending_items(&self, player_id: &str, target_controller: &str) -> Vec<&manabrew_agent_interface::game_view_dto::StackObjectDto> {
         let Some(view) = &self.view else { return Vec::new(); };
         view.stack.iter().enumerate().filter(|(i, item)| {
-            item.controller_id == player_id && !item.is_casting
+            Self::on_our_side(player_id, target_controller, &item.controller_id) && !item.is_casting
                 && !view.stack[i + 1..].iter().any(|later| later.targets.iter().any(|t|
                     t.id == item.id && matches!(t.kind, TargetKind::Spell)))
         }).map(|(_, item)| item).collect()
     }
 
-    /// Permanents or cards our own stack already destroys, exiles, bounces or blinks. A
-    /// second removal aimed at one would fizzle once the first resolves.
-    fn removed_by_own_stack(&self, player_id: &str, target_id: &str) -> bool {
-        self.own_pending_items(player_id).iter().any(|item| item.targets.iter().any(|t|
+    /// Permanents or cards our side's stack already destroys, exiles, bounces or blinks (ours,
+    /// and for an opponent's permanent any other opponent's too). A second removal aimed at one
+    /// would fizzle once the first resolves.
+    fn removed_by_stack(&self, player_id: &str, target_id: &str) -> bool {
+        let controller = self.card(target_id).map_or(player_id, |card| card.controller_id.as_str());
+        self.side_pending_items(player_id, controller).iter().any(|item| item.targets.iter().any(|t|
             t.id == target_id && matches!(t.kind, TargetKind::Card)
                 && matches!(t.intent, Some(TargetingIntent::Destroy | TargetingIntent::Exile | TargetingIntent::Bounce))))
     }
@@ -1699,23 +1741,27 @@ impl SimpleAi {
     fn covered_by_friendly_answer(&self, target: &TargetRef, player_id: &str) -> bool {
         let Some(view) = &self.view else { return false; };
         if !matches!(target.kind, TargetKind::Spell | TargetKind::Card) { return false; }
+        // Whose object this is decides whose answers count as ours (`on_our_side`).
+        let target_controller;
         if matches!(target.kind, TargetKind::Spell) {
             let Some(object) = view.stack.iter().find(|item| item.id == target.id && !item.is_casting) else { return false; };
+            target_controller = object.controller_id.as_str();
             // Two or more of our counters at one spell are enough, even taxing ones (storm
             // copies of Flusterstorm); a further counter would only fizzle after it is taken.
-            if self.own_pending_items(player_id).iter().filter(|item| item.targets.iter().any(|t|
+            if self.side_pending_items(player_id, target_controller).iter().filter(|item| item.targets.iter().any(|t|
                 t.id == target.id && matches!(t.intent, Some(TargetingIntent::Counter)))).count() >= 2 {
                 return true;
             }
             if object.source_card.as_ref().is_none_or(|c| c.text.to_ascii_lowercase().contains("can't be countered") || c.text.to_ascii_lowercase().contains("cannot be countered")) { return false; }
         } else {
             let Some(card) = self.card(&target.id) else { return false; };
+            target_controller = card.controller_id.as_str();
             if card.zone != Some(ZoneKind::Battlefield) || card.keywords.iter().any(|k| {
                 let k=k.to_ascii_lowercase(); k.contains("shroud") || k.contains("hexproof") || k.contains("protection")
             }) { return false; }
         }
         view.stack.iter().enumerate().any(|(index, answer)| {
-            if answer.controller_id != player_id || answer.is_casting { return false; }
+            if !Self::on_our_side(player_id, target_controller, &answer.controller_id) || answer.is_casting { return false; }
             let effect=answer.source_ability_text.as_deref().unwrap_or(&answer.text).to_ascii_lowercase();
             if ["unless", "you may", "if you", "if that", "indestructible"].iter().any(|word| effect.contains(word)) { return false; }
             let clause = effect.split('.').next().unwrap_or("").trim();
@@ -1725,12 +1771,7 @@ impl SimpleAi {
                     (Some(TargetingIntent::Counter), TargetKind::Spell) => {
                         let Some(object)=view.stack.iter().find(|item| item.id==t.id) else { return false; };
                         let Some(card)=object.source_card.as_ref() else { return false; };
-                        match clause {
-                            "counter target spell" => true,
-                            "counter target noncreature spell" => !card.types.iter().any(|ty|ty=="Creature"),
-                            "counter target creature spell" => card.types.iter().any(|ty|ty=="Creature"),
-                            _ => false,
-                        }
+                        clause.starts_with("counter target ") && Self::counter_clause_allows(clause, &card.types, false)
                     }
                     (Some(intent @ (TargetingIntent::Destroy | TargetingIntent::Exile | TargetingIntent::Bounce)), TargetKind::Card) => {
                         let Some(card)=self.card(&t.id) else { return false; };
@@ -1754,9 +1795,9 @@ impl SimpleAi {
                 }
             });
             if !sufficient { return false; }
-            // Stack is in resolution order bottom to top. A later hostile
-            // counter/removal targeting this answer may save the original.
-            !view.stack[index+1..].iter().any(|threat| threat.controller_id != player_id
+            // Stack is in resolution order bottom to top. A later counter/removal from another
+            // seat than the answer's own, aimed at the answer, may save the original.
+            !view.stack[index+1..].iter().any(|threat| threat.controller_id != answer.controller_id
                 && threat.targets.iter().any(|t| t.id == answer.id && matches!(t.intent,
                     Some(TargetingIntent::Counter | TargetingIntent::Exile | TargetingIntent::Bounce))))
         })
@@ -2207,8 +2248,7 @@ impl BotAgent for SimpleAi {
                 if self_reuse || self_copy {
                     let mut scored: Vec<_> = candidates.iter().map(|target| {
                         let card = self.card(&target.id);
-                        let value = card.and_then(|card| self.reentry_value(card, &deciding_player_id))
-                            .filter(|_| !self.removed_by_own_stack(&deciding_player_id, &target.id));
+                        let value = card.and_then(|card| self.reuse_value(card, &deciding_player_id));
                         (value, -card.map_or(0, Self::card_value), target.clone())
                     }).collect();
                     scored.sort_by_key(|(value, low, _)| std::cmp::Reverse((value.unwrap_or(i32::MIN), *low)));
@@ -2255,7 +2295,10 @@ impl BotAgent for SimpleAi {
                         let own_spell = matches!(intent, TargetingIntent::Counter) && matches!(target.kind,TargetKind::Spell)
                             && self.view.as_ref().and_then(|view|view.stack.iter().find(|item|item.id==target.id))
                                 .is_some_and(|item|item.controller_id==deciding_player_id);
-                        !own_spell && !self.covered_by_friendly_answer(target, &deciding_player_id)
+                        let third_party = matches!(intent, TargetingIntent::Counter) && matches!(target.kind, TargetKind::Spell)
+                            && self.view.as_ref().and_then(|view| view.stack.iter().find(|item| item.id == target.id))
+                                .is_some_and(|item| self.answers_another_opponent(item, &deciding_player_id));
+                        !own_spell && !third_party && !self.covered_by_friendly_answer(target, &deciding_player_id)
                     });
                     if candidates.is_empty() {
                         self.pending_voluntary_cast = None;
@@ -2290,7 +2333,7 @@ impl BotAgent for SimpleAi {
                     // that is being removed. Picked only when nothing else is left.
                     let handled = hostile && matches!(target.kind, TargetKind::Card)
                         && matches!(intent, TargetingIntent::Damage | TargetingIntent::Destroy | TargetingIntent::Exile | TargetingIntent::Bounce)
-                        && self.removed_by_own_stack(&deciding_player_id, &target.id);
+                        && self.removed_by_stack(&deciding_player_id, &target.id);
                     let spread = if hostile && matches!(intent, TargetingIntent::Damage) { 2_000 * self.own_damage_hits(&deciding_player_id, &target.id) } else { 0 };
                     std::cmp::Reverse(base - if covered {100_000} else {0} - if friendly {200_000} else {0}
                         - if handled {300_000} else {0} - if countered {300_000} else {0} - spread)
@@ -2824,6 +2867,9 @@ impl BotAgent for SimpleAi {
                     }
                     1
                 });
+                let floating: Vec<_> = colors.iter().filter_map(|(_, color)| {
+                    pool.and_then(|p| p.get(color)).map(|&n| (*color, n as i32))
+                }).collect();
                 let payment = if input.can_confirm_from_pool {
                     self.failed_attack_targets.clear();
                     PayManaCostOutput::Pay { auto: false }
@@ -2834,6 +2880,13 @@ impl BotAgent for SimpleAi {
                     PayManaCostOutput::Act {
                         action_id: action.id.clone(),
                     }
+                } else if let Some(action_id) = payment::planned_tap(&input.mana_cost, &floating, &input.actions, &self.payment_actions) {
+                    // Pay the coloured pips ourselves when a source with a choice of colour could be
+                    // wasted by the automatic payer (see `payment`).
+                    self.payment_actions.insert(action_id.clone());
+                    self.selected_mana_source = action_id.strip_prefix("tap:").and_then(|s| s.split(':').next()).map(str::to_owned);
+                    self.awaiting_mana_color = false;
+                    PayManaCostOutput::Act { action_id }
                 } else if input.actions.is_empty()
                     || self.payment_attempt.as_deref() == Some(input.card_id.as_str())
                 {
@@ -3954,6 +4007,84 @@ mod execution_audit_policy {
         }
     }
 
+    /// DEV-087: a stack item of another seat, aimed at an object.
+    fn seat_item(id: &str, controller: usize, text: &str, target_id: &str, kind: &str, intent: &str) -> StackObjectDto {
+        let mut item = own_item(id, text, target_id, kind, intent);
+        item.controller_id = format!("player-{controller}");
+        item.is_spell = true;
+        item
+    }
+
+    /// DEV-087: a counterspell is not cast at a spell that a second opponent's counter already
+    /// takes, unless that counter cannot take it or is itself about to be countered.
+    #[test]
+    fn a_counter_is_not_cast_at_a_spell_another_seat_already_counters() {
+        const SWAN_SONG: &str = "Counter target enchantment, instant, or sorcery spell. Its controller creates a 2/2 blue Bird creature token with flying.";
+        for (other, countered_in_turn, expected) in [
+            (None, false, "act"),
+            (Some("Counter target spell."), false, "pass"),
+            (Some(SWAN_SONG), false, "pass"),
+            (Some("Counter target creature spell."), false, "act"),
+            (Some("Counter target spell."), true, "act"),
+        ] {
+            let islands: Vec<_> = (0..3).map(|i| land(&format!("card-{}", 20 + i), 0, "Island")).collect();
+            let hand = vec![spell_card("card-9", "{U}{U}", 2, "Counter target spell.")];
+            let mut view = view(0, StepKind::Main1, vec![(ZoneKind::Battlefield, 0, islands), (ZoneKind::Hand, 0, hand)]);
+            view.stack.push(StackObjectDto { id: "stack-1".into(), controller_id: "player-1".into(), is_spell: true,
+                text: "Draw a card.".into(), source_card: Some(spell_card("card-30", "{1}{U}", 2, "Draw a card.")), ..Default::default() });
+            if let Some(text) = other {
+                view.stack.push(seat_item("stack-2", 2, text, "stack-1", "spell", "counter"));
+                if countered_in_turn {
+                    // The spell's own controller answers the answer.
+                    view.stack.push(seat_item("stack-3", 1, "Counter target spell.", "stack-2", "spell", "counter"));
+                }
+            }
+            let mut bot = SimpleAi::default();
+            bot.observe(view);
+            assert_eq!(cast_choice(&mut bot, "card-9"), expected, "{other:?}, answered: {countered_in_turn}");
+        }
+    }
+
+    /// DEV-087: a removal spell is not aimed at a permanent another opponent's removal already
+    /// takes; it still is when nothing else is left to choose from, and with no removal pending.
+    #[test]
+    fn a_removal_spell_is_not_cast_at_a_permanent_another_seat_already_removes() {
+        const PATH: &str = "Exile target creature. Its controller may search their library for a basic land card.";
+        for (pending, expected) in [(false, "boardTargets"), (true, "cancel")] {
+            let mut enemy = creature("card-7", 1, (3, 3), 4, "");
+            enemy.zone = Some(ZoneKind::Battlefield);
+            let mut view = view(0, StepKind::Main1, vec![(ZoneKind::Battlefield, 1, vec![enemy])]);
+            if pending {
+                view.stack.push(seat_item("stack-1", 2, PATH, "card-7", "card", "exile"));
+            }
+            let mut bot = SimpleAi::default();
+            bot.observe(view);
+            bot.pending_voluntary_cast = Some("card-9".into());
+            assert_eq!(targets(&mut bot, "card-9", PATH, "exile", &["card-7"], 1, true)["type"], expected, "pending: {pending}");
+        }
+    }
+
+    /// DEV-086: the cast check and the target prompt use one rule for a blink spell. Eerie
+    /// Interlude is not cast when the only creature worth blinking is already being exiled by
+    /// our Ephemerate.
+    #[test]
+    fn a_blink_spell_is_not_cast_for_a_creature_our_stack_already_blinks() {
+        const EERIE: &str = "Exile any number of target creatures you control. Return those cards to the battlefield under their owner's control at the beginning of the next end step.";
+        const EPHEMERATE: &str = "Exile target creature you control, then return it to the battlefield under its owner's control.";
+        for (pending, expected) in [(false, "act"), (true, "pass")] {
+            let mut lands: Vec<_> = (0..3).map(|i| land(&format!("card-{}", 20 + i), 0, "Plains")).collect();
+            lands.push(creature("card-66", 0, (3, 3), 5, "When this creature enters, draw a card."));
+            let hand = vec![spell_card("card-9", "{W}", 1, EERIE)];
+            let mut view = view(0, StepKind::Main1, vec![(ZoneKind::Battlefield, 0, lands), (ZoneKind::Hand, 0, hand)]);
+            if pending {
+                view.stack.push(own_item("stack-1", EPHEMERATE, "card-66", "card", "exile"));
+            }
+            let mut bot = SimpleAi::default();
+            bot.observe(view);
+            assert_eq!(cast_choice(&mut bot, "card-9"), expected, "pending: {pending}");
+        }
+    }
+
     /// DEV-071: the copy of a spell that takes the same target as the original (Azula's copy of
     /// Chaos Warp, which has no damage or destroy words) chooses a new one.
     #[test]
@@ -3994,7 +4125,7 @@ mod execution_audit_policy {
     fn a_counter_clause_names_the_spells_it_can_take() {
         let types = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
         let (creature, instant, enchant) = (types(&["Creature"]), types(&["Instant"]), types(&["Enchantment"]));
-        let allows = SimpleAi::counter_clause_allows;
+        let allows = |text: &str, types: &[String]| SimpleAi::counter_clause_allows(text, types, true);
         assert!(allows("you may exile a blue card rather than pay. counter target spell.", &creature));
         assert!(!allows("counter target noncreature spell.", &creature));
         assert!(allows("counter target noncreature spell.", &instant));
