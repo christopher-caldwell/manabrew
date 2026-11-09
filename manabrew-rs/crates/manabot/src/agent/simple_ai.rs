@@ -532,7 +532,57 @@ impl SimpleAi {
             }
         }
         let short: i32 = (0..5).map(|i| (pips[i] - colors[i]).max(0)).sum();
-        short <= any
+        if short > any {
+            return false;
+        }
+        // The counts above add a land's colours up, so a land making green or blue pays for both.
+        // Assigning each pip its own source says whether the cost can be paid at all.
+        let convoke = card.keywords.iter().any(|kw| kw.eq_ignore_ascii_case("Convoke"));
+        match (payment::cost_pips(cost), self.mana_supplies(player_id)) {
+            (Some(pips), Some(supplies)) if !convoke => {
+                let pips: Vec<_> = pips.into_iter().filter(|pip| !pip.contains(&manabrew_protocol::game::ManaColor::Colorless)).collect();
+                payment::coverable(&pips, &supplies)
+            }
+            _ => true,
+        }
+    }
+
+    /// The colours each untapped source and each floating mana can make, one entry per mana, for
+    /// the assignment of coloured pips. `None` when a source makes several colours at once
+    /// ("Add {W}{U}"), which this does not model; the caller then keeps its own count.
+    fn mana_supplies(&self, player_id: &str) -> Option<Vec<Vec<manabrew_protocol::game::ManaColor>>> {
+        use manabrew_protocol::game::ManaColor::{Black, Blue, Green, Red, White};
+        const COLORS: [manabrew_protocol::game::ManaColor; 5] = [White, Blue, Black, Red, Green];
+        let mut supplies = Vec::new();
+        let life = self.view.as_ref().and_then(|v| v.players.iter().find(|p| p.id == player_id)).map_or(i32::MAX, |p| p.life);
+        for card in self.battlefield(player_id).filter(|card| !card.tapped) {
+            let creature = card.types.iter().any(|ty| ty == "Creature");
+            if creature && (card.summoning_sick || !card.text.contains("{T}: Add")) {
+                continue;
+            }
+            if Self::life_cost_of_mana(&card.text).is_some_and(|cost| life <= cost) {
+                continue;
+            }
+            let Some((produced, wild, amount)) = Self::mana_output(card) else { continue };
+            for clause in card.text.split("Add ").skip(1) {
+                let clause = clause.split(['.', '\n']).next().unwrap_or("");
+                let symbols: std::collections::BTreeSet<&str> = clause.split('{').skip(1)
+                    .filter_map(|part| part.split('}').next()).filter(|symbol| matches!(*symbol, "W" | "U" | "B" | "R" | "G")).collect();
+                if symbols.len() > 1 && !clause.contains(" or ") {
+                    return None;
+                }
+            }
+            let options: Vec<_> = (0..5).filter(|&i| produced[i] > 0 || wild > 0).map(|i| COLORS[i]).collect();
+            if !options.is_empty() {
+                supplies.extend(std::iter::repeat(options).take(amount.max(1) as usize));
+            }
+        }
+        if let Some(player) = self.view.as_ref().and_then(|v| v.players.iter().find(|p| p.id == player_id)) {
+            for (color, &amount) in &player.mana_pool {
+                supplies.extend(std::iter::repeat(vec![*color]).take(amount as usize));
+            }
+        }
+        Some(supplies)
     }
 
     fn roles(card: &CardDto) -> Roles {
@@ -640,19 +690,119 @@ impl SimpleAi {
         unknown
     }
 
-    /// What exiling and returning `card` gains, for a blink spell: none when it gains nothing
-    /// or our own stack already removes it. The one rule for both the cast check and the target
-    /// prompt, so they cannot disagree.
-    fn reuse_value(&self, card: &CardDto, player_id: &str) -> Option<i32> {
+    /// Whether `source` (a spell or ability of `player_id`) may target `card` at all: not under
+    /// Shroud, not an opponent's Hexproof, not Protection from a colour the source has. The engine
+    /// never offers such a permanent as a candidate, so a cast must not count it either.
+    fn can_target(&self, card: &CardDto, source: Option<&CardDto>, player_id: &str) -> bool {
+        const COLOR_NAMES: [(char, &str); 5] = [('W', "white"), ('U', "blue"), ('B', "black"), ('R', "red"), ('G', "green")];
+        card.keywords.iter().map(|keyword| keyword.to_ascii_lowercase()).all(|keyword| {
+            if keyword.contains("shroud") {
+                return false;
+            }
+            if keyword.contains("hexproof") && card.controller_id != player_id {
+                return false;
+            }
+            if keyword.contains("protection") {
+                let from_all = keyword.contains("everything") || keyword.contains("all colors");
+                let from_source = source.is_some_and(|source| COLOR_NAMES.iter().any(|(letter, name)| source.color.contains(*letter) && keyword.contains(name)));
+                return !(from_all || from_source);
+            }
+            true
+        })
+    }
+
+    /// What exiling and returning `card` gains, for a blink spell: none when it gains nothing,
+    /// our own stack already removes it, or `source` cannot target it. The one rule for both the
+    /// cast check and the target prompt, so they cannot disagree.
+    fn reuse_value(&self, card: &CardDto, player_id: &str, source: Option<&CardDto>) -> Option<i32> {
         self.reentry_value(card, player_id)
-            .filter(|&value| value > 0 && !self.removed_by_stack(player_id, &card.id))
+            .filter(|&value| value > 0 && !self.removed_by_stack(player_id, &card.id) && self.can_target(card, source, player_id))
     }
 
     /// A permanent of ours that exiling and returning improves, for a blink spell.
-    fn reuse_target_exists(&self, player_id: &str, creatures_only: bool) -> bool {
+    fn reuse_target_exists(&self, player_id: &str, creatures_only: bool, source: Option<&CardDto>) -> bool {
         self.battlefield(player_id)
             .filter(|card| !creatures_only || card.types.iter().any(|ty| ty == "Creature"))
-            .any(|card| self.reuse_value(card, player_id).is_some())
+            .any(|card| self.reuse_value(card, player_id, source).is_some())
+    }
+
+    /// The kind of direct answer a spell's text is: "Destroy target ...", "Exile target ...",
+    /// "Return target ... to its owner's hand". `None` for anything else, including a blink.
+    fn direct_answer_intent(effect: &str) -> Option<TargetingIntent> {
+        let effect = effect.trim_start();
+        if effect.starts_with("exile ") && effect.contains("return") && effect.contains("to the battlefield") {
+            return None;
+        }
+        if !effect.contains("target ") {
+            return None;
+        }
+        if effect.starts_with("destroy ") {
+            Some(TargetingIntent::Destroy)
+        } else if effect.starts_with("exile ") {
+            Some(TargetingIntent::Exile)
+        } else if effect.starts_with("return ") && effect.contains("to its owner's hand") {
+            Some(TargetingIntent::Bounce)
+        } else {
+            None
+        }
+    }
+
+    /// Whether `target` is worth a voluntary direct answer from `player_id`: targetable by the
+    /// source, not a spell or permanent our side already answers, and not our own permanent
+    /// unless a bounce saves it. The one rule for the cast check (over every permanent that could
+    /// be the target) and the target prompt (over the engine's candidates).
+    fn answer_target_worthwhile(&self, target: &TargetRef, intent: TargetingIntent, source: Option<&CardDto>, player_id: &str) -> bool {
+        match target.kind {
+            TargetKind::Spell => {
+                let item = self.view.as_ref().and_then(|view| view.stack.iter().find(|item| item.id == target.id));
+                let own = matches!(intent, TargetingIntent::Counter) && item.is_some_and(|item| item.controller_id == player_id);
+                let third_party = matches!(intent, TargetingIntent::Counter) && item.is_some_and(|item| self.answers_another_opponent(item, player_id));
+                !own && !third_party && !self.covered_by_friendly_answer(target, player_id)
+            }
+            TargetKind::Card => {
+                let Some(card) = self.card(&target.id) else { return true };
+                if !self.can_target(card, source, player_id) {
+                    return false;
+                }
+                if card.controller_id == player_id {
+                    let saved = matches!(intent, TargetingIntent::Bounce)
+                        && self.view.as_ref().is_some_and(|view| threat::threatened(view, card, player_id));
+                    if !saved {
+                        return false;
+                    }
+                }
+                !self.covered_by_friendly_answer(target, player_id)
+            }
+            TargetKind::Player => true,
+        }
+    }
+
+    /// Whether a direct answer spell has any permanent worth answering, by the same rule its
+    /// target prompt applies. `true` when the text names a target this does not read.
+    fn answer_target_exists(&self, effect: &str, intent: TargetingIntent, source: &CardDto, player_id: &str) -> bool {
+        let Some(after) = effect.split("target ").nth(1) else { return true };
+        let noun: String = after.split(['.', ',']).next().unwrap_or("")
+            .split(" to its").next().unwrap_or("").split(" you control").next().unwrap_or("").trim().to_string();
+        let nonland = noun.starts_with("nonland");
+        let wanted = if noun.ends_with("creature") {
+            "Creature"
+        } else if noun.ends_with("artifact") {
+            "Artifact"
+        } else if noun.ends_with("enchantment") {
+            "Enchantment"
+        } else if noun.ends_with("permanent") {
+            ""
+        } else {
+            return true;
+        };
+        let Some(view) = &self.view else { return true };
+        view.zones.iter().filter(|zone| zone.zone == ZoneKind::Battlefield).flat_map(|zone| &zone.cards).any(|card| {
+            let CardView::Visible(card) = card else { return false };
+            let right_type = (wanted.is_empty() || card.types.iter().any(|ty| ty == wanted))
+                && !(nonland && card.types.iter().any(|ty| ty == "Land"));
+            let target = TargetRef { kind: TargetKind::Card, id: card.id.clone(), intent: None, oracle: None };
+            right_type && self.answer_target_worthwhile(&target, intent, Some(source), player_id)
+        })
     }
 
     fn sane(&self, action: &AvailableAction, player_id: &str) -> bool {
@@ -759,9 +909,15 @@ impl SimpleAi {
             && text.contains("you control")
             && text.contains("return")
             && text.contains("to the battlefield")
-            && !self.reuse_target_exists(player_id, true)
+            && !self.reuse_target_exists(player_id, true, Some(card))
         {
             return false;
+        }
+        // A direct answer is cast only when the target prompt would find a target worth it.
+        if let Some(intent) = Self::direct_answer_intent(&text) {
+            if !self.answer_target_exists(&text, intent, card, player_id) {
+                return false;
+            }
         }
         // The same cast was cancelled at target selection against this very board.
         if self.cancelled_plays.get(card_id.as_str()) == Some(&self.board_signature()) {
@@ -1864,6 +2020,20 @@ impl SimpleAi {
         }
     }
 
+    /// The players our attacking creatures are attacking, or whose planeswalkers and battles they
+    /// are: who "that player" can be for a trigger that follows our combat damage.
+    fn players_reached_in_combat(&self, me: &str) -> Vec<String> {
+        let mut reached: Vec<String> = Vec::new();
+        for card in self.battlefield(me).filter(|card| card.is_attacking) {
+            let Some(target) = card.attack_target_id.as_deref() else { continue };
+            let player = self.card(target).map_or_else(|| target.to_string(), |permanent| permanent.controller_id.clone());
+            if player != me && !reached.contains(&player) {
+                reached.push(player);
+            }
+        }
+        reached
+    }
+
     /// How much `me` should want to hit this attack target: an opponent's danger, a planeswalker's importance.
     fn attack_target_score(&self, id: &str, me: &str) -> i32 {
         let Some(view) = &self.view else {
@@ -2248,7 +2418,7 @@ impl BotAgent for SimpleAi {
                 if self_reuse || self_copy {
                     let mut scored: Vec<_> = candidates.iter().map(|target| {
                         let card = self.card(&target.id);
-                        let value = card.and_then(|card| self.reuse_value(card, &deciding_player_id));
+                        let value = card.and_then(|card| self.reuse_value(card, &deciding_player_id, prompt.source_card.as_ref()));
                         (value, -card.map_or(0, Self::card_value), target.clone())
                     }).collect();
                     scored.sort_by_key(|(value, low, _)| std::cmp::Reverse((value.unwrap_or(i32::MIN), *low)));
@@ -2291,19 +2461,30 @@ impl BotAgent for SimpleAi {
                     }));
                 }
                 if voluntary && direct_answer {
-                    candidates.retain(|target| {
-                        let own_spell = matches!(intent, TargetingIntent::Counter) && matches!(target.kind,TargetKind::Spell)
-                            && self.view.as_ref().and_then(|view|view.stack.iter().find(|item|item.id==target.id))
-                                .is_some_and(|item|item.controller_id==deciding_player_id);
-                        let third_party = matches!(intent, TargetingIntent::Counter) && matches!(target.kind, TargetKind::Spell)
-                            && self.view.as_ref().and_then(|view| view.stack.iter().find(|item| item.id == target.id))
-                                .is_some_and(|item| self.answers_another_opponent(item, &deciding_player_id));
-                        !own_spell && !third_party && !self.covered_by_friendly_answer(target, &deciding_player_id)
-                    });
+                    // The same rule the cast check used to decide the spell was worth starting.
+                    candidates.retain(|target| self.answer_target_worthwhile(target, intent, prompt.source_card.as_ref(), &deciding_player_id));
                     if candidates.is_empty() {
                         self.pending_voluntary_cast = None;
                         self.note_cancelled_play(&prompt_source_id);
                         return Some(PromptOutput::ChooseBoardTargets(ChooseBoardTargetsOutput::Cancel));
+                    }
+                }
+                // "... target creature that player controls": the engine lists every creature, but the
+                // player is the one our combat just reached. Only their permanents are legal picks.
+                if ["that player controls", "defending player controls", "that opponent controls"].iter().any(|phrase| effect.contains(phrase)) {
+                    let reached = self.players_reached_in_combat(&deciding_player_id);
+                    if !reached.is_empty() {
+                        let belongs = |target: &TargetRef| match target.kind {
+                            TargetKind::Card => self.card(&target.id).is_some_and(|card| reached.contains(&card.controller_id)),
+                            TargetKind::Player => reached.contains(&target.id),
+                            TargetKind::Spell => false,
+                        };
+                        if candidates.iter().any(|target| belongs(target)) {
+                            candidates.retain(|target| belongs(target));
+                        } else if cancellable {
+                            self.pending_voluntary_cast = None;
+                            return Some(PromptOutput::ChooseBoardTargets(ChooseBoardTargetsOutput::Cancel));
+                        }
                     }
                 }
                 candidates.sort_by_key(|target| {
@@ -4327,6 +4508,112 @@ mod execution_audit_policy {
         let order: Vec<_> = cards.iter().filter(|c| one.contains(&c.id)).chain(cards.iter().filter(|c| !one.contains(&c.id))).cloned().collect();
         let pick = SimpleAi::better_pile_card(&order, one.len()).unwrap();
         assert_eq!(pick, "card-50", "the caster names the pile with the big creature");
+    }
+
+    /// The target prompt a cast would reach: the engine offers `ids` (it leaves out what the spell
+    /// cannot target), and a voluntary cast is cancellable.
+    fn prompt_for(bot: &mut SimpleAi, spell: &CardDto, intent: &str, ids: &[&str]) -> Value {
+        bot.pending_voluntary_cast = Some(spell.id.clone());
+        let candidates: Vec<_> = ids.iter().map(|id| json!({"id":id,"kind":"card"})).collect();
+        let prompt: AgentPrompt = serde_json::from_value(json!({"promptId":1,"decidingPlayerId":"player-0","sourceCard":spell,"sourceAbilityText":spell.text,
+            "input":{"type":"chooseBoardTargets","presentation":{"title":"Target","targets":[]},"candidates":candidates,
+            "hostile":true,"intent":intent,"minTargets":1,"maxTargets":1,"chosenTargets":0,"cancellable":true}})).unwrap();
+        serde_json::to_value(bot.decide(prompt).unwrap()).unwrap()["output"].clone()
+    }
+
+    /// DEV-092: one rule decides both "is there a worthwhile target" before casting and "which
+    /// target" at the prompt, for blink and bounce spells alike. Each position is put to the cast
+    /// check and to the prompt the engine would then raise; the two must agree, and agree with the
+    /// expected play. Shroud, protection from the spell's colour, an opponent's hexproof and a
+    /// creature another seat is already answering are not worth a cast.
+    #[test]
+    fn the_cast_check_and_the_target_prompt_cannot_disagree() {
+        const BLINK: &str = "Exile target creature you control, then return that card to the battlefield under your control.";
+        const BOUNCE: &str = "Return target creature to its owner's hand.";
+        const ENTRY: &str = "When this creature enters, draw a card.";
+        let with = |mut card: CardDto, keyword: &str| { card.keywords.push(keyword.into()); card };
+        let mut token = creature("card-3", 0, (1, 1), 0, ENTRY);
+        token.identity.is_token = true;
+        let exile_elsewhere = seat_item("stack-1", 2, "Exile target creature.", "card-5", "card", "exile");
+        // (label, spell colour, spell text, intent, our creatures, their creatures, stack, offered by the engine, expected)
+        let cases: Vec<(&str, &str, &str, &str, Vec<CardDto>, Vec<CardDto>, Vec<StackObjectDto>, Vec<&str>, bool)> = vec![
+            ("blink an entry creature", "W", BLINK, "exile", vec![creature("card-1", 0, (2, 2), 3, ENTRY), token.clone()], vec![], vec![], vec!["card-1", "card-3"], true),
+            ("blink: the entry creature has shroud", "W", BLINK, "exile", vec![with(creature("card-1", 0, (2, 2), 3, ENTRY), "Shroud"), token.clone()], vec![], vec![], vec!["card-3"], false),
+            ("blink: protection from the spell's colour", "W", BLINK, "exile", vec![with(creature("card-1", 0, (2, 2), 3, ENTRY), "Protection:White:Card.White:white"), token.clone()], vec![], vec![], vec!["card-3"], false),
+            ("blink: protection from another colour", "W", BLINK, "exile", vec![with(creature("card-1", 0, (2, 2), 3, ENTRY), "Protection:Red:Card.Red:red"), token.clone()], vec![], vec![], vec!["card-1", "card-3"], true),
+            ("blink: protection from the same colour, spell of another colour", "U", BLINK, "exile", vec![with(creature("card-1", 0, (2, 2), 3, ENTRY), "Protection:White:Card.White:white"), token.clone()], vec![], vec![], vec!["card-1", "card-3"], true),
+            ("bounce an opponent's creature", "U", BOUNCE, "bounce", vec![], vec![creature("card-5", 1, (2, 2), 3, "")], vec![], vec!["card-5"], true),
+            ("bounce: already being exiled by another seat", "U", BOUNCE, "bounce", vec![], vec![creature("card-5", 1, (2, 2), 3, "")], vec![exile_elsewhere], vec!["card-5"], false),
+            ("bounce: opponent's creature has hexproof", "U", BOUNCE, "bounce", vec![], vec![with(creature("card-5", 1, (2, 2), 3, ""), "Hexproof")], vec![], vec![], false),
+            ("bounce: only our own creature, not threatened", "U", BOUNCE, "bounce", vec![creature("card-1", 0, (2, 2), 3, "")], vec![], vec![], vec!["card-1"], false),
+        ];
+        for (label, colour, text, intent, ours, theirs, stack, offered, expected) in cases {
+            let mut battlefield: Vec<_> = (0..3).map(|i| land(&format!("card-{}", 20 + i), 0, "Island")).collect();
+            battlefield.extend(ours);
+            let mut spell = spell_card("card-9", "{U}", 1, text);
+            spell.color = colour.into();
+            let mut zones = vec![(ZoneKind::Battlefield, 0, battlefield), (ZoneKind::Hand, 0, vec![spell.clone()])];
+            if !theirs.is_empty() { zones.push((ZoneKind::Battlefield, 1, theirs.into_iter().map(|mut card| { card.zone = Some(ZoneKind::Battlefield); card }).collect())); }
+            let mut view = view(0, StepKind::Main1, zones);
+            view.stack = stack;
+            let mut bot = SimpleAi::default();
+            bot.observe(view.clone());
+            let cast = cast_choice(&mut bot, "card-9") == "act";
+            let mut bot = SimpleAi::default();
+            bot.observe(view);
+            let picked = if offered.is_empty() { false } else { prompt_for(&mut bot, &spell, intent, &offered)["type"] == "boardTargets" };
+            assert_eq!(cast, picked, "{label}: cast check and prompt disagree");
+            assert_eq!(cast, expected, "{label}");
+        }
+    }
+
+    /// DEV-090: "that player controls" limits the pick to the player our combat reached, though the
+    /// engine lists every creature. With none of theirs offered a voluntary pick is declined.
+    #[test]
+    fn a_target_limited_to_the_player_we_hit_is_taken_from_that_player() {
+        const GOAD: &str = "Goad target creature that player controls.";
+        let mut attacker = creature("card-1", 0, (2, 2), 3, "");
+        attacker.is_attacking = true;
+        attacker.attack_target_id = Some("player-1".into());
+        let zones = vec![
+            (ZoneKind::Battlefield, 0, vec![attacker]),
+            (ZoneKind::Battlefield, 1, vec![creature("card-10", 1, (1, 1), 1, "")]),
+            (ZoneKind::Battlefield, 2, vec![creature("card-20", 2, (8, 8), 8, "Flying")]),
+        ];
+        let mut bot = SimpleAi::default();
+        bot.observe(view(0, StepKind::CombatDamage, zones));
+        let out = targets(&mut bot, "card-9", GOAD, "hostile", &["card-20", "card-10", "card-1"], 1, false);
+        assert_eq!(out["chosen"][0]["id"], "card-10", "the better creature belongs to a player we did not hit");
+        let out = targets(&mut bot, "card-9", GOAD, "hostile", &["card-20"], 1, true);
+        assert_eq!(out["type"], "cancel", "nothing legal offered and the pick is optional");
+        let out = targets(&mut bot, "card-9", GOAD, "hostile", &["card-20"], 1, false);
+        assert_eq!(out["chosen"][0]["id"], "card-20", "a required pick still answers");
+        // A text without the limit keeps ranking every candidate.
+        let out = targets(&mut bot, "card-9", "Goad target creature.", "hostile", &["card-20", "card-10"], 1, false);
+        assert_eq!(out["chosen"][0]["id"], "card-20");
+    }
+
+    fn land_with(id: &str, text: &str) -> CardDto {
+        CardDto { id: id.into(), controller_id: "player-0".into(), owner_id: "player-0".into(), types: vec!["Land".into()], text: text.into(), ..Default::default() }
+    }
+
+    /// DEV-091: a cost is not started when no tap order pays it. One land making green, white or
+    /// blue cannot pay both the green and the blue pip, however many colours the lands add up to.
+    #[test]
+    fn a_four_colour_spell_is_cast_only_when_each_colour_has_its_own_source() {
+        let spara = land_with("card-30", "{T}: Add {W}.\n{T}: Add {U}.\n{T}: Add {G}.");
+        let shrine = land_with("card-31", "{T}: Add {W}.\n{T}: Add {B}.");
+        let ring = land_with("card-32", "{T}: Add {C}{C}.");
+        let plains = land_with("card-33", "{T}: Add {W}.");
+        let island = land_with("card-34", "{T}: Add {U}.");
+        for (extra, expected) in [(None, "pass"), (Some(island), "act")] {
+            let mut lands = vec![spara.clone(), shrine.clone(), ring.clone(), plains.clone()];
+            lands.extend(extra);
+            let hand = vec![spell_card("card-9", "{G}{W}{U}{B}", 4, "Draw a card.")];
+            let mut bot = SimpleAi::default();
+            bot.observe(view(0, StepKind::Main1, vec![(ZoneKind::Battlefield, 0, lands), (ZoneKind::Hand, 0, hand)]));
+            assert_eq!(cast_choice(&mut bot, "card-9"), expected);
+        }
     }
 }
 
