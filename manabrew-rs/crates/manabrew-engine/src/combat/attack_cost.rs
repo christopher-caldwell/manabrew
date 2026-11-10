@@ -37,25 +37,18 @@ pub fn get_attack_cost(cards: &[Card], attacker: &Card, defender: DefenderId) ->
                 continue;
             }
 
-            // Check Target$ — who is being defended
-            if let Some(target_param) = sa.ir.target_text.as_deref() {
-                match target_param {
-                    "You" => {
-                        // Only applies when attacking the source's controller
-                        let defends_controller = match defender {
-                            DefenderId::Player(pid) => pid == source.controller,
-                            DefenderId::Permanent(cid) => {
-                                cards[cid.index()].controller == source.controller
-                            }
-                        };
-                        if !defends_controller {
-                            continue;
-                        }
-                    }
-                    _ => {
-                        // Applies to any attack
-                    }
-                }
+            // Target selectors are relative to the static ability's controller.
+            // A permanent defender is represented by its controlling player.
+            let defending_player = match defender {
+                DefenderId::Player(pid) => pid,
+                DefenderId::Permanent(cid) => cards[cid.index()].controller,
+            };
+            if !valid_filter::matches_valid_player_opt(
+                sa.ir.target_text.as_deref(),
+                defending_player,
+                source.controller,
+            ) {
+                continue;
             }
 
             // Parse Cost$ parameter as generic mana amount
@@ -89,4 +82,17 @@ mod scoped_tax_regression {
         assert_eq!(get_attack_cost(&game.cards, game.card(a), DefenderId::Player(PlayerId(1))), 2);
         assert_eq!(get_attack_cost(&game.cards, game.card(a), DefenderId::Player(PlayerId(2))), 0);
     }
+    #[test]
+    fn player_qualified_target_is_relative_to_tax_source() {
+        let mut game = GameState::new(&["A", "B", "C"], 40);
+        let creature = parse_card_script("Name:Attacker\nTypes:Creature Human\nPT:2/2").unwrap();
+        let tax = parse_card_script("Name:Tax\nTypes:Enchantment\nS:Mode$ CantAttackUnless | ValidCard$ Creature | Target$ Player.You | Cost$ 1").unwrap();
+        let a = game.create_card(Card::from_rules(&creature, PlayerId(0)));
+        let t = game.create_card(Card::from_rules(&tax, PlayerId(1)));
+        game.move_card(a, ZoneType::Battlefield, PlayerId(0));
+        game.move_card(t, ZoneType::Battlefield, PlayerId(1));
+        assert_eq!(get_attack_cost(&game.cards, game.card(a), DefenderId::Player(PlayerId(1))), 1);
+        assert_eq!(get_attack_cost(&game.cards, game.card(a), DefenderId::Player(PlayerId(2))), 0);
+    }
+
 }
