@@ -823,11 +823,18 @@ impl GameLoop {
                 };
                 let mut chosen_blockers = {
                     let def_agent = &mut agents[defending.index()];
-                    def_agent.choose_blockers(
+                    let legality: Vec<_> = attacker_card_ids.iter().map(|&attacker| {
+                        let blockers = legal_blockers.iter().copied()
+                            .filter(|&blocker| combat::can_creature_block(game, blocker, attacker))
+                            .collect();
+                        (attacker, blockers, combat::combat_util::get_min_num_blockers_for_attacker(game, attacker))
+                    }).collect();
+                    def_agent.choose_blockers_with_legality(
                         defending,
                         &attacker_card_ids,
-                        &available_blockers,
+                        &legal_blockers,
                         max_blockers,
+                        &legality,
                     )
                 };
                 if self.apply_pending_snapshot_restore(game, agents) {

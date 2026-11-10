@@ -821,7 +821,15 @@ impl<R: Responder> PlayerAgent for PromptAgent<R> {
         available_blockers: &[CardId],
         max_blockers: Option<usize>,
     ) -> Vec<(CardId, CardId)> {
-        combat::choose_blockers(self, player, attackers, available_blockers, max_blockers)
+        let legality: Vec<_> = attackers.iter().map(|&id| (id, available_blockers.to_vec(), 1)).collect();
+        combat::choose_blockers(self, player, attackers, available_blockers, max_blockers, &legality)
+    }
+
+    fn choose_blockers_with_legality(
+        &mut self, player: PlayerId, attackers: &[CardId], available_blockers: &[CardId],
+        max_blockers: Option<usize>, legality: &[(CardId, Vec<CardId>, usize)],
+    ) -> Vec<(CardId, CardId)> {
+        combat::choose_blockers(self, player, attackers, available_blockers, max_blockers, legality)
     }
 
     fn choose_damage_assignment_order(

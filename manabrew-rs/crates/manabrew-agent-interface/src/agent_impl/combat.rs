@@ -90,22 +90,21 @@ pub(super) fn choose_blockers<T: Responder>(
     _player: PlayerId,
     attackers: &[CardId],
     available_blockers: &[CardId],
-    _max_blockers: Option<usize>,
+    max_blockers: Option<usize>,
+    legality: &[(CardId, Vec<CardId>, usize)],
 ) -> Vec<(CardId, CardId)> {
     use manabrew_protocol::prompts::choose_blockers::BlockableAttackerDto;
     let available_blocker_ids = PromptAgent::<T>::card_ids(available_blockers);
-    // The Rust engine doesn't surface per-attacker block legality yet, so every
-    // available blocker may block every attacker (min 1, no must-block).
-    let attackers = PromptAgent::<T>::card_ids(attackers)
-        .into_iter()
-        .map(|attacker_id| BlockableAttackerDto {
-            attacker_id,
-            valid_blocker_ids: available_blocker_ids.clone(),
-            min_blockers: 1,
-            max_blockers: None,
+    let attackers = attackers.iter().map(|&attacker| {
+        let entry = legality.iter().find(|(id, _, _)| *id == attacker);
+        BlockableAttackerDto {
+            attacker_id: card_id_str(attacker),
+            valid_blocker_ids: entry.map(|(_, ids, _)| PromptAgent::<T>::card_ids(ids)).unwrap_or_default(),
+            min_blockers: entry.map(|(_, _, min)| *min as u32).unwrap_or(1),
+            max_blockers: max_blockers.map(|max| max as u32),
             must_be_blocked: false,
-        })
-        .collect();
+        }
+    }).collect();
     agent.send_prompt(
         PromptInput::ChooseBlockers(
             manabrew_protocol::prompts::choose_blockers::ChooseBlockersInput {
@@ -347,6 +346,28 @@ mod required_attack_regression {
                 "action":{"type":"chooseAttackers", "output":{"type":"declareAttackers", "assignments":[]}}
             })).unwrap()
         }
+    }
+
+    #[test]
+    fn blocker_prompt_preserves_per_attacker_legality_and_menace() {
+        struct BlockCapture { prompt: Option<AgentPrompt> }
+        impl Responder for BlockCapture {
+            fn respond(&mut self, prompt: AgentPrompt) -> ClientToServerMessage {
+                let id = prompt.prompt_id;
+                self.prompt = Some(prompt);
+                serde_json::from_value(serde_json::json!({
+                    "kind":"response", "promptId":id,
+                    "action":{"type":"chooseBlockers", "output":{"type":"declareBlockers", "assignments":[]}}
+                })).unwrap()
+            }
+        }
+        let mut agent = PromptAgent::new(PlayerId(0), "fixture".into(), BlockCapture { prompt: None });
+        agent.choose_blockers_with_legality(PlayerId(0), &[CardId(1), CardId(2)], &[CardId(3), CardId(4)], None,
+            &[(CardId(1), vec![CardId(4)], 2), (CardId(2), vec![CardId(3), CardId(4)], 1)]);
+        let value = serde_json::to_value(agent.responder.prompt.as_ref().unwrap()).unwrap();
+        assert_eq!(value["input"]["attackers"][0]["validBlockerIds"], serde_json::json!(["card-4"]));
+        assert_eq!(value["input"]["attackers"][0]["minBlockers"], 2);
+        assert_eq!(value["input"]["attackers"][1]["validBlockerIds"], serde_json::json!(["card-3", "card-4"]));
     }
 
     #[test]

@@ -169,6 +169,18 @@ pub trait PlayerAgent {
         max_blockers: Option<usize>,
     ) -> Vec<(CardId, CardId)>;
 
+    /// Declare blockers with per-attacker legal candidates and minimum block counts.
+    fn choose_blockers_with_legality(
+        &mut self,
+        player: PlayerId,
+        attackers: &[CardId],
+        available_blockers: &[CardId],
+        max_blockers: Option<usize>,
+        _legality: &[(CardId, Vec<CardId>, usize)],
+    ) -> Vec<(CardId, CardId)> {
+        self.choose_blockers(player, attackers, available_blockers, max_blockers)
+    }
+
     /// Choose one attacker for a specific blocker during sequential declaration.
     ///
     /// Return `Some(attacker_id)` to assign this blocker, or `None` to leave it
