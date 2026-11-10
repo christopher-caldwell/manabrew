@@ -428,6 +428,23 @@ impl GameState {
             }
         }
         if host_left_battlefield {
+            // Copy effects use characteristics at resolution if the source is
+            // still the same permanent, otherwise its last battlefield state.
+            let identity = self.card(card_id).zone_timestamp;
+            let needs_copy_lki = |sa: &crate::spellability::SpellAbility| {
+                sa.source == Some(card_id)
+                    && sa.source_zone_timestamp == Some(identity)
+                    && sa.ir.token_attacking_text.as_deref() == Some("Myriad")
+                    && sa.copy_source_lki.is_none()
+            };
+            if self.stack.iter().any(|entry| needs_copy_lki(&entry.spell_ability)) {
+                let last = self.card(card_id).clone();
+                for entry in self.stack.iter_mut() {
+                    if needs_copy_lki(&entry.spell_ability) {
+                        entry.spell_ability.copy_source_lki = Some(Box::new(last.clone()));
+                    }
+                }
+            }
             if self.card(card_id).is_room() {
                 self.update_lki_snapshot(card_id);
             }

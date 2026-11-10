@@ -1250,6 +1250,10 @@ impl Card {
         self.pump_trigger_count = 0;
     }
 
+    pub fn copiable_keywords(&self) -> Vec<String> {
+        self.trait_base_keywords.as_ref().unwrap_or(&self.keywords).as_string_list()
+    }
+
     pub fn copiable_triggers(&self) -> Vec<Trigger> {
         self.trait_base_triggers
             .clone()
@@ -1257,7 +1261,7 @@ impl Card {
                 let end = self.base_trigger_count;
                 let start = end.saturating_sub(self.object_trigger_count);
                 self.triggers.iter().enumerate()
-                    .filter(|(idx, _)| *idx < start || *idx >= end)
+                    .filter(|(idx, _)| *idx < start)
                     .map(|(_, trigger)| trigger.clone()).collect()
             })
     }
@@ -2771,6 +2775,13 @@ impl Card {
 
     pub fn add_pump_keyword(&mut self, keyword: &str) {
         self.pump_keywords.add(keyword);
+        if keyword.eq_ignore_ascii_case("Myriad") {
+            let mut next = self.triggers.iter().map(|t| t.id).max().unwrap_or(0).saturating_add(1);
+            // Temporary triggers precede continuous grants, which are rebuilt.
+            self.triggers.truncate(self.base_trigger_count + self.pump_trigger_count);
+            self.add_myriad_trigger(&mut next);
+            self.pump_trigger_count += 1;
+        }
     }
 
     pub fn add_granted_keyword(&mut self, keyword: &str) {

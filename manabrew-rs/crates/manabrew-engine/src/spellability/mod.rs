@@ -161,6 +161,10 @@ pub struct SpellAbility {
     /// Used for non-target references like `Defined$ Self` to preserve object identity.
     #[serde(default)]
     pub source_zone_timestamp: Option<u64>,
+    /// Copiable last-known characteristics for an independent copy ability
+    /// whose source left the battlefield while the ability was on the stack.
+    #[serde(default)]
+    pub copy_source_lki: Option<Box<crate::card::Card>>,
     /// Source trigger id (Java `sourceTrigger`), used for state-trigger dedupe.
     pub source_trigger_id: Option<u32>,
     /// Index into card.triggers for intervening-if recheck.
@@ -612,6 +616,7 @@ impl SpellAbility {
             trigger_source: None,
             trigger_source_zone_timestamp: None,
             source_zone_timestamp: None,
+            copy_source_lki: None,
             source_trigger_id: None,
             trigger_index: None,
             alt_cost: None,

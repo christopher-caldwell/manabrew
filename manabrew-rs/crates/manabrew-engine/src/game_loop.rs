@@ -1534,3 +1534,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod myriad_regressions;

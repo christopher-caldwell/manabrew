@@ -8,6 +8,7 @@ use manabrew_agent_interface::prompt::*;
 use super::BotAgent;
 
 mod payment;
+mod combat_plan;
 mod plan;
 mod roles;
 mod threat;
@@ -1463,66 +1464,7 @@ impl SimpleAi {
     }
 
     fn blockers_to_keep(&self, player_id: &str, attackers: &[String]) -> HashSet<String> {
-        let mut keep = HashSet::new();
-        let Some(view) = &self.view else {
-            return keep;
-        };
-        let life = view
-            .players
-            .iter()
-            .find(|player| player.id == player_id)
-            .map_or(20, |player| player.life);
-        let mut threats = view
-            .players
-            .iter()
-            .filter(|player| player.id != player_id)
-            .map(|player| {
-                let mut powers = view
-                    .zones
-                    .iter()
-                    .filter(|zone| zone.zone == ZoneKind::Battlefield && zone.owner_id == player.id)
-                    .flat_map(|zone| &zone.cards)
-                    .filter_map(|card| match card {
-                        CardView::Visible(card) if card.types.iter().any(|ty| ty == "Creature") => {
-                            Some(Self::stat(card.power.as_deref()).max(0))
-                        }
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>();
-                powers.sort_unstable_by(|left, right| right.cmp(left));
-                powers
-            })
-            .max_by_key(|powers| powers.iter().sum::<i32>())
-            .unwrap_or_default();
-        let mut incoming = threats.iter().sum::<i32>();
-        if !Self::life_in_danger(life, incoming, false) {
-            return keep;
-        }
-        let mut candidates = attackers
-            .iter()
-            .filter_map(|id| self.combatant(id))
-            .filter(|creature| {
-                !self
-                    .card(&creature.id)
-                    .is_some_and(|card| Self::has_keyword(card, "Vigilance"))
-            })
-            .collect::<Vec<_>>();
-        candidates.sort_by_key(|creature| std::cmp::Reverse((creature.lethal, creature.power)));
-        for creature in candidates {
-            if !Self::life_in_danger(life, incoming, false) {
-                break;
-            }
-            if threats.is_empty() {
-                break;
-            }
-            incoming -= threats.remove(0);
-            keep.insert(creature.id);
-        }
-        // Blockers that still leave us in danger save nothing; they attack instead.
-        if Self::life_in_danger(life, incoming, false) {
-            keep.clear();
-        }
-        keep
+        self.defense_reserve(player_id, attackers)
     }
 
     fn battlefield<'a>(&'a self, player_id: &'a str) -> impl Iterator<Item = &'a CardDto> + 'a {
@@ -1566,17 +1508,20 @@ impl SimpleAi {
         let Some(view) = &self.view else {
             return true;
         };
+        let defender_id = self.card(target_id).map_or(target_id, |card| card.controller_id.as_str());
         let flying = Self::has_keyword(attacker, "Flying");
         let menace = Self::has_keyword(attacker, "Menace");
         let blockers: Vec<Combatant> = view
             .zones
             .iter()
-            .filter(|zone| zone.zone == ZoneKind::Battlefield && zone.owner_id == target_id)
+            .filter(|zone| zone.zone == ZoneKind::Battlefield && zone.owner_id == defender_id)
             .flat_map(|zone| &zone.cards)
             .filter_map(|card| match card {
                 CardView::Visible(card)
                     if card.types.iter().any(|card_type| card_type == "Creature")
                         && !card.tapped
+                        && !card.phased_out
+                        && !card.text.to_ascii_lowercase().contains("can't block")
                         && (!flying
                             || Self::has_keyword(card, "Flying")
                             || Self::has_keyword(card, "Reach")) =>
@@ -1648,6 +1593,16 @@ impl SimpleAi {
         available_blocker_ids: &[String],
         player_id: &str,
     ) -> Vec<BlockAssignment> {
+        self.declare_blockers_with_targets(attackers, available_blocker_ids, player_id, None)
+    }
+
+    fn declare_blockers_with_targets(
+        &self,
+        attackers: &[manabrew_protocol::prompts::choose_blockers::BlockableAttackerDto],
+        available_blocker_ids: &[String],
+        player_id: &str,
+        attack_targets: Option<&[AttackAssignment]>,
+    ) -> Vec<BlockAssignment> {
         let life = self.view.as_ref().map_or(20, |view| {
             view.players
                 .iter()
@@ -1658,9 +1613,10 @@ impl SimpleAi {
             .iter()
             .filter_map(|attacker| {
                 let combatant = self.combatant(&attacker.attacker_id)?;
-                let at_me = self
+                let at_me = attack_targets.map_or_else(|| self
                     .card(&attacker.attacker_id)
-                    .is_some_and(|card| card.attacking_player_id.as_deref() == Some(player_id));
+                    .is_some_and(|card| card.attacking_player_id.as_deref() == Some(player_id)),
+                    |targets| targets.iter().any(|a| a.attacker_id == attacker.attacker_id && a.target_id == player_id));
                 Some((attacker, combatant, at_me))
             })
             .collect::<Vec<_>>();
@@ -2311,23 +2267,6 @@ impl BotAgent for SimpleAi {
                 max_attackers,
                 target_limits,
             }) => {
-                let default_target = attack_targets
-                    .iter()
-                    .max_by_key(|target| self.attack_target_score(&target.id, &deciding_player_id))
-                    .map(|target| target.id.clone())
-                    .unwrap_or_else(|| "player-1".to_string());
-                let attack_power = attackers
-                    .iter()
-                    .filter_map(|attacker| self.card(&attacker.attacker_id))
-                    .filter_map(|card| card.power.as_deref())
-                    .filter_map(|power| power.parse::<i32>().ok())
-                    .sum::<i32>();
-                let lethal_target = self.view.as_ref().is_some_and(|view| {
-                    view.players
-                        .iter()
-                        .find(|player| player.id == default_target)
-                        .is_some_and(|player| player.life > 0 && attack_power >= player.life)
-                });
                 let signature = format!(
                     "attack:{}|{}",
                     attackers
@@ -2342,14 +2281,10 @@ impl BotAgent for SimpleAi {
                         .join(",")
                 );
                 let reprompted = self.looping_on_consecutive(signature);
-                let keep = if lethal_target {
-                    HashSet::new()
-                } else {
-                    self.blockers_to_keep(
-                        &deciding_player_id,
-                        &attackers.iter().map(|a| a.attacker_id.clone()).collect::<Vec<_>>(),
-                    )
-                };
+                let keep = self.blockers_to_keep(
+                    &deciding_player_id,
+                    &attackers.iter().map(|a| a.attacker_id.clone()).collect::<Vec<_>>(),
+                );
                 // Minimum-cost maximum matching satisfies as many required
                 // attacks as possible, then minimizes avoidable attacks at the
                 // goader/non-player targets across the entire declaration.
@@ -2419,21 +2354,9 @@ impl BotAgent for SimpleAi {
                             target_id: attack_targets[edge.to - target_base].id.clone() });
                     }
                 }
-                // Optional attacks use only capacity left after requirements.
-                for a in attackers.iter().filter(|a| !a.must_attack) {
-                    if max_attackers.is_some_and(|max| assignments.len() >= max) { break; }
-                    if reprompted || keep.contains(&a.attacker_id) { continue; }
-                    // The most dangerous opponent this creature can safely and usefully attack.
-                    let mut targets: Vec<&String> = a.valid_target_ids.iter()
-                        .filter(|target| !self.failed_attack_targets.contains(*target))
-                        .filter(|target| target_limits.get(*target).is_none_or(|limit|
-                            assignments.iter().filter(|entry| entry.target_id.as_str() == target.as_str()).count() < *limit))
-                        .collect();
-                    targets.sort_by_key(|target| std::cmp::Reverse(self.attack_target_score(target, &deciding_player_id)));
-                    let Some(target_id) = targets.into_iter()
-                        .find(|target| (lethal_target && **target == default_target) || self.should_attack(&a.attacker_id, target))
-                        .cloned() else { continue };
-                    assignments.push(AttackAssignment { attacker_id: a.attacker_id.clone(), target_id });
+                if !reprompted {
+                    assignments = self.allocate_optional_attacks(assignments, &attackers, &deciding_player_id,
+                        max_attackers, &target_limits, &keep);
                 }
                 self.last_attack_declaration = assignments
                     .iter()
@@ -2631,8 +2554,8 @@ impl BotAgent for SimpleAi {
                 deny_label,
             }) => {
                 let signature = format!(
-                    "bool:{prompt_source_id}|{}|{confirm_label}|{deny_label}",
-                    presentation.title
+                    "bool:{prompt_source_id}|{}|{confirm_label}|{deny_label}|board:{}",
+                    presentation.title, self.board_signature()
                 );
                 let repeated = self.looping_on(signature);
                 let title = presentation.title.to_ascii_lowercase();

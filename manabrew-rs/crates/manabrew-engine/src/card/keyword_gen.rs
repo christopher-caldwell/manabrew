@@ -431,6 +431,10 @@ impl Card {
     }
 
     fn generate_keyword_trigger_combat(&mut self, kw: &str, next_id: &mut u32) {
+        if kw == "Myriad" {
+            self.add_myriad_trigger(next_id);
+        }
+
         if let Some(n_str) = crate::keyword::extract_keyword_cost_str(kw, "Firebending") {
             if let Ok(n) = n_str.parse::<usize>() {
                 let effect = format!("TrigFirebending{n}");
@@ -570,6 +574,17 @@ impl Card {
             self.svars
                 .entry("ExtortGain".to_string())
                 .or_insert_with(|| "DB$ GainLife | Defined$ You | LifeAmount$ 1".to_string());
+        }
+    }
+
+    /// Shared by printed, continuously granted and temporary myriad instances.
+    pub(crate) fn add_myriad_trigger(&mut self, next_id: &mut u32) {
+        let raw = "Mode$ Attacks | ValidCard$ Card.Self | Execute$ TrigMyriad | TriggerZones$ Battlefield | TriggerDescription$ Myriad";
+        if let Some(mut trigger) = parse_trigger(raw, next_id) {
+            // Capture the definition on the trigger: a grant can disappear while
+            // this ability is on the stack, without removing its effect.
+            trigger.execute_definition = Some("DB$ CopyPermanent | Defined$ Self | TokenTapped$ True | TokenAttacking$ Myriad".into());
+            self.add_trigger(trigger);
         }
     }
 

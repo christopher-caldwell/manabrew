@@ -613,6 +613,10 @@ pub fn apply_continuous_effects(game: &mut GameState) {
             } => {
                 let card = &mut game.cards[effect.target.index()];
                 card.add_changed_card_keyword_at(&kw, timestamp, static_id);
+                if kw.eq_ignore_ascii_case("Myriad") {
+                    let mut next = card.triggers.iter().map(|t| t.id).max().unwrap_or(0).saturating_add(1);
+                    card.add_myriad_trigger(&mut next);
+                }
                 if kw.eq_ignore_ascii_case("Undying") || kw.eq_ignore_ascii_case("Persist") {
                     let is_undying=kw.eq_ignore_ascii_case("Undying");
                     let counter=if is_undying { "P1P1" } else { "M1M1" };

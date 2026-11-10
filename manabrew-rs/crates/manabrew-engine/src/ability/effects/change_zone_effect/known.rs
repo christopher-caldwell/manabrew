@@ -45,7 +45,7 @@ pub(super) fn resolve_known_origin(
         return;
     }
 
-    let cards_to_move: Vec<CardId> = if sa.uses_targeting() {
+    let mut cards_to_move: Vec<CardId> = if sa.uses_targeting() {
         if sa.overloaded && origin_zone == ZoneType::Battlefield {
             // Overload: target → each. Mirrors damage_deal_effect / pump_effect.
             let valid_tgts = sa
@@ -175,6 +175,18 @@ pub(super) fn resolve_known_origin(
     } else {
         Vec::new()
     };
+
+    // CR 603.7c: delayed zone changes refer to the registered objects,
+    // not new objects represented by a reused physical CardId after blinking.
+    if matches!(defined_ref, Some(DefinedRef::DelayTriggerRemembered | DefinedRef::DelayTriggerRememberedLki)) {
+        let stored = crate::parsing::Params::from_raw(&sa.ability_text);
+        if let Some(objects) = stored.get("StoredRememberedObjects") {
+            cards_to_move.retain(|&id| {
+                let identity = format!("{}:{}", id.0, ctx.game.card(id).zone_timestamp);
+                objects.split(',').any(|object| object == identity)
+            });
+        }
+    }
 
     // Optional$ True — Java mirrors the per-card confirm at
     // `ChangeZoneEffect.java:558-561`: ask the chooser whether to move each

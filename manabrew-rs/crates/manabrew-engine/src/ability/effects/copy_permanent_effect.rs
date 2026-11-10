@@ -13,6 +13,10 @@ use crate::spellability::SpellAbility;
 /// `CopyPermanentEffect` class extending `SpellAbilityEffect`.
 #[manabrew_engine_macros::spell_effect(CopyPermanentEffect)]
 fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
+    if sa.ir.token_attacking_text.as_deref() == Some("Myriad") {
+        resolve_myriad(ctx, sa);
+        return;
+    }
     let amount = super::resolve_numeric_svar(ctx.game, sa, "NumCopies", 1).max(0) as usize;
     let controllers = resolve_copy_controllers(ctx, sa);
     if controllers.is_empty() {
@@ -90,10 +94,12 @@ pub fn get_proto_type(sa: &SpellAbility, original: &Card, new_owner: crate::ids:
         original.color,
         original.base_power,
         original.base_toughness,
-        original.keywords.as_string_list(),
+        original.copiable_keywords(),
         original.abilities.clone(),
     );
+    crate::card::card_copy_service::copy_copiable_characteristics(original, &mut copy);
     copy.full_name.clone_from(&original.full_name);
+    copy.oracle_text.clone_from(&original.oracle_text);
     if original.copied_spell && sa.is_spell && sa.source == Some(original.id) {
         copy.cast_sa = Some(Box::new(sa.clone()));
     }
@@ -281,4 +287,51 @@ fn resolve_originals(
     // Check Defined$ parameter first.
     // Fall back to targeting.
     sa.target_chosen.target_card.into_iter().collect()
+}
+
+/// CR 702.116: one optional copy for each opponent other than the
+/// defending player. All copies from one resolving instance enter together.
+fn resolve_myriad(ctx: &mut EffectContext, sa: &SpellAbility) {
+    let Some(source) = sa.source else { return; };
+    let Some(defending) = sa.get_triggering_player(crate::ability::AbilityKey::DefendingPlayer)
+        .or_else(|| sa.get_triggering_player(crate::ability::AbilityKey::Defender)) else { return; };
+    let controller = sa.activating_player;
+    let opponents: Vec<_> = ctx.game.alive_players().into_iter().filter(|&player|
+        player != defending && crate::player::player_predicates::is_opponent_of(ctx.game, controller, player)
+    ).collect();
+    let original = sa.copy_source_lki.as_deref().unwrap_or_else(|| ctx.game.card(source));
+    // Preserve the prototype across choices and creation; grants and counters
+    // are not copiable, but copy effects and printed characteristics are.
+    let prototype = get_proto_type(sa, original, controller);
+    let mut table = TokenCreateTable::default();
+    for opponent in opponents {
+        ctx.agents[controller.index()].snapshot_state(ctx.game, ctx.mana_pools);
+        if !ctx.agents[controller.index()].confirm_action(controller, Some("Myriad"),
+            &format!("Create a token that's a copy of {} attacking {} or a planeswalker they control?", prototype.card_name, ctx.game.player(opponent).name),
+            &[], Some(source), Some(crate::ability::api_type::ApiType::CopyPermanent)) { continue; }
+        let mut copy = prototype.clone();
+        copy.copied_permanent = Some(source);
+        // Runtime routing only, never part of the token's copiable values.
+        copy.remembered_players = vec![opponent];
+        table.put(controller, copy, 1);
+    }
+    let mut changes = CardZoneTable::default();
+    let result = TOKEN_EFFECT_BASE.make_token_table(ctx, table, true, &mut changes, sa);
+    if result.created.is_empty() { return; }
+    changes.trigger_changes_zone_all(ctx.trigger_handler, ctx.game, Some(sa));
+    let identities = result.created.iter().map(|id|
+        format!("{}:{}", id.0, ctx.game.card(*id).zone_timestamp)).collect::<Vec<_>>().join(",");
+    ctx.trigger_handler.register_delayed_trigger(crate::trigger::handler::DelayedTrigger {
+        mode: crate::trigger::TriggerType::Phase,
+        trigger_mode: Box::new(crate::trigger::trigger_phase::TriggerPhase {
+            phases: vec![forge_foundation::PhaseType::CombatEnd], valid_player: None,
+        }),
+        params: crate::parsing::Params::default(),
+        execute_svar: format!("DB$ ChangeZone | Defined$ DelayTriggerRemembered | Origin$ Battlefield | Destination$ Exile | StoredRememberedObjects$ {identities}"),
+        controller, source_card: source, source_zone_timestamp: None,
+        created_turn: ctx.game.turn.turn_number, created_phase: ctx.game.turn.phase,
+        target_card: None, remembered_amount: 0, remembered_cards: result.created,
+        remembered_players: Vec::new(), remembered_lki_cards: Vec::new(),
+        sort_after_active: false, trigger_order: None,
+    });
 }

@@ -33,8 +33,7 @@ pub(super) fn choose_defender(
         })
         .collect();
     ctx.agents[controller.index()].snapshot_state(ctx.game, ctx.mana_pools);
-    Some(
-        match ctx.agents[controller.index()].choose_target_any(
+    let chosen = match ctx.agents[controller.index()].choose_target_any(
             controller,
             &valid_players,
             &valid_cards,
@@ -43,8 +42,8 @@ pub(super) fn choose_defender(
             crate::agent::TargetChoice::Player(pid) => DefenderId::Player(pid),
             crate::agent::TargetChoice::Card(cid) => DefenderId::Permanent(cid),
             _ => defenders[0],
-        },
-    )
+        };
+    Some(if defenders.contains(&chosen) { chosen } else { defenders[0] })
 }
 
 pub(super) fn resolve_attack_defenders(
@@ -55,6 +54,15 @@ pub(super) fn resolve_attack_defenders(
 ) -> Vec<DefenderId> {
     let controller = ctx.game.card(card_id).controller;
     let possible = crate::combat::get_possible_defenders(ctx.game, controller);
+    if attacking_param.eq_ignore_ascii_case("Myriad") {
+        let opponent = ctx.game.card(card_id).remembered_players.first().copied();
+        return possible.into_iter().filter(|defender|
+            opponent == Some(defender.controlling_player(ctx.game))
+                && match defender {
+                    DefenderId::Player(_) => true,
+                    DefenderId::Permanent(id) => ctx.game.card(*id).type_line.is_planeswalker(),
+                }).collect();
+    }
     if attacking_param.eq_ignore_ascii_case("True") {
         return possible;
     }
@@ -180,11 +188,13 @@ pub(crate) fn add_to_combat(
 
     let card = ctx.game.card_mut(card_id);
     card.set_attacking_player(defending_player);
+    if attacking != "Myriad" {
     card.mark_attacked_this_turn();
     card.damage_history.set_creature_attacked_this_combat(
         Some(tracked_defender),
         num_other_attackers,
         defender_is_battle,
     );
+    }
     true
 }

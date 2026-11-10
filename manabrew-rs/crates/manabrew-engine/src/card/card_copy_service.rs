@@ -63,9 +63,10 @@ pub fn copy_copiable_characteristics(copy_from: &Card, to: &mut Card) {
         .map(|state| state.original_base_toughness)
         .or(copy_from.changed_base_toughness)
         .unwrap_or(copy_from.base_toughness);
-    to.keywords = copy_from.keywords.clone();
+    to.keywords = crate::keyword::keyword_collection::KeywordCollection::from_strings(&copy_from.copiable_keywords());
     to.abilities = copy_from.abilities.clone();
-    to.triggers = copy_from.triggers.clone();
+    to.triggers = copy_from.copiable_triggers();
+    for trigger in &mut to.triggers { trigger.bind_host_card_id(to.id); }
     to.svars = copy_from.svars.clone();
     to.update_rooms();
     to.parsed_svar_cache.clear();

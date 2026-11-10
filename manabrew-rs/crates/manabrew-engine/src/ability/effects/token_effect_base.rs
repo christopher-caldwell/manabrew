@@ -263,6 +263,9 @@ pub trait TokenEffectBase {
             if self.add_token_to_combat(ctx, sa, token_id) {
                 result.combat_changed = true;
             }
+            if sa.ir.token_attacking_text.as_deref() == Some("Myriad") {
+                ctx.game.card_mut(token_id).remembered_players.clear();
+            }
         }
         // Tokens created by this one effect enter simultaneously. Register all
         // their triggers before emitting any of the individual entry events so
@@ -312,6 +315,7 @@ pub trait TokenEffectBase {
         token.set_owner(creator);
         token.set_controller(controller);
         token.set_is_token(true);
+        if sa.ir.token_tapped { token.set_tapped(true); }
 
         if let Some(counter_type) = sa.ir.with_counters_type.as_ref() {
             let amount = super::resolve_numeric_svar(ctx.game, sa, keys::WITH_COUNTERS_AMOUNT, 1);

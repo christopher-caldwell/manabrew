@@ -686,8 +686,10 @@ fn puzzles() -> Vec<Puzzle> {
         },
         Puzzle {
             id: "4-attack-leader",
-            name: "Attack the opponent closest to winning, not the one with no blockers",
-            expected: "attack player-1",
+            // A 6/6 loses to coordinated 5/5 blocks. Threat rank does not
+            // justify that sacrifice, nor does six damage stop this opponent.
+            name: "Keep the defensive body when the leading opponent has five 5/5 blockers",
+            expected: "no attack",
             play: attack_closest_to_winning,
         },
         Puzzle {
