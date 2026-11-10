@@ -274,6 +274,46 @@ fn resolve_card_list_property(
     controller: PlayerId,
     sa: &SpellAbility,
 ) -> Option<i32> {
+    // Count the remembered objects even when the collection is empty. Falling
+    // through would reinterpret this card expression as a player expression.
+    // LKI validity uses pre-move snapshots, not current owner-controlled exiles.
+    if defined.eq_ignore_ascii_case("RememberedLKI") {
+        if let Some(rest) = property.strip_prefix("Valid ") {
+            let (valid, operators) = rest.split_once('/').unwrap_or((rest, ""));
+            let snapshots = &game.card(source_id).remembered_lki_cards;
+            let count = if snapshots.is_empty() {
+                resolve_defined_cards_for_svar(defined, game, source_id, sa)
+                    .into_iter()
+                    .filter(|&id| {
+                        crate::ability::ability_utils::matches_valid_cards_for_sa(
+                            game,
+                            sa,
+                            game.card(id),
+                            None,
+                            valid,
+                        )
+                    })
+                    .count()
+            } else {
+                snapshots
+                    .iter()
+                    .filter(|card| {
+                        crate::ability::ability_utils::matches_valid_cards_for_sa(
+                            game, sa, card, None, valid,
+                        )
+                    })
+                    .count()
+            };
+            return Some(do_x_math(
+                count as i32,
+                operators,
+                game,
+                source_id,
+                controller,
+                sa,
+            ));
+        }
+    }
     let cards = resolve_defined_cards_for_svar(defined, game, source_id, sa);
     if cards.is_empty() {
         // A recognized remembered-LKI mana-value expression over an empty
@@ -3198,5 +3238,61 @@ mod tests {
             ),
             11
         );
+    }
+}
+
+#[cfg(test)]
+mod remembered_lki_valid_regressions {
+    use super::*;
+    use crate::card::Card;
+    use forge_foundation::{CardTypeLine, ColorSet, ManaCost, ZoneType};
+    #[test]
+    fn empty_and_pre_move_controller_counts_remain_card_expressions() {
+        let mut game = GameState::new(&["A", "B", "C"], 40);
+        let add = |game: &mut GameState, owner| {
+            game.create_card(Card::new(
+                CardId(0),
+                "Fixture".into(),
+                owner,
+                CardTypeLine::parse("Creature"),
+                ManaCost::parse("W"),
+                ColorSet::WHITE,
+                Some(1),
+                Some(1),
+                vec![],
+                vec![],
+            ))
+        };
+        let host = add(&mut game, PlayerId(0));
+        game.card_mut(host).svars.insert(
+            "X".into(),
+            "RememberedLKI$Valid Card.RememberedPlayerCtrl".into(),
+        );
+        let sa = SpellAbility::new_simple(Some(host), PlayerId(0), "DB$ Draw | NumCards$ X");
+        let count = |g: &GameState| {
+            resolve_svar_expression(
+                "RememberedLKI$Valid Card.RememberedPlayerCtrl",
+                g,
+                host,
+                PlayerId(0),
+                &sa,
+            )
+        };
+        assert_eq!(count(&game), 0);
+        let victim = add(&mut game, PlayerId(1));
+        game.move_card(victim, ZoneType::Battlefield, PlayerId(1));
+        game.change_controller(victim, PlayerId(2));
+        let snapshot = game.card(victim).clone();
+        game.move_card(victim, ZoneType::Exile, PlayerId(1));
+        game.card_mut(host).remembered_cards.push(victim);
+        game.card_mut(host).remembered_lki_cards.push(snapshot);
+        for (player, expected) in [(0, 0), (1, 0), (2, 1)] {
+            game.card_mut(host).remembered_players = vec![PlayerId(player)];
+            assert_eq!(count(&game), expected);
+            assert_eq!(resolve_numeric_svar(&game, &sa, "NumCards", 99), expected);
+        }
+        game.card_mut(host).clear_remembered();
+        assert_eq!(count(&game), 0);
+        assert!(game.card(host).remembered_lki_cards.is_empty());
     }
 }

@@ -88,7 +88,7 @@ impl SpellAbilityCondition {
         if is_true("ConditionDesert") {
             self.variables.set_desert(true);
         }
-        if is_true("ConditionBlessing") {
+        if is_true("ConditionBlessing") || get("Condition") == Some("Blessing") {
             self.variables.set_blessing(true);
         }
         if is_true("ConditionSolved") || get("Condition") == Some("Solved") {

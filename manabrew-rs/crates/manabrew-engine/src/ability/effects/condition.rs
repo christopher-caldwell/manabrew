@@ -306,6 +306,20 @@ mod tests {
     use forge_foundation::{CardTypeLine, ColorSet, ManaCost};
 
     #[test]
+    fn blessing_aliases_gate_the_activator_not_an_opponent() {
+        let mut game = GameState::new(&["A", "B"], 40);
+        for gate in ["Condition$ Blessing", "ConditionBlessing$ True"] {
+            let sa = SpellAbility::new_simple(None, PlayerId(0), &format!("DB$ Draw | {gate}"));
+            assert!(!check_condition(&game, &sa));
+            game.player_set_blessing(PlayerId(1), true);
+            assert!(!check_condition(&game, &sa));
+            game.player_set_blessing(PlayerId(0), true);
+            assert!(check_condition(&game, &sa));
+            game.player_set_blessing(PlayerId(0), false);
+        }
+    }
+
+    #[test]
     fn condition_present_targeted_nonbasic_matches_destroyed_land() {
         let player = PlayerId(0);
         let mut game = GameState::new(&["P1"], 20);

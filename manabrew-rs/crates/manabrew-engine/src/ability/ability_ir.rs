@@ -833,7 +833,8 @@ impl SpellAbilityIr {
             condition_delirium: parsed_true(params.get("ConditionDelirium")),
             condition_revolt: parsed_true(params.get("ConditionRevolt")),
             condition_desert: parsed_true(params.get("ConditionDesert")),
-            condition_blessing: parsed_true(params.get("ConditionBlessing")),
+            condition_blessing: parsed_true(params.get("ConditionBlessing"))
+                || params.get("Condition") == Some("Blessing"),
             condition_solved: parsed_true(params.get("ConditionSolved")),
             condition_kicked: parsed_true(params.get("ConditionKicked")),
             condition_optional_paid: parsed_true(params.get("ConditionOptionalPaid")),

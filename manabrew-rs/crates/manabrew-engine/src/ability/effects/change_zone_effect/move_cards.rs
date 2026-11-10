@@ -121,7 +121,23 @@ pub(super) fn move_cards(
         // `GameAction.changeZone()` running `replacementHandler.run(Moved)`
         // regardless of destination.
         let final_dest = apply_hand_library_replacement(ctx, card_id, old_zone, dest_zone);
+        // RememberLKI must retain the pre-move controller and characteristics;
+        // a zone change can reset control to the owner (including stolen cards).
+        let remembered_lki = sa
+            .ir
+            .remember_lki_flag
+            .then(|| ctx.game.card(card_id).clone());
         ctx.move_card(card_id, final_dest, dest_owner);
+        if ctx.game.card(card_id).zone != old_zone {
+            if let (Some(sid), Some(snapshot)) = (sa.source, remembered_lki) {
+                let remembered = &mut ctx.game.card_mut(sid).remembered_lki_cards;
+                if !remembered.iter().any(|card| {
+                    card.id == card_id && card.zone_timestamp == snapshot.zone_timestamp
+                }) {
+                    remembered.push(snapshot);
+                }
+            }
+        }
         if final_dest == ZoneType::Battlefield {
             ctx.trigger_handler
                 .register_active_trigger(ctx.game, card_id);

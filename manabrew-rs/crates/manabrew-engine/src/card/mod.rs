@@ -1711,6 +1711,7 @@ impl Card {
 
     pub fn clear_remembered(&mut self) {
         self.remembered_cards.clear();
+        self.remembered_lki_cards.clear();
         self.remembered_players.clear();
         self.remembered_cmc.clear();
     }
