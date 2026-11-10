@@ -641,16 +641,15 @@ pub fn apply_continuous_effects(game: &mut GameState) {
                     let raw = format!(
                         "Mode$ BecomesTarget | ValidSource$ SpellAbility.OppCtrl | ValidTarget$ Card.Self | Secondary$ True | Execute$ {execute} | TriggerZones$ Battlefield | TriggerDescription$ Ward"
                     );
+                    let definition = format!(
+                        "DB$ Counter | Defined$ TriggeredSourceSA | UnlessCost$ {cost_str}"
+                    );
                     if let Some(mut trig) = crate::trigger::parse_trigger(&raw, &mut next_id_mut) {
                         trig.execute = execute.clone();
+                        trig.execute_definition = Some(definition.clone());
                         card.add_trigger(trig);
                     }
-                    card.granted_svars.insert(
-                        execute,
-                        format!(
-                            "DB$ Counter | Defined$ TriggeredSourceSA | UnlessCost$ {cost_str}"
-                        ),
-                    );
+                    card.granted_svars.insert(execute, definition);
                 }
             }
             EffectKind::AddType(t) => {
@@ -1329,6 +1328,33 @@ mod tests {
     }
 
     // ── Keyword granting ──────────────────────────────────────────────────
+
+    #[test]
+    fn granted_ward_trigger_retains_definition_after_grant_is_removed() {
+        let mut game = new_game();
+        let alice = PlayerId(0);
+        let creature = add_creature(&mut game, alice, 2, 2, vec![], vec![]);
+        let enchantment = add_enchantment(
+            &mut game,
+            alice,
+            vec!["S$ Mode$ Continuous | Affected$ Creature.YouControl | AddKeyword$ Ward:2".to_string()],
+        );
+        apply_continuous_effects(&mut game);
+        let trigger = game.card(creature).triggers.iter()
+            .find(|trigger| trigger.description == "Ward")
+            .expect("ward trigger is granted")
+            .clone();
+
+        game.move_card(enchantment, ZoneType::Graveyard, alice);
+        apply_continuous_effects(&mut game);
+        assert!(!game.card(creature).has_keyword("Ward:2"));
+        assert!(game.card(creature).get_s_var(&trigger.execute).is_none());
+        let ability = trigger.build_triggered_spell_ability(
+            &game, creature, alice, 0, &Default::default(),
+        );
+        assert_eq!(ability.api, Some(crate::ability::ApiType::Counter));
+        assert_eq!(ability.ir.unless_cost.as_deref(), Some("2"));
+    }
 
     #[test]
     fn grant_flying_to_your_creatures() {
