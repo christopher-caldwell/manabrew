@@ -815,6 +815,7 @@ impl GameLoop {
         let mut inherited_targets = entry.spell_ability.target_chosen.clone();
         let mut inherited_trigger_index = entry.spell_ability.trigger_index;
         let root_kicked = entry.spell_ability.kicked;
+        let root_x = entry.spell_ability.x_mana_cost_paid;
         let root_trigger_objects = entry.spell_ability.trigger_objects.clone();
         let mut current = Some(&entry.spell_ability);
         let mut is_first = true;
@@ -832,6 +833,7 @@ impl GameLoop {
             // Propagate kicked flag from root SA to sub-abilities for condition checks
             let mut sa_with_ctx;
             let needs_ctx_clone = (!is_first && !root_trigger_objects.is_empty())
+                || sa.x_mana_cost_paid != root_x
                 || (root_kicked && !sa.kicked)
                 || (parent_target_card.is_some() && sa.target_chosen.target_card.is_none())
                 || (parent_target_player.is_some() && sa.target_chosen.target_player.is_none())
@@ -842,6 +844,10 @@ impl GameLoop {
                 || (inherited_trigger_index.is_some() && sa.trigger_index.is_none());
             let sa_ref = if needs_ctx_clone {
                 sa_with_ctx = sa.clone();
+                // X is an announcement on the whole stack ability, including
+                // its subabilities. Never recover it from a source card that
+                // may already have become a new zone object during resolution.
+                sa_with_ctx.x_mana_cost_paid = root_x;
                 for (key, value) in &root_trigger_objects {
                     sa_with_ctx.trigger_objects.entry(*key).or_insert_with(|| value.clone());
                 }

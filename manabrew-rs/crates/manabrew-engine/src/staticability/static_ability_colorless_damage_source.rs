@@ -54,22 +54,11 @@ pub fn target_is_protected_from_source(cards: &[Card], target: &Card, source: &C
                     return true;
                 }
             }
-            "artifacts" => {
-                if source.type_line.is_artifact() {
+            _ => {
+                if source.matches_protection_card_type(&prot) {
                     return true;
                 }
             }
-            "creatures" => {
-                if source.type_line.is_creature() {
-                    return true;
-                }
-            }
-            "enchantments" => {
-                if source.type_line.is_enchantment() {
-                    return true;
-                }
-            }
-            _ => {}
         }
     }
     false

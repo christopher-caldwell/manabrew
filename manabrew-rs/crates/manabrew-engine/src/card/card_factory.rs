@@ -65,6 +65,9 @@ pub fn copy_spell_ability_and_possibly_host(
             host.set_code.clone_from(&original.set_code);
             host.card_number.clone_from(&original.card_number);
             host.copied_spell = true;
+            // A spell copy copies the announced X, unlike a permanent copy.
+            host.svars
+                .insert("XPaid".into(), copy.x_mana_cost_paid.to_string());
             host.copied_permanent = Some(source_id);
             host.base_ability_count = host.activated_abilities.len();
             host.base_trigger_count = host.triggers.len();

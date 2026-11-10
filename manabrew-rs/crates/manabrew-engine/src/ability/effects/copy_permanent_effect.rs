@@ -116,6 +116,11 @@ pub fn get_proto_type(sa: &SpellAbility, original: &Card, new_owner: crate::ids:
     }
     copy.set_triggers(original.copiable_triggers());
     copy.set_svars_map(original.svars.clone());
+    copy.svars.remove("XPaid");
+    if let Some(cast) = copy.cast_sa.as_ref() {
+        copy.svars
+            .insert("XPaid".into(), cast.x_mana_cost_paid.to_string());
+    }
     copy.set_static_abilities(original.static_abilities.clone());
     copy.set_replacement_effects(original.copiable_replacement_effects());
     copy.set_perpetual(original, false);

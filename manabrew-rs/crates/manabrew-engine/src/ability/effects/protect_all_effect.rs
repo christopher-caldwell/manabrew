@@ -30,7 +30,6 @@ pub fn run(game: &mut crate::game::GameState, card_id: crate::ids::CardId, keywo
 /// `ProtectAllEffect` class extending `SpellAbilityEffect`.
 #[manabrew_engine_macros::spell_effect(ProtectAllEffect)]
 fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
-    let controller = sa.activating_player;
     let valid_filter = sa
         .ir
         .valid_cards_text
@@ -38,35 +37,8 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
         .unwrap_or("Creature.YouCtrl")
         .to_string();
     let valid_selector = sa.ir.valid_cards_selector.as_ref();
-    let gains = sa.ir.gains.as_deref().unwrap_or("").to_string();
-
-    // If choosing a color, do it once for all targets
-    let prot_keyword = if gains.contains("chosen color") {
-        let choices = sa
-            .ir
-            .choices
-            .as_deref()
-            .map(|s| {
-                s.split(',')
-                    .map(|c| c.trim().to_string())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_else(|| {
-                vec![
-                    "White".into(),
-                    "Blue".into(),
-                    "Black".into(),
-                    "Red".into(),
-                    "Green".into(),
-                ]
-            });
-        let chosen = ctx.agents[controller.index()].choose_color(controller, &choices);
-        match chosen {
-            Some(color) => format!("Protection from {}", color.to_lowercase()),
-            None => return,
-        }
-    } else {
-        gains
+    let Some(prot_keyword) = super::protect_effect::choose_protection_keyword(ctx, sa) else {
+        return;
     };
 
     if prot_keyword.is_empty() {

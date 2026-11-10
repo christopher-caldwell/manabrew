@@ -68,6 +68,8 @@ pub fn copy_copiable_characteristics(copy_from: &Card, to: &mut Card) {
     to.triggers = copy_from.copiable_triggers();
     for trigger in &mut to.triggers { trigger.bind_host_card_id(to.id); }
     to.svars = copy_from.svars.clone();
+    // Script definitions are copiable; a previous object's cast choice is not.
+    to.svars.remove("XPaid");
     to.update_rooms();
     to.parsed_svar_cache.clear();
     to.refresh_action_specs();

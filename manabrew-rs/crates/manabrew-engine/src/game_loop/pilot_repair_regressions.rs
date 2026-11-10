@@ -554,3 +554,6 @@ fn archived_conversion_changes_ready_army_and_keeps_flying_through_opponents_tur
     }
     }).unwrap().join().unwrap();
 }
+
+#[path = "object_choices_repair.rs"]
+mod object_choices_repair;

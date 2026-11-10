@@ -1556,6 +1556,18 @@ impl Card {
         prots
     }
 
+    /// Match singular chosen card types and legacy plural protection qualities.
+    /// Shared by blocking and the targeting/damage/attachment checks.
+    pub(crate) fn matches_protection_card_type(&self, quality: &str) -> bool {
+        let singular = if quality == "sorceries" {
+            "sorcery"
+        } else {
+            quality.strip_suffix('s').unwrap_or(quality)
+        };
+        self.type_line.core_types.iter()
+            .any(|t| t.name().eq_ignore_ascii_case(singular))
+    }
+
     /// Check if this card is protected from a source card.
     /// Protection from <color> checks source's color.
     /// Protection from <type> checks source's type (e.g. "artifacts", "creatures").
@@ -1595,22 +1607,11 @@ impl Card {
                         return true;
                     }
                 }
-                "artifacts" => {
-                    if source.type_line.is_artifact() {
+                _ => {
+                    if source.matches_protection_card_type(&prot) {
                         return true;
                     }
                 }
-                "creatures" => {
-                    if source.type_line.is_creature() {
-                        return true;
-                    }
-                }
-                "enchantments" => {
-                    if source.type_line.is_enchantment() {
-                        return true;
-                    }
-                }
-                _ => {}
             }
         }
         false

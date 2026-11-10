@@ -96,6 +96,11 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
     ) {
         return;
     }
+    if crate::staticability::static_ability_colorless_damage_source::target_is_protected_from_source(
+        &ctx.game.cards, ctx.game.card(target), ctx.game.card(aura_id),
+    ) {
+        return;
+    }
 
     // Run Attached replacement effects before attaching.
     let mut event = ReplacementEvent::Attached {

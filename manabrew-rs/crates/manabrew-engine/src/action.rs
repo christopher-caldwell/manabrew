@@ -286,9 +286,11 @@ impl GameState {
                         .get(amount_text)
                         .map(|expression| {
                             if matches!(expression.as_str(), "Count$xPaid" | "Count$XPaid") {
-                                card.svars
-                                    .get("XPaid")
-                                    .and_then(|value| value.parse().ok())
+                                // Cast choices belong to this entry's spell,
+                                // not to script variables copied from an old object.
+                                card.cast_sa
+                                    .as_ref()
+                                    .map(|sa| sa.x_mana_cost_paid as i32)
                                     .unwrap_or(0)
                             } else {
                                 expression.parse().unwrap_or_else(|_| {
@@ -461,6 +463,7 @@ impl GameState {
                 || !matches!(dest_zone, ZoneType::Stack | ZoneType::Battlefield))
         {
             self.card_mut(card_id).cast_sa = None;
+            self.card_mut(card_id).svars.remove("XPaid");
         }
         if dest_zone == ZoneType::Graveyard && was_permanent && !is_token {
             self.player_record_permanent_put_into_graveyard(self.card(card_id).owner);
@@ -1647,6 +1650,24 @@ impl GameState {
             }
         }
 
+        // Equipment and Fortifications remain on the battlefield when
+        // protection (or another attachment restriction) makes them illegal.
+        // Auras above instead go to the graveyard.
+        let detach_ids: Vec<CardId> = self.cards.iter()
+            .filter(|c| {
+                c.zone == ZoneType::Battlefield && !c.phased_out
+                    && (c.type_line.has_subtype("Equipment") || c.type_line.has_subtype("Fortification"))
+                    && c.attached_to.is_some_and(|host| {
+                        !can_attachment_remain_attached(&self.cards, c, self.card(host), true)
+                    })
+            })
+            .map(|c| c.id)
+            .collect();
+        for id in detach_ids {
+            self.detach(id);
+            any_changes = true;
+        }
+
         // Check game over
         let alive = self.alive_players();
         if alive.len() <= 1 {
@@ -1857,6 +1878,11 @@ impl GameState {
         let card = &self.cards[card_id.index()];
         let src_zone = card.zone;
         let src_owner = card.controller;
+
+        if src_zone != ZoneType::Library {
+            self.card_mut(card_id).cast_sa = None;
+            self.card_mut(card_id).svars.remove("XPaid");
+        }
 
         self.expire_until_lose_control_keyword_changes(card_id);
         self.cards[card_id.index()].clear_changed_card_keyword_layers();

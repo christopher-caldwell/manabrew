@@ -8,10 +8,9 @@ use crate::spellability::SpellAbility;
 /// Return the list of qualities a `SP$ Protection | Gains$ Choice` ability can
 /// choose from. Mirrors Java `ProtectEffect.getProtectionList(SpellAbility)`.
 ///
-/// When `Choices$` contains `AnyColor`, expands to the five MTG colors. When
-/// `Choices$` contains `CardType`, Java expands to every card type — not yet
-/// implemented here (no `CardType::all()` enumerator). Everything else is a
-/// comma-separated list.
+/// `AnyColor` expands to the five MTG colors and `CardType` to core card types.
+/// Everything else is a literal
+/// quality; never expose the script's category placeholder as a choice.
 pub fn get_protection_list(sa: &SpellAbility) -> Vec<String> {
     let gains = sa.ir.gains.as_deref().unwrap_or("");
     if gains != "Choice" && !gains.contains("chosen color") {
@@ -24,23 +23,16 @@ pub fn get_protection_list(sa: &SpellAbility) -> Vec<String> {
 
     let mut out = Vec::new();
     let choices = sa.ir.choices.as_deref().unwrap_or("");
-    let mut choices_mut = choices.to_string();
-    if choices_mut.contains("AnyColor") {
-        out.extend(
-            ["White", "Blue", "Black", "Red", "Green"]
-                .iter()
-                .map(|s| s.to_string()),
-        );
-        choices_mut = choices_mut.replace("AnyColor,", "").replace("AnyColor", "");
-    }
-    let trimmed = choices_mut.trim().trim_end_matches(',');
-    if !trimmed.is_empty() {
-        out.extend(
-            trimmed
-                .split(',')
-                .map(|c| c.trim().to_string())
-                .filter(|s| !s.is_empty()),
-        );
+    for choice in choices.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        match choice {
+            "AnyColor" => out.extend(["White", "Blue", "Black", "Red", "Green"].map(String::from)),
+            "CardType" => out.extend(
+                forge_foundation::CoreType::ALL
+                    .iter()
+                    .map(|t| t.name().to_string()),
+            ),
+            _ => out.push(choice.to_string()),
+        }
     }
     if out.is_empty() {
         out = ["White", "Blue", "Black", "Red", "Green"]
@@ -49,6 +41,36 @@ pub fn get_protection_list(sa: &SpellAbility) -> Vec<String> {
             .collect();
     }
     out
+}
+
+/// Use the type-choice interface for type qualities, retaining the existing
+/// color interface for color choices. Both targeted and mass grants share it.
+pub(super) fn choose_protection_keyword(
+    ctx: &mut EffectContext,
+    sa: &SpellAbility,
+) -> Option<String> {
+    let gains = sa.ir.gains.as_deref().unwrap_or_default();
+    if !gains.contains("Choice") && !gains.contains("chosen color") {
+        return Some(gains.to_string());
+    }
+    let choices = get_protection_list(sa);
+    let agent = &mut ctx.agents[sa.activating_player.index()];
+    let chosen = if sa
+        .ir
+        .choices
+        .as_deref()
+        .is_some_and(|s| s.split(',').any(|c| c.trim() == "CardType"))
+    {
+        agent.choose_type_for_source(sa.activating_player, "Card", &choices, sa.source)
+    } else {
+        agent.choose_color(sa.activating_player, &choices)
+    };
+    // Protection is a required choice. Guard malformed/cancelled agent replies
+    // with a legal choice, rather than granting an unresolved keyword.
+    let chosen = chosen
+        .filter(|c| choices.contains(c))
+        .or_else(|| choices.first().cloned())?;
+    Some(format!("Protection from {}", chosen.to_lowercase()))
 }
 
 /// End-of-turn revert for Protection. Mirrors the `GameCommand.run()` in Java
@@ -76,8 +98,6 @@ pub fn run(game: &mut crate::game::GameState, card_id: crate::ids::CardId, keywo
 /// `ProtectEffect` class extending `SpellAbilityEffect`.
 #[manabrew_engine_macros::spell_effect(ProtectEffect)]
 fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
-    let controller = sa.activating_player;
-
     // Determine target
     let target = sa
         .target_chosen
@@ -88,12 +108,6 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
             _ => sa.source,
         });
 
-    let gains = sa.ir.gains.clone().unwrap_or_default();
-
-    // Mirrors Java ProtectEffect: `isChoice = sa.getParam("Gains").contains("Choice")`
-    // Handles both `Gains$ Choice` (Gods Willing) and `Gains$ Protection from chosen color`.
-    let is_choice = gains.contains("Choice") || gains.contains("chosen color");
-
     let mut targets = target.into_iter().collect::<Vec<_>>();
     targets.extend(card_util::get_radiance(ctx.game, sa).iter().copied());
     targets.retain(|&id| ctx.game.card(id).zone == ZoneType::Battlefield);
@@ -103,19 +117,9 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
         return;
     }
 
-    if is_choice {
-        let choices = get_protection_list(sa);
-        let chosen = ctx.agents[controller.index()].choose_color(controller, &choices);
-        if let Some(color) = chosen {
-            let prot_kw = format!("Protection from {}", color.to_lowercase());
-            for card_id in targets {
-                ctx.game.card_mut(card_id).add_pump_keyword(&prot_kw);
-            }
-        }
-    } else {
-        // Static protection grant
+    if let Some(keyword) = choose_protection_keyword(ctx, sa) {
         for card_id in targets {
-            ctx.game.card_mut(card_id).add_pump_keyword(&gains);
+            ctx.game.card_mut(card_id).add_pump_keyword(&keyword);
         }
     }
 }
