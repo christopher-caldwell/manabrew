@@ -3,10 +3,9 @@ use forge_foundation::ZoneType;
 
 use super::attack_constraints::AttackConstraints;
 use super::{CombatState, DefenderId, LureType};
-use crate::card::{valid_filter, Card};
+use crate::card::Card;
 use crate::game::GameState;
 use crate::ids::{CardId, PlayerId};
-use crate::staticability::static_ability::StaticMode;
 use crate::staticability::static_ability_cant_attack_block;
 
 pub fn get_available_attackers(game: &GameState, player: PlayerId) -> Vec<CardId> {
@@ -153,53 +152,42 @@ pub fn can_creature_block(game: &GameState, blocker_id: CardId, attacker_id: Car
         return false;
     }
     // CantBlockBy static abilities
-    if cant_block_by(game, attacker_id, blocker_id) {
+    if static_ability_cant_attack_block::cant_block_by(game, &game.cards, attacker, Some(blocker)) {
         return false;
     }
     true
 }
 
-/// Check if any `CantBlockBy` static ability prevents blocking.
-fn cant_block_by(game: &GameState, attacker_id: CardId, blocker_id: CardId) -> bool {
-    let attacker = game.card(attacker_id);
-    let blocker = game.card(blocker_id);
+#[cfg(test)]
+mod relative_block_tests {
+    use super::*;
+    use forge_carddb::parse_card_script;
 
-    for source in game
-        .cards
-        .iter()
-        .filter(|c| c.zone == ZoneType::Battlefield || c.zone == ZoneType::Command)
-    {
-        for sa in &source.static_abilities {
-            if !sa.check_mode(&StaticMode::CantBlockBy) {
-                continue;
-            }
-
-            if let Some(valid_attacker) = sa.ir.valid_attacker.as_ref() {
-                if !valid_filter::matches_valid_card_selector_in_game(
-                    valid_attacker,
-                    attacker,
-                    source,
-                    game,
-                ) {
-                    continue;
-                }
-            }
-
-            if let Some(valid_blocker) = sa.ir.valid_blocker.as_ref() {
-                if !valid_filter::matches_valid_card_selector_in_game(
-                    valid_blocker,
-                    blocker,
-                    source,
-                    game,
-                ) {
-                    continue;
-                }
-            }
-
-            return true;
-        }
+    #[test]
+    fn relative_power_restriction_keeps_small_and_equal_flyers() {
+        let mut game = GameState::new(&["attacker", "defender"], 40);
+        let make = |game: &mut GameState, name: &str, power: i32, flying: bool, player: PlayerId| {
+            let keyword = if flying { "K:Flying\n" } else { "" };
+            let rules = parse_card_script(&format!("Name:{name}\nTypes:Creature\nPT:{power}/4\n{keyword}")).unwrap();
+            let id = game.create_card(Card::from_rules(&rules, player));
+            game.move_card(id, ZoneType::Battlefield, player);
+            id
+        };
+        let attacker = make(&mut game, "Bearer", 4, true, PlayerId(0));
+        let small = make(&mut game, "Small", 2, true, PlayerId(1));
+        let equal = make(&mut game, "Equal", 4, true, PlayerId(1));
+        let large = make(&mut game, "Large", 5, true, PlayerId(1));
+        let ground = make(&mut game, "Ground", 2, false, PlayerId(1));
+        let rules = parse_card_script("Name:Restriction\nTypes:Enchantment\nS:Mode$ CantBlockBy | ValidAttacker$ Creature.YouCtrl | ValidBlockerRelative$ Creature.powerGTX").unwrap();
+        let source = game.create_card(Card::from_rules(&rules, PlayerId(0)));
+        game.move_card(source, ZoneType::Battlefield, PlayerId(0));
+        assert!(can_creature_block(&game, small, attacker));
+        assert!(can_creature_block(&game, equal, attacker));
+        assert!(!can_creature_block(&game, large, attacker));
+        assert!(!can_creature_block(&game, ground, attacker));
+        game.move_card(source, ZoneType::Graveyard, PlayerId(0));
+        assert!(can_creature_block(&game, large, attacker));
     }
-    false
 }
 
 /// Filter blockers to only those that can legally block at least one attacker.

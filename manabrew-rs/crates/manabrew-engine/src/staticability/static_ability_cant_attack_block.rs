@@ -353,10 +353,13 @@ pub fn apply_cant_block_by_ability(
 
     // ValidBlockerRelative — relative to attacker
     if let Some(blocker_card) = blocker {
+        // Relative power comparisons use the other creature's current power as X.
+        let mut relative_attacker = attacker.clone();
+        relative_attacker.set_s_var("X", attacker.power().to_string());
         if !valid_filter::matches_valid_card_selector_opt_in_game(
             st_ab.ir.valid_blocker_relative.as_ref(),
             blocker_card,
-            attacker,
+            &relative_attacker,
             game,
         ) {
             return false;
