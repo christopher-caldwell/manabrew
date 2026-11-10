@@ -33,6 +33,7 @@ pub fn create_permanent_spell(
         api: Some(api),
         source: Some(card_id),
         original_host: None,
+        may_play_source: None,
         activating_player: player,
         targeting_player: None,
         ability_text: String::new(),

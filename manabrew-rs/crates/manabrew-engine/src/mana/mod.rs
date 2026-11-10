@@ -2228,3 +2228,28 @@ mod multi_mode_mana_availability_regression {
     }
 
 }
+
+/// Highest payable announced X for an ordinary cast, using the same restricted
+/// sources, reductions, commander tax and permission checks as the cast path.
+pub fn maximum_cast_x(game: &crate::game::GameState, pool: &ManaPool, card_id: crate::ids::CardId,
+    player: crate::ids::PlayerId) -> u32 {
+    let card = game.card(card_id);
+    let count = card.mana_cost.count_x() as i32;
+    if count == 0 { return 0; }
+    let mut sa = crate::spellability::SpellAbility::new_empty(Some(card_id), player);
+    sa.is_spell = true;
+    let mut context = payment_context_for_sa(game, &sa);
+    context.is_spell = true;
+    let available = calculate_available_mana_with_context(pool, game, player, None, &[], Some(&context));
+    let adjustment = crate::cost::cost_adjustment::compute_cost_adjustment_for_payment(game, card, player, card.zone, &[]);
+    let tax = if card.zone == forge_foundation::ZoneType::Command && game.player_is_commander(player, card_id) {
+        game.player_commander_tax(player, card_id)
+    } else { 0 };
+    (0..=99u32).take_while(|&x| {
+        sa.x_mana_cost_paid = x;
+        let cost = card.mana_cost.without_x().add(&forge_foundation::ManaCost::generic(x as i32 * count + tax));
+        available.can_pay(&adjustment.apply(&cost))
+            && (card.zone != forge_foundation::ZoneType::Graveyard
+                || crate::staticability::static_ability_continuous::play_permission(game, player, card, &sa).is_some())
+    }).last().unwrap_or(0)
+}

@@ -277,6 +277,16 @@ impl SimpleAi {
                 if self.beats_reserve(card, me) {
                     return false;
                 }
+                // The engine's ordinary X cast currently spends the largest feasible X.
+                // Retain that resource if deploying it would consume the held answer.
+                if card.mana_cost.contains('X') {
+                    let count = card.mana_cost.matches('X').count() as u32;
+                    let x = card.maximum_cast_x.unwrap_or_else(|| ((self.mana_sources(me).2 - card.cmc).max(0) as u32) / count.max(1));
+                    if x > 0 && self.cost_affordable(reserve, me) && !self.reserve_spending_window(me) {
+                        let announced = card.mana_cost.replace("{X}", &format!("{{{x}}}"));
+                        return !self.cost_affordable(&format!("{reserve}{announced}"), me);
+                    }
+                }
                 // A cost with {X} or a hybrid symbol counts as its mana value, colorless.
                 Self::spell_cost(card).unwrap_or_else(|| {
                     format!("{{{}}}", card.cmc + card.commander_tax.unwrap_or(0))

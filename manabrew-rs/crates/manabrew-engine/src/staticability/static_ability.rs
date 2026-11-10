@@ -218,6 +218,8 @@ pub struct StaticAbility {
     pub ignore_effect_cards: Vec<CardId>,
     pub ignore_effect_players: Vec<PlayerId>,
     pub may_play_turn: i32,
+    #[serde(default)]
+    pub may_play_usage: Option<(u32, u64, u32)>,
     /// Mirrors `CardTraitBase.sVars` in Java. Populated by the card factory
     /// with the host card's SVar map so that `$`-expressions evaluated under
     /// the ability resolve against the card's SVars (not the ability's
@@ -243,6 +245,8 @@ pub struct StaticAbilityIr {
     pub affected_zones: Vec<ZoneType>,
     pub valid_zone: Vec<ZoneType>,
     pub may_play: bool,
+    pub may_play_limit: Option<u32>,
+    pub valid_after_stack: Option<String>,
     pub may_play_dont_grant_zone_permissions: bool,
     pub may_play_without_mana_cost: bool,
     /// Mana cost string from `MayPlayAltManaCost$` (e.g. Airbend's `2`).
@@ -422,6 +426,8 @@ impl StaticAbilityIr {
             may_play: raw
                 .get(keys::MAY_PLAY)
                 .is_some_and(|value| value.eq_ignore_ascii_case("True")),
+            may_play_limit: raw.get("MayPlayLimit").and_then(|s|s.parse().ok()),
+            valid_after_stack: raw.get("ValidAfterStack").map(String::to_string),
             may_play_dont_grant_zone_permissions: raw
                 .contains_key("MayPlayDontGrantZonePermissions"),
             may_play_without_mana_cost: raw.contains_key("MayPlayWithoutManaCost"),
@@ -758,6 +764,7 @@ impl StaticAbility {
         }
 
         if let Some(condition) = self.ir.condition_text.as_deref() {
+            if condition.eq_ignore_ascii_case("PlayerTurn") && game.turn.active_player != source.controller { return false; }
             if condition.eq_ignore_ascii_case("MaxSpeed")
                 && game.player(source.controller).speed != 4
             {
@@ -1119,6 +1126,7 @@ pub fn parse_static_ability(raw: &str) -> Option<StaticAbility> {
         ignore_effect_cards: Vec::new(),
         ignore_effect_players: Vec::new(),
         may_play_turn: 0,
+        may_play_usage: None,
         svars: HashMap::default(),
         ir,
     };

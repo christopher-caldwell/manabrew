@@ -126,6 +126,14 @@ pub struct TokenCosmeticBinding {
 pub struct GameState {
     // Arenas
     pub cards: Vec<Card>,
+    /// Entry replacements for one simultaneous batch are evaluated before any
+    /// member is committed to the battlefield (CR 614.12).
+    #[serde(skip)]
+    pub(crate) entry_batch: Option<Vec<(CardId, PlayerId, crate::replacement::replacement_handler::ReplacementEvent)>>,
+    #[serde(skip)]
+    pub(crate) entry_batch_parents: Vec<Vec<(CardId, PlayerId, crate::replacement::replacement_handler::ReplacementEvent)>>,
+    #[serde(skip)]
+    pub(crate) prepared_entry: Option<crate::replacement::replacement_handler::ReplacementEvent>,
     pub players: Vec<PlayerState>,
     /// Opt-in rules-event record for observers; see `crate::journal`.
     #[serde(skip)]
@@ -262,6 +270,9 @@ impl GameState {
 
         GameState {
             cards: Vec::new(),
+            entry_batch: None,
+            prepared_entry: None,
+            entry_batch_parents: Vec::new(),
             players,
             journal: None,
             token_cosmetics: BTreeMap::new(),

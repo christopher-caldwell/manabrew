@@ -230,6 +230,7 @@ pub trait TokenEffectBase {
         let pump_keywords = self.pump_keywords(sa);
         let mut result = TokenCreateResult::default();
 
+        ctx.game.begin_entry_batch();
         for cell in token_table.cells().iter().cloned() {
             let script = cell.prototype.get_s_var("TokenScript").map(str::to_owned);
             if let Some(script) = script.as_deref() {
@@ -254,12 +255,15 @@ pub trait TokenEffectBase {
                     continue;
                 };
                 result.created.push(token_id);
-                if self.add_token_to_combat(ctx, sa, token_id) {
-                    result.combat_changed = true;
-                }
             }
         }
 
+        ctx.game.finish_entry_batch(ctx.agents, ctx.trigger_handler);
+        for &token_id in &result.created {
+            if self.add_token_to_combat(ctx, sa, token_id) {
+                result.combat_changed = true;
+            }
+        }
         // Tokens created by this one effect enter simultaneously. Register all
         // their triggers before emitting any of the individual entry events so
         // each entering object can observe its peers entering the battlefield.

@@ -2,7 +2,6 @@ use forge_foundation::{ColorSet, ZoneType};
 
 use super::trait_animate_effect::parse_animate_params;
 use super::EffectContext;
-use crate::ability::ability_ir::DefinedRef;
 use crate::card::card_trait_changes::CardTraitChanges;
 use crate::card::perpetual::perpetual_interface::PerpetualInterface;
 use crate::card::perpetual::{
@@ -95,7 +94,9 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
 
     for card_id in target_ids {
         // Only animate cards on the battlefield
-        if ctx.game.card(card_id).zone != ZoneType::Battlefield {
+        if ctx.game.card(card_id).zone != ZoneType::Battlefield
+            && !(ctx.game.card(card_id).zone == ZoneType::Stack
+                && is_permanent_duration && !parsed_triggers.is_empty()) {
             continue;
         }
 
@@ -274,17 +275,24 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
                 }
             } else {
                 for trig in &parsed_triggers {
-                    ctx.game.card_mut(card_id).add_trigger(trig.clone());
-                    ctx.game.card_mut(card_id).increment_pump_trigger_count();
-                    // Copy the Execute SVar from source to target so trigger resolution
-                    // can find it (e.g. SupernaturalStaminaTrigChangeZone)
-                    if !trig.execute.is_empty() {
-                        if let Some(exec_svar) = source_svars.get(&trig.execute) {
-                            ctx.game
-                                .card_mut(card_id)
-                                .set_s_var_if_absent(trig.execute.clone(), exec_svar.clone());
+                    if is_permanent_duration {
+                        // Capture the granted definition and its sub-ability chain
+                        // without overwriting same-named intrinsic SVars on the recipient.
+                        let mut granted = trig.clone();
+                        if let Some(raw) = source_svars.get(&trig.execute) {
+                            let mut definition_host = ctx.game.card(card_id).clone();
+                            definition_host.svars.extend(source_svars.clone());
+                            definition_host.parsed_svar_cache.clear();
+                            granted.set_overriding_ability(crate::spellability::build_spell_ability_from_host_card(
+                                &definition_host, raw, controller));
                         }
+                        ctx.game.card_mut(card_id).add_object_trigger(granted);
+                    } else {
+                        ctx.game.card_mut(card_id).add_pump_trigger(trig.clone());
                     }
+                }
+                for (key, value) in &source_svars {
+                    ctx.game.card_mut(card_id).set_s_var_if_absent(key.clone(), value.clone());
                 }
             }
             // Re-register this card's triggers so the new ones are active
@@ -348,26 +356,9 @@ fn resolve_animate_targets(
         return vec![target];
     }
 
-    // Check Defined$ param
-    if let Some(defined) = sa.defined_ref() {
-        match defined {
-            DefinedRef::SelfCard => {
-                if let Some(src) = sa.source {
-                    return vec![src];
-                }
-            }
-            DefinedRef::ParentTarget => {
-                if let Some(pt) = ctx.parent_target_card {
-                    return vec![pt];
-                }
-            }
-            DefinedRef::Remembered => {
-                if let Some(src) = sa.source {
-                    return ctx.game.card(src).remembered_cards.clone();
-                }
-            }
-            _ => {}
-        }
+    if sa.defined_ref().is_some() {
+        // An explicit definition must never silently grant to the source.
+        return crate::ability::spell_ability_effect::get_defined_cards_or_targeted(ctx.game, sa);
     }
 
     // Default: animate source card itself

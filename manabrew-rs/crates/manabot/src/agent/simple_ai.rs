@@ -11,6 +11,7 @@ mod payment;
 mod plan;
 mod roles;
 mod threat;
+mod pilot_repair;
 #[cfg(test)]
 mod diagnostic_regressions;
 use roles::Roles;
@@ -859,6 +860,7 @@ impl SimpleAi {
             return true;
         };
         let text = card.text.to_ascii_lowercase();
+        if self.pointless_x_cast(card, player_id) { return false; }
         let own_turn = view.active_player_id == player_id;
         let foreign_stack = view
             .stack
@@ -1149,6 +1151,7 @@ impl SimpleAi {
                 let text = info.description.to_ascii_lowercase();
                 let land_search = text.starts_with("search your library for") && text.contains("land")
                     || ["plains", "island", "swamp", "mountain", "forest"].iter().any(|t| text.starts_with("search your library for a") && text.contains(t));
+                if let Some(score) = self.contextual_activation_score(info, player_id) { return score; }
                 if self.useful_lifelink_activation(info) || self.useful_creature_tutor_sacrifice(info) { 1_000 }
                 // A land fetched before the spells are chosen adds its mana to this turn.
                 else if land_search && info.cost.as_deref().is_some_and(|c| c.contains("CARDNAME")) { 700 }
@@ -1416,6 +1419,7 @@ impl SimpleAi {
 
     fn wasted_activation(&self, info: &ActivatableAbilityInfo) -> bool {
         let text = info.description.to_ascii_lowercase();
+        if self.contextual_activation_score(info, self.card(&info.card_id).map_or("", |c| c.controller_id.as_str())).is_some() { return false; }
         if grants_unblockability(&text) {
             let Some(source) = self.card(&info.card_id) else { return true };
             return !self.battlefield(&source.controller_id)
@@ -2250,6 +2254,7 @@ impl BotAgent for SimpleAi {
                                 &action.kind,
                                 AvailableActionKind::ActivateAbility(info) if self.wasted_activation(info)
                             )
+                            && self.action_score(action, &deciding_player_id) > 0
                             && self.sane(action, &deciding_player_id)
                             && !self.dips_into_reserve(action, &deciding_player_id)
                     })

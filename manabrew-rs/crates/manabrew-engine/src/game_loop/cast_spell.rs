@@ -203,6 +203,13 @@ impl GameLoop {
             game.card_mut(card_id).transform();
         }
 
+        let mut land_sa = SpellAbility::new_land(Some(card_id), player);
+        let permission = crate::staticability::static_ability_continuous::play_permission(game, player, game.card(card_id), &land_sa);
+        if origin_zone != ZoneType::Hand && permission.is_none() { return None; }
+        if let Some((source, index)) = permission {
+            land_sa.may_play_source = Some((source, game.card(source).zone_timestamp));
+            crate::staticability::static_ability_continuous::consume_play_permission(game, source, index);
+        }
         self.move_card_with_runtime(game, card_id, ZoneType::Battlefield, player, agents);
 
         game.player_record_land_play(player);
@@ -225,6 +232,7 @@ impl GameLoop {
             RunParams {
                 card: Some(card_id),
                 player: Some(player),
+                source_sa: Some(land_sa),
                 ..Default::default()
             },
             false,
@@ -1381,6 +1389,13 @@ impl GameLoop {
                 }
                 x
             };
+            let max_x = if original_zone == ZoneType::Graveyard && sa.alt_cost.is_none() {
+                (0..=max_x).rev().find(|&x| {
+                    let mut candidate = sa.clone();
+                    candidate.x_mana_cost_paid = x;
+                    crate::staticability::static_ability_continuous::play_permission(game, player, game.card(card_id), &candidate).is_some()
+                }).unwrap_or(0)
+            } else { max_x };
             x_value = max_x;
             if is_harmonize && x_count == 1 {
                 let colored_requirements = non_x_cost
@@ -1433,6 +1448,15 @@ impl GameLoop {
             .svars
             .insert("XPaid".to_string(), x_value.to_string());
 
+        let permission = if sa.alt_cost.is_none()
+            || sa.alt_cost == Some(crate::spellability::AlternativeCost::Prototype) {
+            crate::staticability::static_ability_continuous::play_permission(game, player, game.card(card_id), &sa)
+        } else { None };
+        // Recheck after X is chosen; off-stack mana value is insufficient.
+        if original_zone == ZoneType::Graveyard && sa.alt_cost.is_none() && permission.is_none() { return None; }
+        if let Some((source, _)) = permission {
+            sa.may_play_source = Some((source, game.card(source).zone_timestamp));
+        }
         let cast_rollback_snapshot = self.make_snapshot(game, true);
         let announced_from_zone = game.card_current_zone(card_id);
         if sa.is_spell && !game.card_is_in_zone(card_id, ZoneType::Stack) {
@@ -2428,6 +2452,9 @@ impl GameLoop {
             }
             game.player_record_spell_cast(player, card_id);
         }
+        if let Some((source, index)) = permission {
+            crate::staticability::static_ability_continuous::consume_play_permission(game, source, index);
+        }
         // Track spell cast on the stack (storm count, etc.)
         game.stack.record_spell_cast(card_id);
 
@@ -2856,7 +2883,7 @@ mod actual_mana_spend_regression {
                     static DELTA_GOAD_LEGAL: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
     thread_local! { static AUTO_ATTACK_TAX: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
     thread_local! { static CONVOKE_FIXTURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; static IMPROVISE_FIXTURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; static NESTED_ABILITY_FIXTURE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) }; static NESTED_ABILITY_FINISH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
-    struct AutoAgent(bool, bool);
+    pub(super) struct AutoAgent(pub(super) bool, pub(super) bool);
 impl PlayerAgent for AutoAgent {
     fn choose_targets_for(
         &mut self,
@@ -2864,6 +2891,9 @@ impl PlayerAgent for AutoAgent {
         game: &GameState,
         _mana_pools: &[ManaPool],
     ) -> bool {
+        if sa.api == Some(crate::ability::api_type::ApiType::DealDamage) {
+            return crate::spellability::choose_targets_by_kind(self, sa, game, _mana_pools);
+        }
         if sa.api == Some(crate::ability::api_type::ApiType::Counter) {
             sa.target_chosen.target_stack_entry = game.stack.iter().find(|entry| !entry.is_pending_cast).map(|entry| entry.id);
             sa.target_chosen.target_stack_entry.is_some()
@@ -3769,3 +3799,7 @@ impl PlayerAgent for AutoAgent {
     }
 
 }
+
+#[cfg(test)]
+#[path = "pilot_repair_regressions.rs"]
+mod pilot_repair_regressions;

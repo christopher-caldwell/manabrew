@@ -16,6 +16,23 @@ use crate::trigger::TriggerType;
 
 /// Game state mutation methods — moving cards, dealing damage, state-based actions.
 impl GameState {
+    pub(crate) fn begin_entry_batch(&mut self) {
+        if let Some(parent) = self.entry_batch.take() { self.entry_batch_parents.push(parent); }
+        self.entry_batch = Some(Vec::new());
+    }
+
+    pub(crate) fn finish_entry_batch(&mut self, agents: &mut [Box<dyn PlayerAgent>], handler: &mut TriggerHandler) {
+        let entries = self.entry_batch.take().expect("entry batch");
+        for (id, owner, event) in entries {
+            // Keep properties assigned by token creation after preparing entry.
+            let tapped = self.card(id).tapped;
+            self.prepared_entry = Some(event);
+            self.move_card_internal(id, ZoneType::Battlefield, owner, Some(agents), Some(handler), false, false);
+            if tapped { self.tap(id); }
+        }
+        self.entry_batch = self.entry_batch_parents.pop();
+    }
+
     pub fn record_player_damage_assignment(
         &mut self,
         source: Option<CardId>,
@@ -173,7 +190,7 @@ impl GameState {
     ) -> ZoneType {
         let from = self.cards[card_id.index()].zone;
         let to = self.move_card_unjournaled(card_id, dest_zone, dest_owner, agents, trigger_handler, apply_move_replacement, is_discard);
-        if self.journal.is_some() {
+        if self.journal.is_some() && self.entry_batch.is_none() {
             let controller = self.cards[card_id.index()].controller;
             self.journal_push(crate::journal::JournalEvent::ZoneChange { card: card_id, from, to, controller });
         }
@@ -338,7 +355,7 @@ impl GameState {
                 counters: etb_counters,
             }]
         });
-        let mut moved_event = ReplacementEvent::Moved {
+        let mut moved_event = self.prepared_entry.take().unwrap_or_else(|| ReplacementEvent::Moved {
             card: card_id,
             origin: src_zone,
             destination: dest_zone,
@@ -347,13 +364,19 @@ impl GameState {
             counter_cause,
             counter_is_effect: dest_zone == ZoneType::Battlefield,
             after_replacement_static_abilities: Vec::new(),
-        };
+        });
         let tapped_before_replacement = self.card(card_id).tapped;
         if apply_move_replacement {
             if let Some(agents) = agents.as_deref_mut() {
                 apply_replacements_with_agents(self, agents, &mut moved_event);
             } else {
                 apply_replacements(self, &mut moved_event);
+            }
+        }
+        if dest_zone == ZoneType::Battlefield && src_zone != ZoneType::Battlefield {
+            if let Some(batch) = self.entry_batch.as_mut() {
+                batch.push((card_id, dest_owner, moved_event));
+                return dest_zone;
             }
         }
         let (dest_zone, etb_counter_map, counter_cause, after_replacement_static_abilities) =
@@ -372,6 +395,12 @@ impl GameState {
                 ),
                 _ => (dest_zone, None, None, Vec::new()),
             };
+        if src_zone == ZoneType::Battlefield && dest_zone != ZoneType::Battlefield {
+            if let Some(handler) = trigger_handler.as_deref_mut() {
+                handler.match_object_departure(self, card_id, dest_zone);
+            }
+            self.card_mut(card_id).clear_object_triggers();
+        }
         let adventure_exile = src_zone == ZoneType::Stack
             && dest_zone == ZoneType::Exile
             && self.card(card_id).on_adventure;

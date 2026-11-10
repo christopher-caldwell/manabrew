@@ -10,12 +10,15 @@ use super::trigger::{Trigger, TriggerBehavior};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TriggerLandPlayed {
+    #[serde(default)]
+    pub valid_sa: Option<String>,
     pub valid_card: Option<crate::parsing::CompiledSelector>,
 }
 
 impl TriggerLandPlayed {
     pub fn parse(params: &Params) -> Box<dyn TriggerBehavior> {
         Box::new(Self {
+            valid_sa: params.get_cloned(keys::VALID_SA),
             valid_card: params.selector_cloned(keys::VALID_CARD),
         })
     }
@@ -28,6 +31,11 @@ impl TriggerBehavior for TriggerLandPlayed {
     }
 
     fn perform_test(&self, trigger: &Trigger, params: &RunParams, game: &GameState) -> bool {
+        if let Some(valid) = &self.valid_sa {
+            let Some(sa) = params.source_sa.as_ref().or(params.spell_ability.as_ref()) else { return false; };
+            let source = trigger.base.card_trait_base.host_card(game);
+            if !crate::spellability::matches_valid_sa(valid, sa, source, sa.source.map(|id| game.card(id))) { return false; }
+        }
         let _host_card = trigger.base.card_trait_base.host_card_id();
         let _host_controller = trigger.base.card_trait_base.host_controller(game);
         trigger.matches_optional_valid_card_filter(&self.valid_card, params.card, game)
@@ -41,7 +49,7 @@ impl TriggerBehavior for TriggerLandPlayed {
         _game: &GameState,
     ) {
         if let Some(card) = params.card {
-            sa.set_triggering_object(crate::ability::AbilityKey::Card, card.0.to_string());
+            sa.set_triggering_object(crate::ability::AbilityKey::Card, card);
         }
     }
 

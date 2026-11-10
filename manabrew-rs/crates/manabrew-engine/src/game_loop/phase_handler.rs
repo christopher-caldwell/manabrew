@@ -354,6 +354,7 @@ impl GameLoop {
             game.remove_card_from_zone(ZoneType::Command, controller, id);
             game.card_mut(id).set_zone(ZoneType::None);
         }
+        crate::staticability::layer::apply_continuous_effects(game);
     }
 
     pub fn step_untap(&mut self, game: &mut GameState, agents: &mut [Box<dyn PlayerAgent>]) {

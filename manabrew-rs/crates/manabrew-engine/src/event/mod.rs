@@ -339,11 +339,11 @@ pub struct RunParams {
 impl RunParams {
     pub fn add_common_trigger_objects(&self, sa: &mut crate::spellability::SpellAbility) {
         if let Some(card_id) = self.card {
-            sa.set_triggering_object(crate::ability::AbilityKey::Card, card_id.0.to_string());
-            sa.set_triggering_object(crate::ability::AbilityKey::NewCard, card_id.0.to_string());
+            sa.set_triggering_object(crate::ability::AbilityKey::Card, card_id);
+            sa.set_triggering_object(crate::ability::AbilityKey::NewCard, card_id);
         }
         if let Some(card_id) = self.card_lki {
-            sa.set_triggering_object(crate::ability::AbilityKey::CardLKI, card_id.0.to_string());
+            sa.set_triggering_object(crate::ability::AbilityKey::CardLKI, card_id);
         }
         if let Some(player_id) = self.activator.or(self.cause_player) {
             sa.set_triggering_object(

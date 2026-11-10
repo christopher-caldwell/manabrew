@@ -362,6 +362,8 @@ pub struct Card {
     /// Number of triggers added temporarily by `DB$ Animate | Triggers$` effects.
     /// At cleanup, this many triggers are popped from the end of the `triggers` vec.
     pub pump_trigger_count: usize,
+    #[serde(default)]
+    pub object_trigger_count: usize,
 
     // Abilities (raw strings from card definition)
     pub abilities: Vec<String>,
@@ -864,6 +866,7 @@ impl Card {
             until_lose_control_keyword_changes: Vec::new(),
             changed_card_keywords: BTreeMap::new(),
             pump_trigger_count: 0,
+            object_trigger_count: 0,
             abilities,
             action_spell_specs: Vec::new(),
             action_spell_cost: None,
@@ -1219,6 +1222,23 @@ impl Card {
         self.pump_trigger_count += 1;
     }
 
+    /// An ability granted to this battlefield object, lasting until it changes zones.
+    pub fn add_object_trigger(&mut self, mut trigger: Trigger) {
+        trigger.bind_host_card_id(self.id);
+        let index = self.base_trigger_count.min(self.triggers.len());
+        self.triggers.insert(index, trigger);
+        self.base_trigger_count += 1;
+        self.object_trigger_count += 1;
+    }
+
+    pub fn clear_object_triggers(&mut self) {
+        let end = self.base_trigger_count.min(self.triggers.len());
+        let start = end.saturating_sub(self.object_trigger_count);
+        self.triggers.drain(start..end);
+        self.base_trigger_count = start;
+        self.object_trigger_count = 0;
+    }
+
     pub fn clear_pump_triggers(&mut self) {
         let count = self.pump_trigger_count;
         if count == 0 {
@@ -1233,7 +1253,13 @@ impl Card {
     pub fn copiable_triggers(&self) -> Vec<Trigger> {
         self.trait_base_triggers
             .clone()
-            .unwrap_or_else(|| self.triggers.clone())
+            .unwrap_or_else(|| {
+                let end = self.base_trigger_count;
+                let start = end.saturating_sub(self.object_trigger_count);
+                self.triggers.iter().enumerate()
+                    .filter(|(idx, _)| *idx < start || *idx >= end)
+                    .map(|(_, trigger)| trigger.clone()).collect()
+            })
     }
 
     pub fn copiable_replacement_effects(&self) -> Vec<ReplacementEffect> {

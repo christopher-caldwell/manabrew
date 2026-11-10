@@ -435,6 +435,10 @@ pub struct CardDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub effective_mana_cost: Option<String>,
+    /// Payable ordinary-cast X, including restricted sources and zone permission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub maximum_cast_x: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub commander_tax: Option<i32>,

@@ -7,6 +7,7 @@
 use forge_foundation::ZoneType;
 
 use crate::card::{valid_filter, Card};
+use crate::game::GameState;
 use crate::combat::DefenderId;
 use crate::staticability::StaticMode;
 
@@ -19,12 +20,12 @@ use crate::staticability::StaticMode;
 /// ```text
 /// S:Mode$ CantAttackUnless | ValidCard$ Creature | Target$ You | Cost$ 2
 /// ```
-pub fn get_attack_cost(cards: &[Card], attacker: &Card, defender: DefenderId) -> i32 {
+pub fn get_attack_cost(game: &GameState, attacker: &Card, defender: DefenderId) -> i32 {
     let mut total_cost = 0;
 
-    for source in cards.iter().filter(|c| c.zone == ZoneType::Battlefield) {
+    for source in game.cards.iter().filter(|c| c.zone == ZoneType::Battlefield) {
         for sa in &source.static_abilities {
-            if !sa.check_mode(&StaticMode::CantAttackUnless) {
+            if !sa.check_conditions_full(&StaticMode::CantAttackUnless, source, game) {
                 continue;
             }
 
@@ -37,17 +38,16 @@ pub fn get_attack_cost(cards: &[Card], attacker: &Card, defender: DefenderId) ->
                 continue;
             }
 
-            // Target selectors are relative to the static ability's controller.
-            // A permanent defender is represented by its controlling player.
-            let defending_player = match defender {
-                DefenderId::Player(pid) => pid,
-                DefenderId::Permanent(cid) => cards[cid.index()].controller,
-            };
-            if !valid_filter::matches_valid_player_opt(
-                sa.ir.target_text.as_deref(),
-                defending_player,
-                source.controller,
-            ) {
+            // A target selector may contain both player and permanent alternatives.
+            // Match each against the actual defender, not its controller: otherwise
+            // a permanent-only alternative can erroneously match any player.
+            let target_matches = sa.ir.target_text.as_deref().map_or(true, |target| {
+                target.split(',').any(|part| match defender {
+                    DefenderId::Player(pid) => valid_filter::matches_valid(part.trim(), None, Some(pid), source, source.controller),
+                    DefenderId::Permanent(cid) => valid_filter::matches_valid(part.trim(), Some(game.card(cid)), None, source, source.controller),
+                })
+            });
+            if !target_matches {
                 continue;
             }
 
@@ -79,8 +79,8 @@ mod scoped_tax_regression {
         let t = game.create_card(Card::from_rules(&tax, PlayerId(1)));
         game.move_card(a, ZoneType::Battlefield, PlayerId(0));
         game.move_card(t, ZoneType::Battlefield, PlayerId(1));
-        assert_eq!(get_attack_cost(&game.cards, game.card(a), DefenderId::Player(PlayerId(1))), 2);
-        assert_eq!(get_attack_cost(&game.cards, game.card(a), DefenderId::Player(PlayerId(2))), 0);
+        assert_eq!(get_attack_cost(&game, game.card(a), DefenderId::Player(PlayerId(1))), 2);
+        assert_eq!(get_attack_cost(&game, game.card(a), DefenderId::Player(PlayerId(2))), 0);
     }
     #[test]
     fn player_qualified_target_is_relative_to_tax_source() {
@@ -91,8 +91,27 @@ mod scoped_tax_regression {
         let t = game.create_card(Card::from_rules(&tax, PlayerId(1)));
         game.move_card(a, ZoneType::Battlefield, PlayerId(0));
         game.move_card(t, ZoneType::Battlefield, PlayerId(1));
-        assert_eq!(get_attack_cost(&game.cards, game.card(a), DefenderId::Player(PlayerId(1))), 1);
-        assert_eq!(get_attack_cost(&game.cards, game.card(a), DefenderId::Player(PlayerId(2))), 0);
+        assert_eq!(get_attack_cost(&game, game.card(a), DefenderId::Player(PlayerId(1))), 1);
+        assert_eq!(get_attack_cost(&game, game.card(a), DefenderId::Player(PlayerId(2))), 0);
+    }
+
+    #[test]
+    fn mixed_player_and_planeswalker_targets_keep_their_scope() {
+        let mut game = GameState::new(&["A", "B", "C"], 40);
+        let creature = parse_card_script("Name:Attacker\nTypes:Creature Human\nPT:2/2").unwrap();
+        let tax = parse_card_script("Name:Tax\nTypes:Creature Angel\nPT:3/5\nS:Mode$ CantAttackUnless | IsPresent$ Card.Self+untapped | ValidCard$ Creature | Target$ You,Planeswalker.YouCtrl | Cost$ 1").unwrap();
+        let walker = parse_card_script("Name:Walker\nTypes:Planeswalker\nLoyalty:3").unwrap();
+        let a = game.create_card(Card::from_rules(&creature, PlayerId(1)));
+        let t = game.create_card(Card::from_rules(&tax, PlayerId(0)));
+        let w = game.create_card(Card::from_rules(&walker, PlayerId(0)));
+        let other = game.create_card(Card::from_rules(&walker, PlayerId(2)));
+        for (id, owner) in [(a, PlayerId(1)), (t, PlayerId(0)), (w, PlayerId(0)), (other, PlayerId(2))] { game.move_card(id, ZoneType::Battlefield, owner); }
+        assert_eq!(get_attack_cost(&game, game.card(a), DefenderId::Player(PlayerId(0))), 1);
+        assert_eq!(get_attack_cost(&game, game.card(a), DefenderId::Player(PlayerId(2))), 0);
+        assert_eq!(get_attack_cost(&game, game.card(a), DefenderId::Permanent(w)), 1);
+        assert_eq!(get_attack_cost(&game, game.card(a), DefenderId::Permanent(other)), 0);
+        game.tap(t);
+        assert_eq!(get_attack_cost(&game, game.card(a), DefenderId::Player(PlayerId(0))), 0);
     }
 
 }

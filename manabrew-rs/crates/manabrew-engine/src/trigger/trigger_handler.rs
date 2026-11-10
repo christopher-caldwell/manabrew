@@ -169,6 +169,7 @@ pub struct TriggerHandler {
     /// Tuple: (PendingTrigger, controller, zone timestamp, trigger bucket, trigger order).
     pre_matched_triggers: Vec<MatchedTrigger>,
     deferred_departures: Vec<DeferredDepartureBatch>,
+    object_departures: HashSet<(CardId, u64)>,
     // Trigger-event limits are distinct from activated-ability counters. The
     // zone timestamp identifies a new object after a zone change.
     trigger_counts: HashMap<(CardId, u64, u32), (u32, u32, u32)>,
@@ -187,6 +188,7 @@ impl TriggerHandler {
             next_trigger_id: 0,
             pre_matched_triggers: Vec::new(),
             deferred_departures: Vec::new(),
+            object_departures: HashSet::default(),
             trigger_counts: HashMap::default(),
         }
     }
@@ -308,6 +310,24 @@ impl TriggerHandler {
         self.pre_matched_triggers.extend(matched);
     }
 
+    /// Match object-lifetime grants before movement clears them, retaining the
+    /// pending ability rather than leaving an ability on the new zone object.
+    pub(crate) fn match_object_departure(&mut self, game: &GameState, id: CardId, destination: ZoneType) {
+        let card = game.card(id);
+        if card.object_trigger_count == 0 { return; }
+        let start = card.base_trigger_count.saturating_sub(card.object_trigger_count);
+        let refs = (start..card.base_trigger_count).map(|idx|(id,idx)).collect();
+        let event = TriggerWaiting { mode: TriggerType::ChangesZone,
+            params: RunParams { card: Some(id), card_lki: Some(id), origin: Some(ZoneType::Battlefield),
+                destination: Some(destination), lki_power: Some(card.power()), lki_toughness: Some(card.toughness()),
+                ..Default::default() }, trigger_refs: Some(refs) };
+        let saved = std::mem::replace(&mut self.waiting_triggers, vec![event]);
+        let matched = self.match_waiting_triggers(game);
+        self.pre_matched_triggers.extend(matched);
+        self.waiting_triggers = saved;
+        self.object_departures.insert((id, card.zone_timestamp));
+    }
+
     /// Retain the pre-departure object context and actual destinations until
     /// the effect resolution unwinds; matching deep inside nested effects can
     /// exhaust the engine's stack, and must not run any ability early.
@@ -324,7 +344,21 @@ impl TriggerHandler {
             lki.cards[old.id.index()] = snapshot;
         }
         self.reset_active_triggers(before);
-        let waiting = events.into_iter().map(|(mode,params)|self.build_waiting_trigger(mode,params)).collect();
+        let waiting = events.into_iter().map(|(mode,params)| {
+            let mut event = self.build_waiting_trigger(mode,params);
+            let mut refs: Vec<_> = event.trigger_refs.take().unwrap_or_else(||
+                self.active_triggers.iter().map(|a|(a.card_id,a.trigger_index)).collect());
+            refs.extend(self.ltb_trigger_refs_for_event(&lki,&event));
+            refs.sort_unstable(); refs.dedup();
+            refs.retain(|&(id,idx)| {
+                let old = before.card(id);
+                !(self.object_departures.contains(&(id, old.zone_timestamp))
+                    && idx >= old.base_trigger_count.saturating_sub(old.object_trigger_count)
+                    && idx < old.base_trigger_count)
+            });
+            event.trigger_refs = Some(refs);
+            event
+        }).collect();
         let active = std::mem::replace(&mut self.active_triggers,saved_active);
         self.deferred_departures.push(DeferredDepartureBatch {lki,active,waiting});
     }

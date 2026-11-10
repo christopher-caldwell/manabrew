@@ -95,6 +95,7 @@ fn matches_property_token_positive(
     ability_host: Option<&Card>,
 ) -> bool {
     match token.to_ascii_lowercase().as_str() {
+        "mayplaysource" => sa.may_play_source == Some((source.id, source.zone_timestamp)),
         "self" => ability_host.is_some_and(|host| host.id == source.id),
         "youctrl" => sa.activating_player == source.controller,
         "oppctrl" => sa.activating_player != source.controller,
@@ -114,6 +115,12 @@ fn matches_property_token_positive(
             ability_host.is_some_and(|host| host.type_line.has_subtype(token))
         }
         _ => {
+            if let Some(cmp) = token.strip_prefix("cmc") {
+                if let Some(host) = ability_host {
+                    let mv = host.mana_value() + host.mana_cost.count_x() as i32 * sa.x_mana_cost_paid as i32;
+                    return crate::parsing::compare::compare_expr(mv, cmp);
+                }
+            }
             if sa.has_property(token) {
                 return true;
             }

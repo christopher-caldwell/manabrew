@@ -991,7 +991,14 @@ impl Trigger {
     ) -> SpellAbility {
         let host = game.card(host_card);
         let (mut sa, svar_text) = if let Some(overriding_ability) = self.get_overriding_ability() {
-            (overriding_ability.clone(), String::new())
+            let mut captured = overriding_ability.clone();
+            let mut node = Some(&mut captured);
+            while let Some(ability) = node {
+                ability.source = Some(host_card);
+                ability.activating_player = host_controller;
+                node = ability.sub_ability.as_deref_mut();
+            }
+            (captured, String::new())
         } else {
             let door = self.base.card_trait_base.get_card_state_name();
             let room_face = door.and_then(|door| host.room_face(door));

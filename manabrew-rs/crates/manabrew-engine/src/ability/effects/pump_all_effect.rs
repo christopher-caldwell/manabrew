@@ -112,6 +112,27 @@ fn resolve(ctx: &mut EffectContext, sa: &crate::spellability::SpellAbility) {
         }
     }
 
+    if sa.ir.duration == Some(crate::spellability::AbilityDuration::UntilYourNextTurn)
+        && !to_pump.is_empty() {
+        // A resolved pump affects this fixed set of objects. Model the longer
+        // duration with the existing command-effect lifetime, rather than the
+        // modifiers that Cleanup clears every turn.
+        let mut effect = crate::card::Card::new(
+            CardId(0), "Continuous pump".into(), sa.activating_player,
+            forge_foundation::CardTypeLine::parse("Effect"), forge_foundation::ManaCost::parse(""),
+            forge_foundation::ColorSet::COLORLESS, None, None, Vec::new(), Vec::new());
+        effect.remembered_cards = to_pump;
+        effect.forget_on_moved_origin = Some(pump_zone);
+        effect.exile_when_no_remembered = true;
+        effect.temp_effect_until_next_turn_of = Some(sa.activating_player);
+        let raw = format!("Mode$ Continuous | EffectZone$ Command | AffectedZone$ {pump_zone:?} | Affected$ Card | AffectedDefined$ Remembered | AddPower$ {att_bonus} | AddToughness$ {def_bonus} | AddKeyword$ {}", keywords.join(" & "));
+        effect.set_static_abilities(vec![crate::staticability::parse_static_ability(&raw).expect("pump static")]);
+        let id = ctx.game.create_card(effect);
+        ctx.game.move_card(id, ZoneType::Command, sa.activating_player);
+        crate::staticability::layer::apply_continuous_effects(ctx.game);
+        return;
+    }
+
     // Pass 2 — apply modifiers
     for card_id in to_pump {
         if ctx.game.card(card_id).zone != pump_zone {

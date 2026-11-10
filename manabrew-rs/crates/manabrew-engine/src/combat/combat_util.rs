@@ -421,7 +421,7 @@ pub fn check_propaganda_effects(
     defender: DefenderId,
 ) -> bool {
     let attacker = game.card(attacker_id);
-    let cost = super::attack_cost::get_attack_cost(&game.cards, attacker, defender);
+    let cost = super::attack_cost::get_attack_cost(game, attacker, defender);
     cost == 0
 }
 
@@ -429,7 +429,7 @@ pub fn check_propaganda_effects(
 pub fn pay_required_block_costs(game: &GameState, blocker_id: CardId, attacker_id: CardId) -> bool {
     let blocker = game.card(blocker_id);
     let attacker = game.card(attacker_id);
-    let cost = super::block_cost::get_block_cost(&game.cards, blocker, attacker);
+    let cost = super::block_cost::get_block_cost(game, blocker, attacker);
     cost == 0
 }
 

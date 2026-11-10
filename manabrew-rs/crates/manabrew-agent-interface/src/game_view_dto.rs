@@ -885,6 +885,7 @@ fn card_to_dto_with_face_visibility(
         is_ring_bearer: game.player(card.controller).ring_bearer == Some(cid),
         commander_tax: (!card.face_down && game.player_is_commander(card.owner, cid))
             .then(|| game.player_commander_tax(card.owner, cid)),
+        maximum_cast_x: None,
         effective_mana_cost: {
             let is_command_zone_commander =
                 card.zone == ZoneType::Command && game.player_is_commander(card.controller, cid);
@@ -976,7 +977,14 @@ impl GameViewDtoExt for GameViewDto {
                         || card_face_visible_to(game.card(cid), Some(human_player))
                 })
                 .map(|&cid| {
-                    CardView::Visible(card_to_dto_for_viewer(game, cid, Some(human_player)))
+                    let mut dto = card_to_dto_for_viewer(game, cid, Some(human_player));
+                    let card = game.card(cid);
+                    if card.mana_cost.count_x() > 0 && pid == human_player
+                        && matches!(zone, ZoneType::Hand | ZoneType::Graveyard | ZoneType::Command | ZoneType::Exile) {
+                        let pool = mana_pools.get(pid.index()).cloned().unwrap_or_default();
+                        dto.maximum_cast_x = Some(manabrew_engine::mana::maximum_cast_x(game, &pool, cid, pid));
+                    }
+                    CardView::Visible(dto)
                 })
                 .collect();
             let count = zone_cards.len();

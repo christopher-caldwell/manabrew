@@ -108,6 +108,9 @@ pub struct SpellAbility {
     /// Used by costs like `Unattach<OriginalHost>`.
     #[serde(default)]
     pub original_host: Option<CardId>,
+    /// Exact permission source object used to announce this play.
+    #[serde(default)]
+    pub may_play_source: Option<(CardId, u64)>,
     /// The player who activated/cast this. Mirrors Java's `activatingPlayer`.
     pub activating_player: PlayerId,
     /// The player who chooses this ability's targets. Mirrors Java's
@@ -591,6 +594,7 @@ impl SpellAbility {
             api,
             source,
             original_host: None,
+            may_play_source: None,
             activating_player: player,
             targeting_player: None,
             ability_text: ability_text.to_string(),

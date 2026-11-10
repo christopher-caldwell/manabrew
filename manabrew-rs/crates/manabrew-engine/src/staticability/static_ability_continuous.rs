@@ -28,6 +28,12 @@ pub fn can_play(st_ab: &StaticAbility, source: &Card, card: &Card, game: &GameSt
     if !st_ab.ir.may_play || !st_ab.check_conditions(source, game) {
         return false;
     }
+    if let Some(limit) = st_ab.ir.may_play_limit {
+        if st_ab.may_play_usage.is_some_and(|(turn, object, used)|
+            turn == game.turn.turn_number && object == source.zone_timestamp && used >= limit) {
+            return false;
+        }
+    }
     // Check AffectedZone$ — the zone where the affected cards must be.
     // Default is Hand if not specified (normal MayPlay like casting from hand).
     if !st_ab.ir.affected_zones.is_empty() {
@@ -76,7 +82,7 @@ pub fn can_play_or_granted(
         .any(|granted| can_play(&granted, source, card, game))
 }
 
-fn can_play_spell(
+pub(crate) fn can_play_spell(
     st_ab: &StaticAbility,
     source: &Card,
     card: &Card,
@@ -84,6 +90,9 @@ fn can_play_spell(
     spell: &crate::spellability::SpellAbility,
 ) -> bool {
     can_play(st_ab, source, card, game)
+        && (spell.is_land_ability || st_ab.ir.valid_after_stack.as_deref().is_none_or(|valid| {
+            crate::spellability::matches_valid_sa(valid, spell, source, Some(card))
+        }))
         && !st_ab.ir.may_play_dont_grant_zone_permissions
         && st_ab.ir.valid_sa.as_deref().is_none_or(|valid| {
             crate::spellability::matches_valid_sa(valid, spell, source, Some(card))
@@ -196,4 +205,22 @@ pub fn may_play_alt_mana_cost(
 
 pub fn run(st_ab: &StaticAbility, source: &Card, game: &GameState) -> bool {
     st_ab.check_conditions(source, game)
+}
+
+/// Select a zone permission before the object moves, retaining its provenance.
+pub(crate) fn play_permission(game: &GameState, player: crate::ids::PlayerId, card: &Card,
+    spell: &crate::spellability::SpellAbility) -> Option<(crate::ids::CardId, usize)> {
+    game.cards_in_zone(forge_foundation::ZoneType::Battlefield, player).iter()
+        .chain(game.cards_in_zone(forge_foundation::ZoneType::Command, player))
+        .find_map(|&id| game.card(id).static_abilities.iter().enumerate()
+            .find(|(_, st)| can_play_spell(st, game.card(id), card, game, spell))
+            .map(|(idx, _)| (id, idx)))
+}
+
+pub(crate) fn consume_play_permission(game: &mut GameState, source: crate::ids::CardId, index: usize) {
+    let turn = game.turn.turn_number;
+    let object = game.card(source).zone_timestamp;
+    let st = &mut game.card_mut(source).static_abilities[index];
+    let used = st.may_play_usage.filter(|(t,o,_)| *t == turn && *o == object).map_or(0, |(_,_,n)| n);
+    st.may_play_usage = Some((turn, object, used + 1));
 }

@@ -390,7 +390,7 @@ impl GameLoop {
             let mut cost_failures = Vec::new();
             for &(attacker_id, defender) in &chosen_attackers {
                 let cost = combat::attack_cost::get_attack_cost(
-                    &game.cards,
+                    game,
                     game.card(attacker_id),
                     defender,
                 );
@@ -870,21 +870,188 @@ impl GameLoop {
                 // Block cost checking (War Cadence effects)
                 {
                     let mut block_cost_failures = Vec::new();
-                    for &(blocker_id, attacker_id) in &self.combat.blockers {
+                    for (blocker_id, attacker_id) in self.combat.blockers.clone() {
                         if game.card(blocker_id).controller != defending { continue; }
                         let cost = combat::block_cost::get_block_cost(
-                            &game.cards,
+                            game,
                             game.card(blocker_id),
                             game.card(attacker_id),
                         );
                         if cost > 0 {
                             let controller = game.card(blocker_id).controller;
-                            let pool = &mut self.mana_pools[controller.index()];
-                            if pool.total_mana() >= cost {
-                                pool.spend_generic(cost);
-                            } else {
-                                block_cost_failures.push(blocker_id);
+                            let blocker_name = game.card(blocker_id).card_name.clone();
+                            let description = format!("Pay {{{cost}}} to block with {blocker_name}");
+                    // A declined mana activation is unavailable until another action changes the payment state.
+                    let mut rejected = crate::det::HashSet::default();
+                    let mut invalid_actions = 0;
+                    loop {
+                        let mut tappable_lands = self.get_tappable_lands(game, controller);
+                        let pool_snapshot = self.pool(controller).clone();
+                        let untappable_lands =
+                            self.get_untappable_lands(game, controller, &pool_snapshot);
+                        let pool_total = self.pool(controller).total_mana();
+                        let mut mana_payment_sources =
+                            crate::mana::collect_mana_payment_sources(game, controller, &[]);
+                        mana_payment_sources.mana_ability_options.retain(|option|
+                            !rejected.contains(&(option.card_id, option.ability_index)));
+                        tappable_lands.retain(|id| {
+                            !rejected.iter().any(|(source, _)| source == id)
+                                || mana_payment_sources.mana_ability_options.iter().any(|option| option.card_id == *id)
+                        });
+
+                        agents[controller.index()].snapshot_state(game, &self.mana_pools);
+                        let action = agents[controller.index()].pay_combat_cost(
+                            controller,
+                            blocker_id,
+                            cost,
+                            &description,
+                            &mana_payment_sources.mana_ability_options,
+                            &tappable_lands,
+                            &untappable_lands,
+                            pool_total,
+                        );
+
+                        match action {
+                            CombatCostAction::TapLand {
+                                card_id: land_id,
+                                mana_ability_index,
+                                express_choice,
+                            } => {
+                                if !tappable_lands.contains(&land_id)
+                                    || mana_ability_index.is_some_and(|idx| rejected.contains(&(land_id, idx))) {
+                                    invalid_actions += 1;
+                                    if invalid_actions > 3 { block_cost_failures.push(blocker_id); break; }
+                                    continue;
+                                }
+                                let undo_record =
+                                    self.begin_mana_undo_action(game, controller, land_id);
+                                let pool_snapshot = self.pool(controller).begin_tap_tracking();
+                                // Use actual mana ability when available
+                                let mana_ab = {
+                                    let c = game.card(land_id);
+                                    if let Some(requested_idx) = mana_ability_index {
+                                        c.activated_abilities
+                                            .iter()
+                                            .find(|ab| {
+                                                ab.is_mana_ability
+                                                    && ab.ability_index == requested_idx
+                                            })
+                                            .cloned()
+                                    } else {
+                                        c.activated_abilities
+                                            .iter()
+                                            .find(|ab| ab.is_mana_ability && !rejected.contains(&(land_id, ab.ability_index)))
+                                            .cloned()
+                                    }
+                                };
+                                if let Some(ab) = mana_ab {
+                                    let resolved = self.with_shared_state_mutation(
+                                        game,
+                                        agents,
+                                        |this, game, agents| {
+                                            this.resolve_mana_ability(
+                                                game,
+                                                agents,
+                                                controller,
+                                                land_id,
+                                                &ab,
+                                                express_choice,
+                                            )
+                                        },
+                                    );
+                                    if resolved {
+                                        rejected.clear();
+                                        invalid_actions = 0;
+                                    } else {
+                                        rejected.insert((land_id, ab.ability_index));
+                                    }
+                                } else {
+                                    let atom_opt = {
+                                        let c = game.card(land_id);
+                                        if c.is_land() && !c.tapped {
+                                            basic_land_mana_atom(c)
+                                        } else {
+                                            None
+                                        }
+                                    };
+                                    if let Some(atom) = atom_opt {
+                                        rejected.clear();
+                                        invalid_actions = 0;
+                                        game.tap(land_id);
+                                        self.pool_mut(controller).add(atom, 1);
+                                        self.trigger_handler.run_trigger(
+                                            TriggerType::Taps,
+                                            RunParams {
+                                                card: Some(land_id),
+                                                player: Some(controller),
+                                                ..Default::default()
+                                            },
+                                            false,
+                                        );
+                                        self.trigger_handler.run_trigger(
+                                            TriggerType::TapsForMana,
+                                            RunParams {
+                                                card: Some(land_id),
+                                                player: Some(controller),
+                                                ..Default::default()
+                                            },
+                                            false,
+                                        );
+                                    }
+                                }
+                                let produced =
+                                    self.pool(controller).end_tap_tracking(&pool_snapshot);
+                                self.finish_mana_undo_action(undo_record, produced.len());
                             }
+                            CombatCostAction::UntapLand(land_id) => {
+                                if !untappable_lands.contains(&land_id) {
+                                    continue;
+                                }
+                                if self.undo_mana_action(game, controller, land_id) {
+                                    rejected.clear();
+                                    invalid_actions = 0;
+                                }
+                            }
+                            CombatCostAction::AutoPay => {
+                                self.invalidate_mana_undo_for_player(controller);
+                                let game_ptr: *mut GameState = game;
+                                let trigger_ptr = std::ptr::from_mut(&mut self.trigger_handler);
+                                let mut callback = Self::make_mana_payment_callback(
+                                    trigger_ptr, game_ptr, agents, controller, blocker_id,
+                                );
+                                let result = crate::mana::pay_mana_cost_auto_with_callback(
+                                    game, self.pool_mut(controller), controller,
+                                    &forge_foundation::ManaCost::generic(cost), None, 0,
+                                    &crate::mana::ManaPaymentContext::default(), false, &mut callback,
+                                );
+                                drop(callback);
+                                if let Some(result) = result {
+                                    self.resolve_auto_tapped_mana_sub_abilities(game, agents, controller, &result.choices);
+                                    if result.cancelled { block_cost_failures.push(blocker_id); }
+                                } else {
+                                    block_cost_failures.push(blocker_id);
+                                }
+                                break;
+                            }
+                            CombatCostAction::Pay => {
+                                self.invalidate_mana_undo_for_player(controller);
+                                let pool = &mut self.mana_pools[controller.index()];
+                                if pool.total_mana() >= cost {
+                                    pool.spend_generic(cost);
+                                    // Successfully paid
+                                } else {
+                                    // Not enough mana — treat as decline
+                                    block_cost_failures.push(blocker_id);
+                                }
+                                break;
+                            }
+                            CombatCostAction::Decline => {
+                                self.invalidate_mana_undo_for_player(controller);
+                                block_cost_failures.push(blocker_id);
+                                break;
+                            }
+                        }
+                    }
                         }
                     }
                     self.combat
@@ -1380,6 +1547,56 @@ mod declined_attack_mana_regression {
         assert!(!game.card(land).tapped);
         assert_eq!(game.player(PlayerId(0)).life, 40);
         assert_eq!(game.player(PlayerId(1)).life, 40);
+        }).unwrap().join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod paid_block_regression {
+    use super::*;
+    use crate::agent::{ManaAbilityOption, PriorityActionSpace, TargetChoice, PassAgent};
+    use crate::player::actions::PlayerAction;
+    use crate::spellability::SpellAbility;
+    use forge_foundation::ZoneType;
+    use std::{cell::Cell, rc::Rc};
+
+    struct CombatAgent { attacker: CardId, blockers: Vec<CardId>, pay: bool, prompts: Rc<Cell<usize>> }
+    impl PlayerAgent for CombatAgent {
+        fn choose_land_or_spell(&mut self, _: PlayerId) -> Option<bool> { None }
+        fn mulligan_decision(&mut self, _: PlayerId, _: &[CardId], _: u32) -> bool { true }
+        fn choose_action(&mut self, _: PlayerId, _: Option<&PriorityActionSpace>, _: &mut dyn FnMut() -> PriorityActionSpace) -> PlayerAction { PlayerAction::PassPriority }
+        fn choose_attackers(&mut self, _: PlayerId, _: &[CardId], _: &[combat::DefenderId]) -> Vec<(CardId, combat::DefenderId)> { vec![(self.attacker, combat::DefenderId::Player(PlayerId(1)))] }
+        fn choose_blockers(&mut self, _: PlayerId, _: &[CardId], _: &[CardId], _: Option<usize>) -> Vec<(CardId, CardId)> { self.blockers.iter().map(|&b| (b,self.attacker)).collect() }
+        fn choose_targets_for(&mut self, sa: &mut SpellAbility, game: &GameState, pools: &[ManaPool]) -> bool { crate::spellability::choose_targets_by_kind(self, sa, game, pools) }
+        fn choose_target_player(&mut self, _: PlayerId, valid: &[PlayerId], _: Option<&SpellAbility>) -> Option<PlayerId> { valid.first().copied() }
+        fn choose_target_card(&mut self, _: PlayerId, valid: &[CardId], _: Option<&SpellAbility>) -> Option<CardId> { valid.first().copied() }
+        fn choose_target_any(&mut self, _: PlayerId, _: &[PlayerId], _: &[CardId], _: Option<&SpellAbility>) -> TargetChoice { TargetChoice::None }
+        fn pay_combat_cost(&mut self, _: PlayerId, _: CardId, _: i32, _: &str, _: &[ManaAbilityOption], _: &[CardId], _: &[CardId], _: i32) -> CombatCostAction {
+            self.prompts.set(self.prompts.get()+1);
+            if self.pay { CombatCostAction::AutoPay } else { CombatCostAction::Decline }
+        }
+    }
+    #[test]
+    fn conditional_block_tax_funds_or_declines_each_trample_block() {
+        std::thread::Builder::new().stack_size(32 * 1024 * 1024).spawn(|| {
+            for (tax_owner, pay, expected_prompts, expected_life) in [(0,true,2,38),(0,false,2,34),(2,false,0,38)] {
+                let mut game=GameState::new(&["A","B","C"],40);
+                let add=|g: &mut GameState, script: &str, owner: PlayerId| { let rules=forge_carddb::parse_card_script(script).unwrap(); let id=g.create_card(crate::card::Card::from_rules(&rules,owner)); g.move_card(id,ZoneType::Battlefield,owner); id };
+                let a=add(&mut game,"Name:Attacker\nTypes:Creature Dragon\nPT:6/6\nK:Flying\nK:Trample",PlayerId(0)); game.card_mut(a).set_summoning_sick(false);
+                let b1=add(&mut game,"Name:Flyer\nTypes:Creature Bird\nPT:1/2\nK:Flying",PlayerId(1));
+                let b2=add(&mut game,"Name:Flyer\nTypes:Creature Bird\nPT:1/2\nK:Flying",PlayerId(1));
+                add(&mut game,"Name:Tax\nTypes:Enchantment\nS:Mode$ CantBlockUnless | ValidCard$ Creature | Attacker$ You | Cost$ 1",PlayerId(tax_owner));
+                let land1=add(&mut game,"Name:Forest\nTypes:Basic Land Forest\nA:AB$ Mana | Cost$ T | Produced$ G",PlayerId(1));
+                let land2=add(&mut game,"Name:Forest\nTypes:Basic Land Forest\nA:AB$ Mana | Cost$ T | Produced$ G",PlayerId(1));
+                let prompts=Rc::new(Cell::new(0));
+                let mut agents: Vec<Box<dyn PlayerAgent>>=vec![Box::new(CombatAgent{attacker:a,blockers:vec![],pay:false,prompts:prompts.clone()}),Box::new(CombatAgent{attacker:a,blockers:vec![b1,b2],pay,prompts:prompts.clone()}),Box::new(PassAgent)];
+                GameLoop::new(3).step_combat(&mut game,&mut agents);
+                assert_eq!(prompts.get(),expected_prompts);
+                assert_eq!(game.player(PlayerId(1)).life,expected_life);
+                assert_eq!(game.card(land1).tapped && game.card(land2).tapped, tax_owner==0 && pay);
+                assert_eq!(game.card(b1).zone==ZoneType::Graveyard, tax_owner!=0 || pay);
+                assert_eq!(game.card(b2).zone==ZoneType::Graveyard, tax_owner!=0 || pay);
+            }
         }).unwrap().join().unwrap();
     }
 }

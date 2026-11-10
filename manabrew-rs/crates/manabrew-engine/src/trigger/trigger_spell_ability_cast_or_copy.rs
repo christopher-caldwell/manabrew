@@ -11,6 +11,8 @@ use super::trigger::{Trigger, TriggerBehavior};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TriggerSpellAbilityCastOrCopy {
     pub trigger_type: TriggerType,
+    #[serde(default)]
+    pub valid_sa: Option<String>,
     pub valid_card: Option<crate::parsing::CompiledSelector>,
     pub valid_activating_player: Option<crate::parsing::CompiledSelector>,
 }
@@ -33,6 +35,7 @@ impl TriggerSpellAbilityCastOrCopy {
             _ => panic!("Unsupported spell/ability cast-or-copy mode: {mode_str}"),
         };
         Box::new(Self {
+            valid_sa: params.get_cloned(keys::VALID_SA),
             trigger_type,
             valid_card,
             valid_activating_player,
@@ -47,6 +50,11 @@ impl TriggerBehavior for TriggerSpellAbilityCastOrCopy {
     }
 
     fn perform_test(&self, trigger: &Trigger, params: &RunParams, game: &GameState) -> bool {
+        if let Some(valid) = &self.valid_sa {
+            let Some(sa) = params.source_sa.as_ref().or(params.spell_ability.as_ref()) else { return false; };
+            let source = trigger.base.card_trait_base.host_card(game);
+            if !crate::spellability::matches_valid_sa(valid, sa, source, sa.source.map(|id| game.card(id))) { return false; }
+        }
         let valid_card_matches = match (&self.valid_card, params.spell_card) {
             (None, _) => true,
             (Some(_), None) => false,
@@ -81,7 +89,7 @@ impl TriggerBehavior for TriggerSpellAbilityCastOrCopy {
     ) {
         // Java: sa.setTriggeringObject(AbilityKey.Card, cause.getHostCard())
         if let Some(card) = params.spell_card {
-            sa.set_triggering_object(crate::ability::AbilityKey::Card, card.0.to_string());
+            sa.set_triggering_object(crate::ability::AbilityKey::Card, card);
         }
         // TODO: port SpellAbility triggering object (AbilityKey.SpellAbility = cause)
         // TODO: port SpellAbilityTargets triggering object (from cause.getAllTargetChoices)
