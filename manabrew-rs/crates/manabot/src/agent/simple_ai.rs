@@ -5,7 +5,7 @@ use manabrew_agent_interface::game_view_dto::{
 };
 use manabrew_agent_interface::prompt::*;
 
-use super::BotAgent;
+use super::{ActionBias, BotAgent};
 
 mod payment;
 mod combat_plan;
@@ -77,6 +77,8 @@ pub struct SimpleAi {
     last_cast_pick: Option<(String, usize)>,
     /// The mana cost the turn plan keeps open at this prompt, if any (see `plan.rs`).
     reserve: Option<String>,
+    /// Optional per-action adjustment added to the main-action score. Absent means no adjustment.
+    bias: Option<Box<dyn ActionBias>>,
 }
 
 const KNOWN_TYPES: [&str; 8] = ["creature", "instant", "sorcery", "enchantment", "artifact", "planeswalker", "land", "battle"];
@@ -96,6 +98,13 @@ struct Combatant {
 impl SimpleAi {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_bias(bias: Box<dyn ActionBias>) -> Self {
+        Self {
+            bias: Some(bias),
+            ..Self::default()
+        }
     }
 
     pub fn observe_lazy(&mut self, view_json: String) {
@@ -2197,9 +2206,34 @@ impl BotAgent for SimpleAi {
                     self.last_lifelink_combo_progress = Some(progress);
                 }
                 self.reserve = self.plan_reserve(&actions, &deciding_player_id);
+                let base: Vec<i32> = actions
+                    .iter()
+                    .map(|action| self.action_score(action, &deciding_player_id))
+                    .collect();
+                let adj = {
+                    let view = self.view.as_ref();
+                    let bias = self.bias.as_mut();
+                    match bias {
+                        Some(bias) => {
+                            let adjusted = bias.adjust(view, &deciding_player_id, &actions, &base);
+                            if adjusted.len() == actions.len() {
+                                adjusted
+                            } else {
+                                vec![0; actions.len()]
+                            }
+                        }
+                        None => vec![0; actions.len()],
+                    }
+                };
+                let score: Vec<i32> = base
+                    .iter()
+                    .zip(&adj)
+                    .map(|(base_score, adjustment)| base_score.saturating_add(*adjustment))
+                    .collect();
                 let pick = actions
                     .iter()
-                    .filter(|action| {
+                    .enumerate()
+                    .filter(|&(i, action)| {
                         !matches!(&action.kind, AvailableActionKind::UndoMana { .. })
                             && !matches!(
                                 &action.kind,
@@ -2210,11 +2244,12 @@ impl BotAgent for SimpleAi {
                                 &action.kind,
                                 AvailableActionKind::ActivateAbility(info) if self.wasted_activation(info)
                             )
-                            && self.action_score(action, &deciding_player_id) > 0
+                            && score[i] > 0
                             && self.sane(action, &deciding_player_id)
                             && !self.dips_into_reserve(action, &deciding_player_id)
                     })
-                    .max_by_key(|action| self.action_score(action, &deciding_player_id));
+                    .max_by_key(|&(i, _)| score[i])
+                    .map(|(_, action)| action);
                 self.pending_lifelink_combo_cost = pick.and_then(|action| match &action.kind {
                     AvailableActionKind::ActivateAbility(info) if self.life_counter_pinger(&deciding_player_id, true).is_some_and(|card| card.id == info.card_id) => Some(info.card_id.clone()),
                     _ => None,

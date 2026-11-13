@@ -20,8 +20,10 @@ use manabrew_agent_interface::prompt::{
 use serde::{Deserialize, Serialize};
 
 pub mod action_facts;
+pub mod bias;
 pub mod comparative;
 pub use action_facts::{ActionFacts, EffectFact, PaymentFacts, ResourceFacts};
+pub use bias::ActionBias;
 pub mod simple_ai;
 pub use simple_ai::SimpleAi;
 

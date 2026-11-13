@@ -9,7 +9,8 @@
 //! a bot that always does (or never does) the thing cannot pass both.
 
 use super::SimpleAi;
-use crate::agent::BotAgent;
+use crate::agent::{ActionBias, BotAgent};
+use manabrew_agent_interface::prompt::AvailableAction;
 use manabrew_protocol::game::{
     CardDto, CardView, GameViewDto, PlayerDto, StackObjectDto, StepKind, ZoneDto, ZoneKind,
 };
@@ -826,4 +827,210 @@ fn skill_puzzles() {
         }
     }
     assert!(problems.is_empty(), "\n{}", problems.join("\n"));
+}
+
+// ---- ActionBias hook ----
+
+/// Returns one fixed adjustment per call, ignoring the position.
+struct FixedBias(Vec<i32>);
+
+impl ActionBias for FixedBias {
+    fn adjust(
+        &mut self,
+        _view: Option<&GameViewDto>,
+        _player_id: &str,
+        _actions: &[AvailableAction],
+        _base: &[i32],
+    ) -> Vec<i32> {
+        self.0.clone()
+    }
+}
+
+fn seeing(view: GameViewDto, bias: Option<Vec<i32>>) -> SimpleAi {
+    let mut bot = match bias {
+        Some(values) => SimpleAi::with_bias(Box::new(FixedBias(values))),
+        None => SimpleAi::default(),
+    };
+    bot.observe(view);
+    bot
+}
+
+fn choose_casts(bot: &mut SimpleAi, cards: &[&str]) -> Value {
+    let actions: Vec<_> = cards
+        .iter()
+        .map(|card| {
+            json!({
+                "type": "cast",
+                "id": format!("cast:{card}:normal"),
+                "cardId": card,
+                "mode": {"type": "normal"},
+                "label": "Cast normally"
+            })
+        })
+        .collect();
+    decide(
+        bot,
+        json!({"type": "chooseAction", "actions": actions}),
+        None,
+    )
+}
+
+/// Puzzle 1b: the opponent's finisher is on the stack and a counter is in hand.
+fn game_winning_counter_view() -> GameViewDto {
+    let mut battlefield = lands(20, 0, "Island", 3);
+    battlefield.extend(creatures(40, 1, (4, 4), 6));
+    let mut v = view(
+        1,
+        StepKind::Main1,
+        [10, 40, 40, 40],
+        vec![
+            zone(ZoneKind::Battlefield, 0, battlefield),
+            zone(
+                ZoneKind::Hand,
+                0,
+                vec![spell("card-9", &["Instant"], "{U}{U}", 2, COUNTERSPELL)],
+            ),
+        ],
+    );
+    let mut finisher = creature("card-31", 1, (6, 6), 8, FINISHER);
+    finisher.mana_cost = "{6}{R}{R}".into();
+    v.stack.push(on_stack(1, finisher, json!([])));
+    v
+}
+
+/// Puzzle 1a: a minor opposing spell, so the counter stays in hand.
+fn minor_counter_view() -> GameViewDto {
+    let mut battlefield = lands(20, 0, "Island", 3);
+    battlefield.extend(creatures(40, 1, (3, 3), 2));
+    let mut v = view(
+        1,
+        StepKind::Main1,
+        [40; 4],
+        vec![
+            zone(ZoneKind::Battlefield, 0, battlefield),
+            zone(
+                ZoneKind::Hand,
+                0,
+                vec![spell("card-9", &["Instant"], "{U}{U}", 2, COUNTERSPELL)],
+            ),
+        ],
+    );
+    v.stack.push(on_stack(
+        1,
+        spell("card-30", &["Instant"], "{W}", 1, GAIN_LIFE),
+        json!([]),
+    ));
+    v
+}
+
+/// Puzzle 5b: far behind on board, with a wrath in hand.
+fn wrath_from_behind_view() -> GameViewDto {
+    let mut mine = lands(20, 0, "Swamp", 4);
+    mine.push(creature("card-30", 0, (1, 1), 1, ""));
+    let mut zones = vec![
+        zone(ZoneKind::Battlefield, 0, mine),
+        zone(
+            ZoneKind::Hand,
+            0,
+            vec![spell("card-9", &["Sorcery"], "{2}{B}{B}", 4, WRATH)],
+        ),
+    ];
+    for (i, board) in [
+        creatures(40, 1, (5, 5), 3),
+        creatures(50, 2, (4, 4), 3),
+        creatures(60, 3, (4, 4), 2),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        zones.push(zone(ZoneKind::Battlefield, i + 1, board));
+    }
+    view(0, StepKind::Main1, [30, 40, 40, 40], zones)
+}
+
+/// Two legal creatures. The 5/5 scores higher than the 1/1, and neither is a guard rejection.
+fn two_creatures_view() -> GameViewDto {
+    view(
+        0,
+        StepKind::Main1,
+        [40; 4],
+        vec![
+            zone(ZoneKind::Battlefield, 0, lands(20, 0, "Plains", 4)),
+            zone(
+                ZoneKind::Hand,
+                0,
+                vec![
+                    creature("card-small", 0, (1, 1), 1, ""),
+                    creature("card-big", 0, (5, 5), 1, ""),
+                ],
+            ),
+        ],
+    )
+}
+
+fn assert_zero_matches(view: fn() -> GameViewDto, cards: &[&str], action_id: Option<&str>) {
+    let mut plain = seeing(view(), None);
+    let mut zero = seeing(view(), Some(vec![0; cards.len()]));
+    let plain_choice = choose_casts(&mut plain, cards);
+    let zero_choice = choose_casts(&mut zero, cards);
+    assert_eq!(plain_choice, zero_choice);
+    match action_id {
+        Some(id) => assert_eq!(plain_choice["actionId"], id),
+        None => assert_eq!(plain_choice["type"], "pass"),
+    }
+}
+
+#[test]
+fn zero_bias_matches_no_bias_on_existing_choose_action_puzzles() {
+    // Puzzle 1b casts the counter, 1a holds it, and 5b casts the wrath.
+    assert_zero_matches(
+        game_winning_counter_view,
+        &["card-9"],
+        Some("cast:card-9:normal"),
+    );
+    assert_zero_matches(minor_counter_view, &["card-9"], None);
+    assert_zero_matches(
+        wrath_from_behind_view,
+        &["card-9"],
+        Some("cast:card-9:normal"),
+    );
+}
+
+#[test]
+fn large_negative_bias_passes() {
+    let cards = ["card-small", "card-big"];
+    let mut plain = seeing(two_creatures_view(), None);
+    let plain_choice = choose_casts(&mut plain, &cards);
+    assert_eq!(plain_choice["type"], "act", "the unbiased bot takes a creature");
+
+    let mut biased = seeing(two_creatures_view(), Some(vec![-100_000, -100_000]));
+    let choice = choose_casts(&mut biased, &cards);
+    assert_eq!(choice["type"], "pass");
+}
+
+#[test]
+fn large_positive_bias_selects_the_action_the_bot_would_skip() {
+    let cards = ["card-small", "card-big"];
+    let mut plain = seeing(two_creatures_view(), None);
+    assert_eq!(
+        choose_casts(&mut plain, &cards)["actionId"],
+        "cast:card-big:normal"
+    );
+
+    let mut biased = seeing(two_creatures_view(), Some(vec![100_000, 0]));
+    assert_eq!(
+        choose_casts(&mut biased, &cards)["actionId"],
+        "cast:card-small:normal"
+    );
+}
+
+#[test]
+fn wrong_length_bias_leaves_the_choice_unchanged() {
+    let cards = ["card-small", "card-big"];
+    let mut plain = seeing(two_creatures_view(), None);
+    let mut biased = seeing(two_creatures_view(), Some(vec![100_000]));
+    assert_eq!(
+        choose_casts(&mut plain, &cards),
+        choose_casts(&mut biased, &cards)
+    );
 }
