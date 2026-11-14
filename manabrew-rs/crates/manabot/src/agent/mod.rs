@@ -23,7 +23,7 @@ pub mod action_facts;
 pub mod bias;
 pub mod comparative;
 pub use action_facts::{ActionFacts, EffectFact, PaymentFacts, ResourceFacts};
-pub use bias::ActionBias;
+pub use bias::{ActionBias, BotSkip};
 pub mod simple_ai;
 pub use simple_ai::SimpleAi;
 

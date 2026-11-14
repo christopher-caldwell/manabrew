@@ -9,7 +9,7 @@
 //! a bot that always does (or never does) the thing cannot pass both.
 
 use super::SimpleAi;
-use crate::agent::{ActionBias, BotAgent};
+use crate::agent::{ActionBias, BotAgent, BotSkip};
 use manabrew_agent_interface::prompt::AvailableAction;
 use manabrew_protocol::game::{
     CardDto, CardView, GameViewDto, PlayerDto, StackObjectDto, StepKind, ZoneDto, ZoneKind,
@@ -841,8 +841,26 @@ impl ActionBias for FixedBias {
         _player_id: &str,
         _actions: &[AvailableAction],
         _base: &[i32],
+        _skips: &[Option<BotSkip>],
     ) -> Vec<i32> {
         self.0.clone()
+    }
+}
+
+/// Zero adjustment; keeps every `skips` list the bot reports.
+struct SkipLog(std::sync::Arc<std::sync::Mutex<Vec<Vec<Option<BotSkip>>>>>);
+
+impl ActionBias for SkipLog {
+    fn adjust(
+        &mut self,
+        _view: Option<&GameViewDto>,
+        _player_id: &str,
+        actions: &[AvailableAction],
+        _base: &[i32],
+        skips: &[Option<BotSkip>],
+    ) -> Vec<i32> {
+        self.0.lock().unwrap().push(skips.to_vec());
+        vec![0; actions.len()]
     }
 }
 
@@ -1033,4 +1051,19 @@ fn wrong_length_bias_leaves_the_choice_unchanged() {
         choose_casts(&mut plain, &cards),
         choose_casts(&mut biased, &cards)
     );
+}
+
+#[test]
+fn skips_report_a_cast_the_bot_already_chose() {
+    let cards = ["card-small", "card-big"];
+    let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut bot = SimpleAi::with_bias(Box::new(SkipLog(std::sync::Arc::clone(&log))));
+    bot.observe(two_creatures_view());
+    assert_eq!(choose_casts(&mut bot, &cards)["actionId"], "cast:card-big:normal");
+    // Offered again in the same window, the big creature is skipped as already tried and the
+    // bot's answer moves to the small one.
+    assert_eq!(choose_casts(&mut bot, &cards)["actionId"], "cast:card-small:normal");
+    let seen = log.lock().unwrap();
+    assert_eq!(seen[0], vec![None, None]);
+    assert_eq!(seen[1], vec![None, Some(BotSkip::Tried)]);
 }

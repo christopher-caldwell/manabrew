@@ -5,6 +5,7 @@ use manabrew_agent_interface::game_view_dto::{
 };
 use manabrew_agent_interface::prompt::*;
 
+use super::bias::BotSkip;
 use super::{ActionBias, BotAgent};
 
 mod payment;
@@ -843,6 +844,33 @@ impl SimpleAi {
             let target = TargetRef { kind: TargetKind::Card, id: card.id.clone(), intent: None, oracle: None };
             right_type && self.answer_target_worthwhile(&target, intent, Some(source), player_id)
         })
+    }
+
+    /// Why the bot will not take `action` at this prompt, whatever its score. Every check reads
+    /// state only, so the main-action choice can ask once per action, before scoring.
+    fn bot_skip(&self, action: &AvailableAction, player_id: &str) -> Option<BotSkip> {
+        match &action.kind {
+            AvailableActionKind::UndoMana { .. } => return Some(BotSkip::Mana),
+            AvailableActionKind::ActivateAbility(info) if info.is_mana_ability => {
+                return Some(BotSkip::Mana)
+            }
+            _ => {}
+        }
+        if self.attempted_actions.contains(&Self::action_key(action)) {
+            return Some(BotSkip::Tried);
+        }
+        if let AvailableActionKind::ActivateAbility(info) = &action.kind {
+            if self.wasted_activation(info) {
+                return Some(BotSkip::Wasted);
+            }
+        }
+        if !self.sane(action, player_id) {
+            return Some(BotSkip::Unsafe);
+        }
+        if self.dips_into_reserve(action, player_id) {
+            return Some(BotSkip::Reserve);
+        }
+        None
     }
 
     fn sane(&self, action: &AvailableAction, player_id: &str) -> bool {
@@ -2210,12 +2238,17 @@ impl BotAgent for SimpleAi {
                     .iter()
                     .map(|action| self.action_score(action, &deciding_player_id))
                     .collect();
+                let skips: Vec<Option<BotSkip>> = actions
+                    .iter()
+                    .map(|action| self.bot_skip(action, &deciding_player_id))
+                    .collect();
                 let adj = {
                     let view = self.view.as_ref();
                     let bias = self.bias.as_mut();
                     match bias {
                         Some(bias) => {
-                            let adjusted = bias.adjust(view, &deciding_player_id, &actions, &base);
+                            let adjusted =
+                                bias.adjust(view, &deciding_player_id, &actions, &base, &skips);
                             if adjusted.len() == actions.len() {
                                 adjusted
                             } else {
@@ -2233,21 +2266,7 @@ impl BotAgent for SimpleAi {
                 let pick = actions
                     .iter()
                     .enumerate()
-                    .filter(|&(i, action)| {
-                        !matches!(&action.kind, AvailableActionKind::UndoMana { .. })
-                            && !matches!(
-                                &action.kind,
-                                AvailableActionKind::ActivateAbility(info) if info.is_mana_ability
-                            )
-                            && !self.attempted_actions.contains(&Self::action_key(action))
-                            && !matches!(
-                                &action.kind,
-                                AvailableActionKind::ActivateAbility(info) if self.wasted_activation(info)
-                            )
-                            && score[i] > 0
-                            && self.sane(action, &deciding_player_id)
-                            && !self.dips_into_reserve(action, &deciding_player_id)
-                    })
+                    .filter(|&(i, _)| skips[i].is_none() && score[i] > 0)
                     .max_by_key(|&(i, _)| score[i])
                     .map(|(_, action)| action);
                 self.pending_lifelink_combo_cost = pick.and_then(|action| match &action.kind {
